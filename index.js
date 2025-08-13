@@ -6,15 +6,22 @@ import qrcodeTerminal from "qrcode-terminal"
 import "dotenv/config"
 import OpenAI from "openai"
 import fs from "fs"
-import { webcrypto } from "crypto"          // 🔧 FIX WebCrypto
+import { webcrypto } from "crypto"
 
-// Exponer WebCrypto como global (Baileys lo espera)
+// 🔧 Exponer WebCrypto global (requerido por Baileys en Node ESM)
 if (!globalThis.crypto) globalThis.crypto = webcrypto
 
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,         // 👈 versión WA web
+  Browsers
+} = baileys
+
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// --- Web server para mantener vivo Railway
+// --- Web server para mantener Railway vivo
 const app = express()
 const PORT = process.env.PORT || 8080
 
@@ -27,7 +34,7 @@ app.get("/qr.png", async (_req, res) => {
     if (!lastQR) return res.status(404).send("No hay QR activo ahora mismo")
     const png = await qrcode.toBuffer(lastQR, { type: "png", margin: 1, width: 512 })
     res.set("Content-Type", "image/png").send(png)
-  } catch (e) {
+  } catch {
     res.status(500).send("Error generando QR")
   }
 })
@@ -47,14 +54,21 @@ async function startBot() {
   if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true })
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
+  // 👇 Obtener la última versión soportada de WhatsApp Web
+  const { version } = await fetchLatestBaileysVersion()
+  console.log("ℹ️ Versión WA Web usada por Baileys:", version)
+
   const sock = makeWASocket({
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
     auth: state,
-    syncFullHistory: false
+    version,                                        // 👈 importantísimo para evitar 405
+    browser: Browsers.macOS("Desktop"),             // 👈 fingerprint de navegador válido
+    syncFullHistory: false,
+    connectTimeoutMs: 30000
   })
 
-  sock.ev.on("connection.update", async (update) => {
+  sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update
 
     if (qr) {
@@ -79,13 +93,14 @@ async function startBot() {
         status === DisconnectReason.loggedOut ||
         /logged.?out|invalid|bad session/i.test(msg)
 
+      // Backoff 1s → 30s
       if (shouldRelogin || reconnectAttempts < 8) {
-        const waitMs = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts)) // 1s→30s
+        const waitMs = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts))
         reconnectAttempts++
         console.log(`🔄 Reintentando en ${waitMs}ms...`)
         setTimeout(() => startBot().catch(console.error), waitMs)
       } else {
-        console.log("🛑 Demasiados reintentos. Me quedo vivo gracias a Express; revisa /logs y /qr.png.")
+        console.log("🛑 Demasiados reintentos. Me quedo vivo gracias a Express; revisa /qr.png si pide nuevo enlace.")
       }
     }
   })
