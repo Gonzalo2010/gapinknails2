@@ -7,7 +7,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@adiwajshing/baileys": "6.5.0",
+    "baileys": "^6.7.18",              // opción oficial y estable
+    // o si prefieres un fork con más features:
+    // "@itsukichan/baileys": "^7.3.1",
     "qrcode-terminal": "^0.12.0",
     "openai": "^4.0.0",
     "dotenv": "^16.3.1",
