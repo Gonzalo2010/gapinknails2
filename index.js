@@ -1,5 +1,6 @@
-// index.js — Gapink Nails WhatsApp Bot (DeepSeek + extracción JSON + sesiones seguras + TZ)
-// Arreglo clave: confirmar también los huecos "sugeridos" y no repetir la pregunta.
+// index.js — Gapink Nails WhatsApp Bot
+// DeepSeek + extracción JSON + sesiones seguras + TZ + confirmación fina
+// + cola de envío con reintentos (Baileys Timed Out fix)
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -22,8 +23,8 @@ const EURO_TZ = "Europe/Madrid"
 
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
-// ====== Negocio
-const WORK_DAYS = [1,2,3,4,5,6]
+// ===== Negocio
+const WORK_DAYS = [1,2,3,4,5,6] // 1=lun..6=sáb (7=dom cerrado)
 const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
@@ -32,7 +33,7 @@ const SERVICES = { "uñas acrílicas": 90 }
 const SERVICE_VARIATIONS = { "uñas acrílicas": process.env.SQ_SV_UNAS_ACRILICAS || "" }
 const TEAM_MEMBER_IDS = (process.env.SQ_TEAM_IDS || "").split(",").map(s=>s.trim()).filter(Boolean)
 
-// ====== DeepSeek
+// ===== DeepSeek
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/chat/completions"
 const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL   || "deepseek-chat"
@@ -50,18 +51,18 @@ async function dsChat(messages, { temperature=0.4 } = {}) {
   } catch (e) { console.error("DeepSeek error:", e?.message || e); return "" }
 }
 
-const SYS_TONE = `Eres el asistente de WhatsApp de un salón de uñas en España (Gapink Nails).
-Habla natural, corto y sin emojis.
+const SYS_TONE = `Eres el asistente de WhatsApp de Gapink Nails (España).
+Habla natural, breve y sin emojis. No menciones que eres IA.
 Si la hora pedida está libre, ofrécela tal cual; si no, propone la más cercana y pide confirmación.
-No ofrezcas profesionales. Pago siempre en persona.`
+No ofrezcas elegir profesional. Pago siempre en persona.`
 
 async function extractFromText(userText="") {
   const schema = `
-Devuelve SOLO un JSON válido. Claves (omite si no aplica):
+Devuelve SOLO un JSON válido (omite claves que no apliquen):
 {
   "intent": "greeting|booking|cancel|reschedule|other",
   "service": "uñas acrílicas|…",
-  "datetime_text": "texto de fecha/hora si lo hay",
+  "datetime_text": "texto con fecha/hora si lo hay",
   "confirm": "yes|no|unknown",
   "name": "si aparece",
   "email": "si aparece",
@@ -84,7 +85,7 @@ async function aiSay(contextSummary) {
   ], { temperature: 0.35 })
 }
 
-// ====== Helpers
+// ===== Helpers
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
 const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const YES_RE = /\b(si|sí|ok|vale|confirmo|confirmar|de acuerdo|perfecto)\b/i
@@ -152,7 +153,7 @@ const fmtES = (d)=> {
   return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`
 }
 
-// ====== Square
+// ===== Square
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment: process.env.SQUARE_ENV === "production" ? Environment.Production : Environment.Sandbox
@@ -228,7 +229,7 @@ async function createSquareBooking({ startEU, serviceKey, customerId, teamMember
   } catch (e) { console.error("createSquareBooking:", e?.message || e); return null }
 }
 
-// ====== DB & Sesiones (guardar startEU como ISO)
+// ===== DB & Sesiones (guardamos dayjs como ISO)
 const db = new Database("gapink.db")
 db.pragma("journal_mode = WAL")
 db.exec(`
@@ -278,11 +279,9 @@ function saveSession(phone, data) {
   upsertSession.run({ phone, data_json: JSON.stringify(toSave), updated_at: new Date().toISOString() })
 }
 
-// ====== Disponibilidad
+// ===== Disponibilidad local
 function getBookedIntervals(fromIso, toIso) {
-  const rows = db.prepare(`SELECT start_iso, end_iso, staff_id FROM appointments WHERE status='confirmed' AND start_iso < @to AND end_iso > @from`).all({
-    from: fromIso, to: toIso
-  })
+  const rows = db.prepare(`SELECT start_iso, end_iso, staff_id FROM appointments WHERE status='confirmed' AND start_iso < @to AND end_iso > @from`).all({ from: fromIso, to: toIso })
   return rows.map(r => ({ start: dayjs(r.start_iso), end: dayjs(r.end_iso), staff_id: r.staff_id }))
 }
 function staffHasFree(intervals, start, end) {
@@ -326,7 +325,7 @@ function suggestOrExact(startEU, durationMin) {
   return { exact:null, suggestion:null }
 }
 
-// ====== Web mini
+// ===== Web mini
 const app = express()
 const PORT = process.env.PORT || 8080
 let lastQR = null, conectado = false
@@ -340,129 +339,175 @@ app.get("/qr.png", async (_req,res)=>{
   res.set("Content-Type","image/png").send(png)
 })
 
+// ===== Cola de envío con reintentos (Baileys Timed Out fix)
+const wait = (ms) => new Promise(r => setTimeout(r, ms))
+
+// ===== Bot
 app.listen(PORT, async ()=>{
   console.log(`🌐 Web en puerto ${PORT}`)
   await squareCheckCredentials()
   startBot().catch(console.error)
 })
 
-// ====== Bot
 async function startBot() {
   console.log("🚀 Bot arrancando…")
-  if (!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info")
-  const { version } = await fetchLatestBaileysVersion()
-  const sock = makeWASocket({
-    logger: pino({ level:"silent" }),
-    printQRInTerminal: false,
-    auth: state,
-    version,
-    browser: Browsers.macOS("Desktop"),
-    syncFullHistory: false,
-    connectTimeoutMs: 30000
-  })
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr })=>{
-    if (qr){ lastQR = qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
-    if (connection==="open"){ lastQR=null; conectado=true; console.log("✅ Conectado a WhatsApp") }
-    if (connection==="close"){ conectado=false; console.log("❌ Cerrado:", lastDisconnect?.error?.message || ""); setTimeout(()=>startBot().catch(console.error), 3000) }
-  })
-  sock.ev.on("creds.update", saveCreds)
+  try {
+    if (!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info")
+    const { version } = await fetchLatestBaileysVersion()
 
-  const safeSend = async (jid, content)=>{ try{ await sock.sendMessage(jid, content) } catch(e){ console.error("sendMessage:", e) } }
+    let isOpen = false
+    let reconnecting = false
 
-  sock.ev.on("messages.upsert", async ({ messages })=>{
-    const m = messages?.[0]; if (!m?.message || m.key.fromMe) return
-    const from = m.key.remoteJid
-    const phone = normalizePhoneES((from||"").split("@")[0] || "") || (from||"").split("@")[0] || ""
-    const body =
-      m.message.conversation ||
-      m.message.extendedTextMessage?.text ||
-      m.message?.imageMessage?.caption || ""
-    const textRaw = (body || "").trim()
+    const sock = makeWASocket({
+      logger: pino({ level:"silent" }),
+      printQRInTerminal: false,
+      auth: state,
+      version,
+      browser: Browsers.macOS("Desktop"),
+      syncFullHistory: false,
+      connectTimeoutMs: 30000
+    })
 
-    // Sesión
-    let data = loadSession(phone) || {
-      service: null,
-      startEU: null,
-      durationMin: null,
-      name: null,
-      email: null,
-      confirmApproved: false,
-      confirmAsked: false
+    // ===== Outbox
+    const outbox = []
+    let sending = false
+    const __SAFE_SEND__ = (jid, content) => new Promise((resolve, reject) => {
+      outbox.push({ jid, content, resolve, reject })
+      processOutbox().catch(console.error)
+    })
+    async function processOutbox() {
+      if (sending) return
+      sending = true
+      while (outbox.length) {
+        const { jid, content, resolve, reject } = outbox.shift()
+        // Esperar conexión
+        let guard = 0
+        while (!isOpen && guard < 60) { await wait(1000); guard++ }
+        if (!isOpen) { reject(new Error("WA not connected")); continue }
+        // Reintentos
+        let ok=false, err=null
+        for (let attempt=1; attempt<=4; attempt++) {
+          try { await sock.sendMessage(jid, content); ok=true; break }
+          catch (e) {
+            err = e
+            const msg = e?.data?.stack || e?.message || String(e)
+            if (/Timed Out/i.test(msg) || /Boom/i.test(msg)) { await wait(500*attempt); continue }
+            await wait(400)
+          }
+        }
+        if (ok) resolve(true)
+        else {
+          console.error("sendMessage failed after retries:", err?.message || err)
+          reject(err)
+          if (/Timed Out/i.test(err?.message || "")) { try { await sock.ws.close() } catch {} }
+        }
+      }
+      sending = false
     }
 
-    // IA: extrae
-    const extra = await extractFromText(textRaw)
-    if (!data.service) data.service = extra.service || detectServiceFree(textRaw) || data.service
-    if (!data.name && extra.name) data.name = extra.name
-    if (!data.email && extra.email) data.email = extra.email
+    sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr })=>{
+      if (qr){ lastQR = qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
+      if (connection==="open"){ lastQR=null; conectado=true; isOpen=true; console.log("✅ Conectado a WhatsApp"); processOutbox().catch(console.error) }
+      if (connection==="close"){
+        conectado=false; isOpen=false
+        const reason = lastDisconnect?.error?.message || String(lastDisconnect?.error || "")
+        console.log("❌ Conexión cerrada:", reason)
+        if (!reconnecting) {
+          reconnecting = true
+          await wait(2000)
+          try { await startBot() } finally { reconnecting=false }
+        }
+      }
+    })
+    sock.ev.on("creds.update", saveCreds)
 
-    // Confirmación libre
-    if (YES_RE.test(textRaw) || extra.confirm === "yes") data.confirmApproved = true
-    if (NO_RE.test(textRaw)  || extra.confirm === "no")  { data.confirmApproved = false; data.confirmAsked = false }
-    saveSession(phone, data)  // 🔐 guarda el flag de confirmación ya mismo
+    // ===== Mensajes
+    sock.ev.on("messages.upsert", async ({ messages })=>{
+      try {
+        const m = messages?.[0]; if (!m?.message || m.key.fromMe) return
+        const from = m.key.remoteJid
+        const phone = normalizePhoneES((from||"").split("@")[0] || "") || (from||"").split("@")[0] || ""
+        const body =
+          m.message.conversation ||
+          m.message.extendedTextMessage?.text ||
+          m.message?.imageMessage?.caption || ""
+        const textRaw = (body || "").trim()
 
-    // Fecha/hora
-    const whenText = extra.datetime_text || textRaw
-    const parsed = parseDateTimeES(whenText)
-    if (parsed) data.startEU = parsed
+        // Sesión
+        let data = loadSession(phone) || {
+          service: null,
+          startEU: null,
+          durationMin: null,
+          name: null,
+          email: null,
+          confirmApproved: false,
+          confirmAsked: false
+        }
 
-    if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
+        // IA: extracción
+        const extra = await extractFromText(textRaw)
+        if (!data.service) data.service = extra.service || detectServiceFree(textRaw) || data.service
+        if (!data.name && extra.name) data.name = extra.name
+        if (!data.email && extra.email) data.email = extra.email
+        if (YES_RE.test(textRaw) || extra.confirm === "yes") data.confirmApproved = true
+        if (NO_RE.test(textRaw)  || extra.confirm === "no")  { data.confirmApproved = false; data.confirmAsked = false }
+        saveSession(phone, data) // guardamos confirmApproved ya
 
-    // Cancelación rápida (si la usas)
-    if ((extra.intent==="cancel") || /cancel(ar)? cita/i.test(textRaw)) {
-      await safeSend(from,{ text: "Cancelación anotada. Si quieres, dime otra fecha y te busco hueco." })
-      clearSession.run({ phone }); return
-    }
+        // Fecha/hora
+        const whenText = extra.datetime_text || textRaw
+        const parsed = parseDateTimeES(whenText)
+        if (parsed) data.startEU = parsed
+        if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
 
-    // ====== DISPONIBILIDAD → PROPUESTA Y CONFIRMACIÓN ======
-    if (data.service && data.startEU && data.durationMin) {
-      const { exact, suggestion } = suggestOrExact(data.startEU, data.durationMin)
+        // Cancelación rápida (si quieres puedes ampliarla con DB futura)
+        if ((extra.intent==="cancel") || /cancel(ar)? cita/i.test(textRaw)) {
+          await __SAFE_SEND__(from,{ text: "Cancelación anotada. Si quieres, dime otra fecha y te busco hueco." })
+          clearSession.run({ phone }); return
+        }
 
-      // ✅ PICK & CONFIRM: usar exacto o sugerido indistintamente
-      const pick = exact || suggestion
-      if (pick) {
-        data.startEU = pick
-        // Si ya aprobó (dijo "sí"/"vale"/etc.), agendamos sin repetir pregunta.
-        if (data.confirmApproved) {
+        // DISPONIBILIDAD → PROPUESTA Y CONFIRMACIÓN
+        if (data.service && data.startEU && data.durationMin) {
+          const { exact, suggestion } = suggestOrExact(data.startEU, data.durationMin)
+          const pick = exact || suggestion
+          if (pick) {
+            data.startEU = pick
+            if (data.confirmApproved) {
+              saveSession(phone, data)
+              await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
+              return
+            }
+            data.confirmAsked = true
+            saveSession(phone, data)
+            const msg = exact
+              ? `Tengo libre ${fmtES(data.startEU)} para ${data.service}. ¿Confirmo la cita?`
+              : `No tengo ese hueco exacto. Te puedo ofrecer ${fmtES(data.startEU)}. ¿Confirmo?`
+            await __SAFE_SEND__(from,{ text: msg })
+            return
+          }
+          data.confirmAsked = false
           saveSession(phone, data)
-          await finalizeBooking({ from, phone, data, safeSend })
+          await __SAFE_SEND__(from,{ text: "No veo hueco en esa franja. Dime otra hora o día y te digo." })
           return
         }
-        // Aún no confirmó → preguntar UNA vez
-        data.confirmAsked = true
-        saveSession(phone, data)
-        const msg = exact
-          ? `Tengo libre ${fmtES(data.startEU)} para ${data.service}. ¿Confirmo la cita?`
-          : `No tengo ese hueco exacto. Te puedo ofrecer ${fmtES(data.startEU)}. ¿Confirmo?`
-        await safeSend(from,{ text: msg })
-        return
-      }
 
-      // Sin hueco ese día
-      data.confirmAsked = false
-      saveSession(phone, data)
-      await safeSend(from,{ text: "No veo hueco en esa franja. Dime otra hora o día y te digo." })
-      return
-    }
+        // Dijo “sí” pero falta nombre/email
+        if (data.confirmApproved && (!data.name || !data.email)) {
+          saveSession(phone, data)
+          await __SAFE_SEND__(from,{ text: "Para cerrar, dime tu nombre y email (ej: “Ana Pérez, ana@correo.com”)." })
+          return
+        }
+        if (data.confirmApproved && data.name && data.email && data.service && data.startEU) {
+          await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ }); return
+        }
 
-    // Si dijo “sí” pero falta nombre/email
-    if (data.confirmApproved && (!data.name || !data.email)) {
-      saveSession(phone, data)
-      await safeSend(from,{ text: "Para cerrar, dime tu nombre y email (ej: “Ana Pérez, ana@correo.com”)." })
-      return
-    }
-    if (data.confirmApproved && data.name && data.email && data.service && data.startEU) {
-      await finalizeBooking({ from, phone, data, safeSend }); return
-    }
+        // Faltan datos → IA redacta
+        const missing = []
+        if (!data.service) missing.push("servicio")
+        if (!data.startEU) missing.push("día y hora")
+        if (!data.name || !data.email) missing.push("nombre y email (si eres nuevo)")
 
-    // Faltan datos → IA redacta
-    const missing = []
-    if (!data.service) missing.push("servicio")
-    if (!data.startEU) missing.push("día y hora")
-    if (!data.name || !data.email) missing.push("nombre y email (si eres nuevo)")
-
-    const prompt = `Contexto:
+        const prompt = `Contexto:
 - Servicio: ${data.service || "?"}
 - Fecha/Hora: ${data.startEU ? fmtES(data.startEU) : "?"}
 - Nombre: ${data.name || "?"}
@@ -471,21 +516,24 @@ Escribe un único mensaje corto y humano que avance la reserva, sin emojis.
 Si faltan datos (${missing.join(", ")}), pídelo amablemente con ejemplo.
 Mensaje del cliente: "${textRaw}"`
 
-    const say = await aiSay(prompt)
-    saveSession(phone, data)
-    await safeSend(from,{ text: say || "¿Qué servicio necesitas y para cuándo?" })
-  })
+        const say = await aiSay(prompt)
+        saveSession(phone, data)
+        await __SAFE_SEND__(from,{ text: say || "Hola. ¿Quieres pedir cita o ver disponibilidad?" })
+      } catch (e) {
+        console.error("messages.upsert error:", e)
+      }
+    })
+  } catch (e) {
+    console.error("startBot error:", e)
+  }
 }
 
-// ====== Finalizar reserva
+// ===== Finalizar reserva
 async function finalizeBooking({ from, phone, data, safeSend }) {
   try {
     let customer = await squareFindCustomerByPhone(phone)
     if (!customer) {
-      if (!data.name || !data.email) {
-        await safeSend(from,{ text: "Me falta tu nombre y email para crear la reserva." })
-        return
-      }
+      if (!data.name || !data.email) { await safeSend(from,{ text: "Me falta tu nombre y email para crear la reserva." }); return }
       customer = await squareCreateCustomer({ givenName: data.name, emailAddress: data.email, phoneNumber: phone })
     }
     if (!customer) { await safeSend(from,{ text: "Ahora mismo no puedo crear tu ficha. Probamos en un minuto." }); return }
@@ -522,10 +570,3 @@ Pago en persona.` })
     await safeSend(from,{ text: "Ha fallado el cierre de la reserva. Lo reviso y te aviso." })
   }
 }
-
-// ====== Launch
-(async ()=>{
-  console.log(`🌐 Web en puerto ${PORT}`)
-  await squareCheckCredentials()
-  startBot().catch(console.error)
-})()
