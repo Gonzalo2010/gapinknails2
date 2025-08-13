@@ -26,17 +26,12 @@ const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
-// Servicios y duraciones
+// Servicios y duraciones (de momento 1)
 const SERVICES = {
   "uñas acrílicas": 90,
-  // si luego añades más:
-  // "manicura": 45,
-  // "pedicura": 60,
-  // "relleno": 75,
-  // "semipermanente": 45
 }
 
-// Mapear servicios → service_variation_id (solo acrílicas ahora)
+// Mapear servicios → service_variation_id (Square)
 const SERVICE_VARIATIONS = {
   "uñas acrílicas": process.env.SQ_SV_UNAS_ACRILICAS || ""
 }
@@ -48,16 +43,13 @@ const TEAM_MEMBER_IDS = (process.env.SQ_TEAM_IDS || "")
 // =================== OPENAI ===================
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-const SYSTEM_PROMPT = `Eres el asistente de WhatsApp de Gapink Nails. Tu objetivo es sonar humano (natural y cercano), no robótico.
-Reglas:
-- Nunca reveles el nombre de la técnica ni ofrezcas elegir profesional.
-- Prioriza rellenar huecos cercanos de la semana, salvo que el cliente pida hora/día concreto (intenta respetarlo).
-- Mensajes cortos y claros, sin emojis.
-- Pago siempre en persona.
-- Si faltan datos para alta nueva, pide solo nombre y email.
-- Si el mensaje NO trata de reservas/cambios/cancelaciones/disponibilidad, no respondas.
-- En confirmaciones incluye servicio, fecha/hora y que el pago será en persona.
-- Español de España. Nunca hables de que eres IA.`
+const SYSTEM_PROMPT = `Eres el asistente de WhatsApp de Gapink Nails. Suena humano y cercano.
+- No reveles nombres del personal ni ofrezcas elegir profesional.
+- Si el cliente indica hora/día, respétalo si cabe; si no, ofrece el hueco más cercano.
+- Mensajes cortos, sin emojis. Pago siempre en persona.
+- Si falta dato para alta nueva, pide solo nombre y email.
+- Si el mensaje no trata de reservar/cambiar/cancelar/disponibilidad/horarios, no respondas.
+- Nunca digas que eres IA.`
 
 async function isBookingIntent(text) {
   try {
@@ -66,8 +58,8 @@ async function isBookingIntent(text) {
       messages: [
         { role: "system", content:
 `Devuelve SOLO:
-BOOKING -> si el mensaje trata de reservar/cita/disponibilidad/cambiar/cancelar.
-IGNORE  -> en cualquier otro caso.` },
+BOOKING -> si es sobre reservas/citas/disponibilidad/cambios/cancelaciones.
+IGNORE  -> lo demás.` },
         { role: "user", content: text || "" }
       ],
       temperature: 0
@@ -90,7 +82,7 @@ async function aiReply(text) {
   } catch (e) { console.error("AI reply error:", e); return "" }
 }
 
-// =================== HELPERS TELÉFONO ===================
+// =================== HELPERS TELÉFONO & CONTACTO ===================
 const onlyDigits = (s="") => (s || "").replace(/\D+/g, "")
 function normalizePhoneES(raw) {
   const digits = onlyDigits(raw)
@@ -102,13 +94,45 @@ function normalizePhoneES(raw) {
   return `+${digits}`
 }
 
+// Heurística para sacar nombre y email de un mensaje libre
+function extractContact(text="") {
+  const t = text.trim()
+  const emailMatch = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)
+  const email = emailMatch ? emailMatch[0] : null
+
+  // pistas “me llamo …”, “soy …”, “mi nombre es …”
+  const nameHints = [
+    /(?:^|\b)(?:me llamo|soy|mi nombre es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ' -]{2,80})/i,
+  ]
+  let name = null
+  for (const re of nameHints) {
+    const m = t.match(re)
+    if (m && m[1]) { name = m[1].trim() ; break }
+  }
+  // si dijo “Nombre y email” en una frase tipo “Pepe García y pepe@…”
+  if (!name && email) {
+    const idx = t.indexOf(email)
+    const left = t.slice(0, idx).replace(/[,.;:]/g, " ")
+    const ySplit = left.split(/\by\b/i)
+    const candidate = (ySplit[0] || left).trim()
+    // filtrar cosas muy cortas o que parezcan pregunta
+    if (candidate && candidate.length >= 2 && !/[?]/.test(candidate)) {
+      name = candidate.slice(-80)
+    }
+  }
+  // limpiar nombre (caps y espacios)
+  if (name) name = name.replace(/\s+/g, " ").replace(/^y\s+/i,"").trim()
+
+  return { name: name || null, email }
+}
+
 // =================== SQUARE SDK ===================
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment: process.env.SQUARE_ENV === "production" ? Environment.Production : Environment.Sandbox
 })
 const locationId = process.env.SQUARE_LOCATION_ID
-let LOCATION_TZ = "Europe/Madrid" // solo para logs
+let LOCATION_TZ = "Europe/Madrid"
 
 async function squareCheckCredentials() {
   try {
@@ -145,7 +169,7 @@ async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
   } catch (e) { console.error("Square create error:", e?.message || e); return null }
 }
 
-// Obtener versión de variación de servicio (para Bookings)
+// Obtener versión de variación de servicio
 async function getServiceVariationVersion(serviceVariationId) {
   try {
     const resp = await square.catalogApi.retrieveCatalogObject(serviceVariationId, true)
@@ -204,7 +228,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   phone TEXT PRIMARY KEY,
   state TEXT,
   data_json TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  last_prompt_at TEXT
 );
 `)
 
@@ -217,8 +242,10 @@ const updateApptStatus   = db.prepare(`UPDATE appointments SET status=@status WH
 const getUpcomingByPhone = db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso ASC LIMIT 1`)
 
 const upsertSession = db.prepare(`
-INSERT INTO sessions (phone, state, data_json, updated_at) VALUES (@phone, @state, @data_json, @updated_at)
-ON CONFLICT(phone) DO UPDATE SET state=excluded.state, data_json=excluded.data_json, updated_at=excluded.updated_at`)
+INSERT INTO sessions (phone, state, data_json, updated_at, last_prompt_at)
+VALUES (@phone, @state, @data_json, @updated_at, @last_prompt_at)
+ON CONFLICT(phone) DO UPDATE
+SET state=excluded.state, data_json=excluded.data_json, updated_at=excluded.updated_at, last_prompt_at=excluded.last_prompt_at`)
 const getSession   = db.prepare(`SELECT * FROM sessions WHERE phone=@phone`)
 const clearSession = db.prepare(`DELETE FROM sessions WHERE phone=@phone`)
 
@@ -251,7 +278,6 @@ function staffHasFree(intervals, start, end) {
   return false
 }
 
-// Parsea “hoy/mañana/lunes… a las 20/20:30”
 const WEEKDAYS = ["domingo","lunes","martes","miércoles","miercoles","jueves","viernes","sábado","sabado"]
 function parsePreference(text) {
   const t = (text || "").toLowerCase()
@@ -282,7 +308,6 @@ function parsePreference(text) {
   return { day, hour, minute }
 }
 
-// Encuentra hueco: respeta preferencia si cabe; si no, earliest
 function findBestSlot(serviceKey, durationMin, preference) {
   const now = dayjs().second(0).millisecond(0)
   const endOfWeek = now.day() === 0 ? now.add(6,"day") : now.day(6)
@@ -397,27 +422,46 @@ async function startBot() {
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
           msg.message?.imageMessage?.caption || ""
-        const low = (body || "").trim().toLowerCase()
+        let low = (body || "").trim().toLowerCase()
 
-        // Sesión (alta de cliente)
+        // Quitar menciones a un profesional concreto (ej. "con Gonzalo")
+        low = low.replace(/\bcon\s+[a-záéíóúüñ]+/gi, "").trim()
+
+        // Sesión (alta de cliente) con antibucles
         const sess = getSession.get({ phone: phoneE164 })
-        if (sess?.state === "ask_name") {
-          const name = (body || "").trim().replace(/\s+/g," ").slice(0,80)
-          const data = JSON.parse(sess.data_json || "{}"); data.name = name
-          upsertSession.run({ phone: phoneE164, state: "ask_email", data_json: JSON.stringify(data), updated_at: new Date().toISOString() })
-          await safeSend(from, { text: "¿Cuál es tu email? (para enviarte la confirmación)" })
-          return
-        }
-        if (sess?.state === "ask_email") {
-          const email = (body || "").trim()
-          const data = JSON.parse(sess.data_json || "{}"); data.email = email
 
+        // Si llega un mensaje que ya incluye nombre y email estando en cualquier estado de alta → completar
+        const { name: inlineName, email: inlineEmail } = extractContact(body)
+        if (sess?.state === "ask_name" || sess?.state === "ask_email") {
+          const data = JSON.parse(sess.data_json || "{}")
+          if (inlineName) data.name = inlineName
+          if (inlineEmail) data.email = inlineEmail
+
+          if (!data.name || !data.email) {
+            // faltan datos → pedir SOLO lo que falta, pero sin spamear
+            const now = Date.now()
+            const last = Date.parse(sess.last_prompt_at || 0)
+            if (now - last > 60_000) { // 60s de margen para no repetir
+              const need = !data.name ? "tu nombre y apellidos" : "tu email"
+              await safeSend(from, { text: `Para confirmarte la reserva necesito ${need}.` })
+              upsertSession.run({
+                phone: phoneE164,
+                state: !data.name ? "ask_name" : "ask_email",
+                data_json: JSON.stringify(data),
+                updated_at: new Date().toISOString(),
+                last_prompt_at: new Date().toISOString()
+              })
+            }
+            return
+          }
+
+          // Tenemos ambos → crear cliente y agendar
           let sq = null
-          try { sq = await squareCreateCustomer({ givenName: data.name || "Cliente", emailAddress: email || undefined, phoneNumber: phoneE164 }) } catch(e){ console.error(e) }
+          try { sq = await squareCreateCustomer({ givenName: data.name || "Cliente", emailAddress: data.email || undefined, phoneNumber: phoneE164 }) } catch(e){ console.error(e) }
           if (!sq) { clearSession.run({ phone: phoneE164 }); return }
 
           const dur = data.durationMin, svc = data.service
-          const pref = parsePreference(data.preferenceText || "")
+          const pref = parsePreference(data.preferenceText || body)
           const slot = findBestSlot(svc, dur, pref)
           if (!slot) { clearSession.run({ phone: phoneE164 }); return }
 
@@ -488,7 +532,7 @@ Pago en persona.` })
           return
         }
 
-        // Pedir cita (solo “uñas acrílicas” de momento)
+        // Pedir cita (uñas acrílicas)
         const svc = Object.keys(SERVICES).find(s => low.includes(s))
         if (/(reserva|reservar|cita|disponible|disponibilidad|pedir hora|hueco)/i.test(low) && svc) {
           const durationMin = SERVICES[svc]
@@ -500,8 +544,9 @@ Pago en persona.` })
           if (!slot) return
 
           const teamMemberId = TEAM_MEMBER_IDS[0] || null
-          let squareBooking = null
           if (customer) {
+            // cliente existe → agendar directo
+            let squareBooking = null
             try {
               squareBooking = await createSquareBooking({
                 startISO: slot.start.toISOString(),
@@ -510,30 +555,93 @@ Pago en persona.` })
                 teamMemberId
               })
             } catch (e) { console.error("square booking (existing) error:", e) }
-          }
 
-          const aptId = randomId("apt")
-          insertAppt.run({
-            id: aptId,
-            customer_name: customer?.givenName || null,
-            customer_phone: phoneE164,
-            customer_square_id: customer?.id || null,
-            service: svc,
-            duration_min: durationMin,
-            start_iso: slot.start.toISOString(),
-            end_iso: slot.end.toISOString(),
-            staff_id: teamMemberId,
-            status: "confirmed",
-            created_at: new Date().toISOString(),
-            square_booking_id: squareBooking?.id || null
-          })
+            const aptId = randomId("apt")
+            insertAppt.run({
+              id: aptId,
+              customer_name: customer?.givenName || null,
+              customer_phone: phoneE164,
+              customer_square_id: customer?.id || null,
+              service: svc,
+              duration_min: durationMin,
+              start_iso: slot.start.toISOString(),
+              end_iso: slot.end.toISOString(),
+              staff_id: teamMemberId,
+              status: "confirmed",
+              created_at: new Date().toISOString(),
+              square_booking_id: squareBooking?.id || null
+            })
 
-          await safeSend(from, { text:
+            await safeSend(from, { text:
 `Reserva confirmada.
 Servicio: ${svc}
 Fecha: ${slot.start.format("dddd DD/MM HH:mm")}
 Duración: ${durationMin} min
 Pago en persona.` })
+            return
+          }
+
+          // cliente NO existe → intentar extraer nombre/email del mismo mensaje
+          const { name, email } = extractContact(body)
+          const data = {
+            service: svc,
+            durationMin,
+            preferenceText: body,
+            name: name || null,
+            email: email || null
+          }
+
+          if (data.name && data.email) {
+            // tenemos ambos → crear y agendar
+            let sq = null
+            try { sq = await squareCreateCustomer({ givenName: data.name, emailAddress: data.email, phoneNumber: phoneE164 }) } catch(e){ console.error(e) }
+            if (!sq) return
+
+            let squareBooking = null
+            try {
+              squareBooking = await createSquareBooking({
+                startISO: slot.start.toISOString(),
+                serviceKey: svc,
+                customerId: sq.id,
+                teamMemberId
+              })
+            } catch (e) { console.error("square booking (new inline) error:", e) }
+
+            const aptId = randomId("apt")
+            insertAppt.run({
+              id: aptId,
+              customer_name: data.name,
+              customer_phone: phoneE164,
+              customer_square_id: sq.id,
+              service: svc,
+              duration_min: durationMin,
+              start_iso: slot.start.toISOString(),
+              end_iso: slot.end.toISOString(),
+              staff_id: teamMemberId,
+              status: "confirmed",
+              created_at: new Date().toISOString(),
+              square_booking_id: squareBooking?.id || null
+            })
+
+            await safeSend(from, { text:
+`Reserva confirmada.
+Servicio: ${svc}
+Fecha: ${slot.start.format("dddd DD/MM HH:mm")}
+Duración: ${durationMin} min
+Pago en persona.` })
+            return
+          }
+
+          // falta algún dato → pedir SOLO lo necesario
+          const need = !data.name ? "tu nombre y apellidos" : "tu email"
+          await safeSend(from, { text: `Para confirmarte la reserva necesito ${need}.` })
+          upsertSession.run({
+            phone: phoneE164,
+            state: !data.name ? "ask_name" : "ask_email",
+            data_json: JSON.stringify(data),
+            updated_at: new Date().toISOString(),
+            last_prompt_at: new Date().toISOString()
+          })
           return
         }
 
