@@ -1,4 +1,4 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@adiwajshing/baileys"
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys"
 import qrcode from "qrcode-terminal"
 import pino from "pino"
 import "dotenv/config"
