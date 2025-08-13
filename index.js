@@ -1,3 +1,4 @@
+import express from "express"
 import baileys from "@whiskeysockets/baileys"
 import pino from "pino"
 import "dotenv/config"
@@ -6,6 +7,19 @@ import fs from "fs"
 
 const { makeWASocket, useMultiFileAuthState } = baileys
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+// 🚀 Servidor Express para que Railway mantenga vivo el proceso
+const app = express()
+const PORT = process.env.PORT || 3000
+
+app.get("/", (req, res) => {
+    res.send("Gapink Nails WhatsApp Bot está en ejecución ✅")
+})
+
+app.listen(PORT, () => {
+    console.log(`🌐 Servidor web escuchando en el puerto ${PORT}`)
+    startBot()
+})
 
 async function startBot() {
     console.log("🚀 Iniciando bot de Gapink Nails...")
@@ -28,6 +42,9 @@ async function startBot() {
         const { connection } = update
         if (connection === "open") {
             console.log("✅ Bot conectado a WhatsApp correctamente usando auth_info.")
+        }
+        if (connection === "close") {
+            console.log("❌ Conexión cerrada. El bot no intentará reconectar en Railway.")
         }
     })
 
@@ -64,5 +81,3 @@ async function responderGPT(userText) {
         return "Ha ocurrido un error, inténtalo más tarde."
     }
 }
-
-startBot()
