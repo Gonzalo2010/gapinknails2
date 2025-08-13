@@ -102,6 +102,20 @@ async function aiReply(text) {
   }
 }
 
+// --------- HELPERS TELÉFONO (ES) ----------
+function onlyDigits(s="") { return (s || "").replace(/\D+/g, "") }
+
+// Normaliza a E.164 España: +34XXXXXXXXX cuando es móvil/fijo español típico
+function normalizePhoneES(raw) {
+  const digits = onlyDigits(raw)
+  if (!digits) return null
+  if (digits.startsWith("34") && digits.length === 11) return `+${digits}`
+  if (digits.length === 9) return `+34${digits}`
+  if (digits.startsWith("00")) return `+${digits.slice(2)}`
+  if (raw.startsWith("+")) return raw
+  return `+${digits}` // fallback
+}
+
 // --------- SQUARE ----------
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
@@ -109,13 +123,47 @@ const square = new Client({
 })
 const locationId = process.env.SQUARE_LOCATION_ID
 
-async function squareFindCustomerByPhone(phone) {
+// Diagnóstico al arrancar (para detectar 401/mismatch sandbox/production)
+async function squareCheckCredentials() {
   try {
-    const resp = await square.customersApi.searchCustomers({
-      query: { filter: { phoneNumber: { exact: phone } } }
-    })
-    const list = resp?.result?.customers || []
-    return list[0] || null
+    const env = (process.env.SQUARE_ENV || "sandbox").toLowerCase()
+    const masked = (process.env.SQUARE_ACCESS_TOKEN || "").slice(0, 8) + "…"
+    console.log(`🔎 Square env: ${env} | token: ${masked} | location: ${locationId || "(sin LOCATION_ID)"}`)
+    const locs = await square.locationsApi.listLocations()
+    const ids = (locs.result.locations || []).map(l => `${l.id}:${l.name}`).join(", ") || "(ninguna)"
+    console.log(`✅ Square OK. Locations visibles: ${ids}`)
+    if (locationId) {
+      const found = (locs.result.locations || []).some(l => l.id === locationId)
+      if (!found) console.warn("⚠️ SQUARE_LOCATION_ID no aparece en este entorno. ¿Seguro que coincide sandbox/production?")
+    }
+  } catch (e) {
+    const msg = e?.message || String(e)
+    console.error(`⛔ Square credenciales no válidas (401 suele ser token/entorno): ${msg}`)
+  }
+}
+
+async function squareFindCustomerByPhone(phoneRaw) {
+  try {
+    const e164 = normalizePhoneES(phoneRaw)
+    const candidates = Array.from(new Set([
+      e164,
+      (e164 || "").replace("+", ""),  // sin +
+      onlyDigits(phoneRaw)            // solo dígitos
+    ])).filter(Boolean)
+
+    for (const ph of candidates) {
+      try {
+        const resp = await square.customersApi.searchCustomers({
+          query: { filter: { phoneNumber: { exact: ph } } }
+        })
+        const list = resp?.result?.customers || []
+        if (list[0]) return list[0]
+      } catch (inner) {
+        // Si es 401, no insistimos más
+        if (String(inner?.status) === "401") throw inner
+      }
+    }
+    return null
   } catch (e) {
     console.error("Square search error:", e?.message || e)
     return null
@@ -124,11 +172,12 @@ async function squareFindCustomerByPhone(phone) {
 
 async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
   try {
+    const phone = normalizePhoneES(phoneNumber)
     const resp = await square.customersApi.createCustomer({
       idempotencyKey: `cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
       givenName,
       emailAddress,
-      phoneNumber,
+      phoneNumber: phone || undefined,
       note: "Creado desde bot WhatsApp Gapink Nails"
     })
     return resp?.result?.customer || null
@@ -304,8 +353,9 @@ app.get("/qr.png", async (_req, res) => {
 })
 
 // --------- ARRANQUE WEB + BOT ----------
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🌐 Web escuchando en puerto ${PORT}`)
+  await squareCheckCredentials()  // 👈 diagnóstico de credenciales al iniciar
   startBot().catch((e)=>console.error("Fallo al iniciar bot:", e))
 })
 
@@ -365,7 +415,8 @@ async function startBot() {
         if (!msg?.message || msg.key.fromMe) return
 
         const from = msg.key.remoteJid
-        const phone = from?.split("@")[0] || ""
+        const phoneRaw = from?.split("@")[0] || ""
+        const phoneE164 = normalizePhoneES(phoneRaw) || phoneRaw
         const body =
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
@@ -374,12 +425,12 @@ async function startBot() {
         const low = (body || "").trim().toLowerCase()
 
         // STATE MACHINE (si ya estamos pidiendo datos, saltamos clasificador)
-        const sess = getSession.get({ phone })
+        const sess = getSession.get({ phone: phoneE164 })
         if (sess?.state === "ask_name") {
           const name = (body || "").trim().replace(/\s+/g, " ").slice(0,80)
           const data = JSON.parse(sess.data_json || "{}")
           data.name = name
-          upsertSession.run({ phone, state: "ask_email", data_json: JSON.stringify(data), updated_at: new Date().toISOString() })
+          upsertSession.run({ phone: phoneE164, state: "ask_email", data_json: JSON.stringify(data), updated_at: new Date().toISOString() })
           await safeSend(from, { text: "¿Cuál es tu email? (para enviarte la confirmación)" })
           return
         }
@@ -388,29 +439,28 @@ async function startBot() {
           const data = JSON.parse(sess.data_json || "{}")
           data.email = email
 
-          // Crear cliente en Square
           let sq = null
           try {
             sq = await squareCreateCustomer({
               givenName: data.name || "Cliente",
               emailAddress: email || undefined,
-              phoneNumber: phone
+              phoneNumber: phoneE164
             })
           } catch (e) { console.error("createCustomer error:", e) }
 
-          if (!sq) { clearSession.run({ phone }); return } // silencio
+          if (!sq) { clearSession.run({ phone: phoneE164 }); return } // silencio
 
           // Agendar primer hueco de la semana
           const dur = data.durationMin
           const svc = data.service
           const slot = firstSlotThisWeek(svc, dur)
-          if (!slot) { clearSession.run({ phone }); return }
+          if (!slot) { clearSession.run({ phone: phoneE164 }); return }
 
           const aptId = randomId("apt")
           insertAppt.run({
             id: aptId,
             customer_name: data.name,
-            customer_phone: phone,
+            customer_phone: phoneE164,
             customer_square_id: sq.id,
             service: svc,
             duration_min: dur,
@@ -421,7 +471,7 @@ async function startBot() {
             created_at: new Date().toISOString()
           })
 
-          clearSession.run({ phone })
+          clearSession.run({ phone: phoneE164 })
           await safeSend(from, { text:
 `Reserva confirmada.
 Servicio: ${svc}
@@ -437,7 +487,7 @@ Pago en persona.` })
 
         // Cancelar
         if (/(cancel(ar)? cita)/i.test(low)) {
-          const upcoming = getUpcomingByPhone.get({ phone, now: new Date().toISOString() })
+          const upcoming = getUpcomingByPhone.get({ phone: phoneE164, now: new Date().toISOString() })
           if (!upcoming) return
           updateApptStatus.run({ id: upcoming.id, status: "cancelled" })
           await safeSend(from, { text: "Tu cita ha sido cancelada. Si quieres, pide una nueva con “cita manicura”." })
@@ -446,7 +496,7 @@ Pago en persona.` })
 
         // Cambiar / mover
         if (/(cambiar cita|mover cita|reprogramar)/i.test(low)) {
-          const upcoming = getUpcomingByPhone.get({ phone, now: new Date().toISOString() })
+          const upcoming = getUpcomingByPhone.get({ phone: phoneE164, now: new Date().toISOString() })
           if (!upcoming) return
           const slot = firstSlotThisWeek(upcoming.service, upcoming.duration_min)
           if (!slot) return
@@ -465,7 +515,7 @@ Pago en persona.` })
         if (/(reserva|reservar|cita|disponible|disponibilidad|pedir hora|hueco)/i.test(low) && svc) {
           const durationMin = SERVICES[svc]
           let customer = null
-          try { customer = await squareFindCustomerByPhone(phone) } catch (e) { console.error("findCustomer error:", e) }
+          try { customer = await squareFindCustomerByPhone(phoneE164) } catch (e) { console.error("findCustomer error:", e) }
 
           if (customer) {
             const slot = firstSlotThisWeek(svc, durationMin)
@@ -474,7 +524,7 @@ Pago en persona.` })
             insertAppt.run({
               id: aptId,
               customer_name: customer.givenName || null,
-              customer_phone: phone,
+              customer_phone: phoneE164,
               customer_square_id: customer.id,
               service: svc,
               duration_min: durationMin,
@@ -493,13 +543,13 @@ Pago en persona.` })
             return
           } else {
             const data = { service: svc, durationMin }
-            upsertSession.run({ phone, state: "ask_name", data_json: JSON.stringify(data), updated_at: new Date().toISOString() })
+            upsertSession.run({ phone: phoneE164, state: "ask_name", data_json: JSON.stringify(data), updated_at: new Date().toISOString() })
             await safeSend(from, { text: "Para confirmar la reserva, dime tu nombre y apellidos." })
             return
           }
         }
 
-        // Si habla de disponibilidad pero SIN servicio, pedimos servicio (breve)
+        // Disponibilidad pero SIN servicio → pedimos servicio (breve)
         if (/(reserva|reservar|cita|disponible|disponibilidad|pedir hora|hueco)/i.test(low) && !Object.keys(SERVICES).some(s=>low.includes(s))) {
           const txt = Object.keys(SERVICES).map(s=>`• ${s} (${SERVICES[s]} min)`).join("\n")
           await safeSend(from, { text:
@@ -512,7 +562,7 @@ Ejemplos:
           return
         }
 
-        // Fallback breve (pero solo si es booking)
+        // Fallback breve (solo si es booking)
         const reply = await aiReply(body)
         if (reply) await safeSend(from, { text: reply })
       } catch (e) {
