@@ -3,12 +3,16 @@ import qrcode from "qrcode-terminal"
 import pino from "pino"
 import "dotenv/config"
 import OpenAI from "openai"
+import fs from "fs"
 
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
 async function startBot() {
+    console.log("🚀 Iniciando bot de Gapink Nails...")
+
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
+
     const sock = makeWASocket({
         logger: pino({ level: "silent" }),
         printQRInTerminal: true,
@@ -17,16 +21,20 @@ async function startBot() {
 
     sock.ev.on("connection.update", (update) => {
         const { connection, lastDisconnect, qr } = update
+
         if (qr) {
+            console.log("📲 Escanea este QR en WhatsApp → Dispositivos vinculados → Vincular dispositivo")
             qrcode.generate(qr, { small: true })
         }
+
         if (connection === "close") {
             const reason = lastDisconnect?.error?.output?.statusCode
+            console.log("❌ Conexión cerrada. Razón:", reason)
             if (reason !== DisconnectReason.loggedOut) {
                 startBot()
             }
         } else if (connection === "open") {
-            console.log("✅ Bot conectado a WhatsApp")
+            console.log("✅ Bot conectado a WhatsApp correctamente.")
         }
     })
 
