@@ -1,84 +1,117 @@
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
 import pino from "pino"
+import qrcode from "qrcode-terminal"
 import "dotenv/config"
 import OpenAI from "openai"
 import fs from "fs"
 
-const { makeWASocket, useMultiFileAuthState } = baileys
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// 🚀 Servidor Express para que Railway mantenga vivo el proceso
+// ---- Servidor web para que Railway mantenga vivo el proceso
 const app = express()
-const PORT = process.env.PORT || 3000
+const PORT = process.env.PORT || 8080
+app.get("/", (_, res) => res.send("Gapink Nails WhatsApp Bot ✅ OK")))
+app.get("/health", (_, res) => res.json({ ok: true }))
+app.listen(PORT, () => console.log(`🌐 Servidor web escuchando en el puerto ${PORT}`))
 
-app.get("/", (req, res) => {
-    res.send("Gapink Nails WhatsApp Bot está en ejecución ✅")
-})
-
-app.listen(PORT, () => {
-    console.log(`🌐 Servidor web escuchando en el puerto ${PORT}`)
-    startBot()
-})
+// ---- Bot WhatsApp (Baileys) con reconexión controlada y QR en logs
+const AUTH_DIR = "auth_info"
+let reconnectAttempts = 0
 
 async function startBot() {
-    console.log("🚀 Iniciando bot de Gapink Nails...")
+  console.log("🚀 Iniciando bot de Gapink Nails...")
 
-    const authFolder = "auth_info"
-    if (!fs.existsSync(authFolder) || fs.readdirSync(authFolder).length === 0) {
-        console.log("⚠️ No se encontró sesión en auth_info. No se iniciará la conexión.")
-        return
+  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true })
+
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+
+  const sock = makeWASocket({
+    logger: pino({ level: "silent" }),
+    // Mostramos QR en terminal SIEMPRE que WhatsApp nos lo dé
+    printQRInTerminal: false,
+    auth: state,
+    syncFullHistory: false
+  })
+
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update
+
+    if (qr) {
+      console.log("📲 Escanea este QR YA (caduca en ~20s):")
+      qrcode.generate(qr, { small: true }) // QR ASCII en logs de Railway
     }
 
+    if (connection === "open") {
+      reconnectAttempts = 0
+      console.log("✅ Bot conectado a WhatsApp correctamente.")
+    }
 
-    const { state, saveCreds } = await useMultiFileAuthState(authFolder)
+    if (connection === "close") {
+      const error = lastDisconnect?.error
+      // Intentamos sacar info útil
+      const status = error?.output?.statusCode || error?.status || "desconocido"
+      const message = error?.message || error?.toString?.() || "sin detalle"
+      console.log(`❌ Conexión cerrada. Status: ${status}. Motivo: ${message}`)
 
-    const sock = makeWASocket({
-        logger: pino({ level: "silent" }),
-        printQRInTerminal: false,
-        auth: state
-    })
+      // Si la sesión fue cerrada desde el móvil, pedimos QR en Railway para re-vincular.
+      const shouldRelogin =
+        status === DisconnectReason.loggedOut ||
+        /logged.?out|invalid|bad session/i.test(String(message))
 
-    sock.ev.on("connection.update", (update) => {
-        const { connection } = update
-        if (connection === "open") {
-            console.log("✅ Bot conectado a WhatsApp correctamente usando auth_info.")
-        }
-        if (connection === "close") {
-            console.log("❌ Conexión cerrada. El bot no intentará reconectar en Railway.")
-        }
-    })
+      // Backoff suave para no entrar en bucle loco
+      if (shouldRelogin || reconnectAttempts < 8) {
+        const waitMs = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts)) // 1s,2s,4s..max30s
+        reconnectAttempts++
+        console.log(`🔄 Reintentando en ${waitMs}ms${shouldRelogin ? " (mostraremos QR si hace falta)" : ""}...`)
+        setTimeout(() => startBot().catch(console.error), waitMs)
+      } else {
+        console.log("🛑 Demasiados reintentos. Me quedo a la espera (el server Express sigue vivo).")
+      }
+    }
+  })
 
-    sock.ev.on("messages.upsert", async (m) => {
-        const msg = m.messages[0]
-        if (!msg.message || msg.key.fromMe) return
+  sock.ev.on("creds.update", saveCreds)
 
-        const from = msg.key.remoteJid
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || ""
+  // Mensajes entrantes -> GPT-4o-mini
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    const msg = messages?.[0]
+    if (!msg?.message || msg.key.fromMe) return
 
-        if (text) {
-            console.log(`📩 Mensaje de ${from}: ${text}`)
-            const reply = await responderGPT(text)
-            await sock.sendMessage(from, { text: reply })
-        }
-    })
+    const from = msg.key.remoteJid
+    const text =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      msg.message?.imageMessage?.caption ||
+      ""
 
-    sock.ev.on("creds.update", saveCreds)
+    if (!text) return
+
+    console.log(`📩 ${from}: ${text}`)
+    const reply = await responderGPT(text)
+    await sock.sendMessage(from, { text: reply })
+  })
 }
 
 async function responderGPT(userText) {
-    try {
-        const response = await client.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
-                { role: "system", content: "Eres un asistente de Gapink Nails que responde breve, amable y profesional." },
-                { role: "user", content: userText }
-            ],
-            temperature: 0.7
-        })
-        return response.choices[0].message.content.trim()
-    } catch (err) {
-        console.error("Error con OpenAI:", err)
-        return "Ha ocurrido un error, inténtalo más tarde."
-    }
+  try {
+    const r = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "Eres el asistente de Gapink Nails: amable, breve, directo y profesional." },
+        { role: "user", content: userText }
+      ],
+      temperature: 0.7
+    })
+    return r.choices[0].message.content.trim()
+  } catch (e) {
+    console.error("Error OpenAI:", e?.message || e)
+    return "Ahora mismo no puedo responder, inténtalo en un momento."
+  }
 }
+
+// Arrancar el bot
+startBot().catch((e) => {
+  console.error("Fallo al iniciar el bot:", e)
+})
