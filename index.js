@@ -8,27 +8,29 @@ import OpenAI from "openai"
 import fs from "fs"
 import { webcrypto } from "crypto"
 
-// 🔧 Exponer WebCrypto global (requerido por Baileys en Node ESM)
+// 🔧 WebCrypto global
 if (!globalThis.crypto) globalThis.crypto = webcrypto
 
 const {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,         // 👈 versión WA web
+  fetchLatestBaileysVersion,
   Browsers
 } = baileys
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-
-// --- Web server para mantener Railway vivo
 const app = express()
 const PORT = process.env.PORT || 8080
 
+// Estado global
+let lastQR = null
+let isConnected = false
+
+// Página raíz
 app.get("/", (_req, res) => res.send("Gapink Nails WhatsApp Bot ✅ OK"))
 
-// QR como PNG en vivo
-let lastQR = null
+// QR como PNG
 app.get("/qr.png", async (_req, res) => {
   try {
     if (!lastQR) return res.status(404).send("No hay QR activo ahora mismo")
@@ -39,12 +41,32 @@ app.get("/qr.png", async (_req, res) => {
   }
 })
 
+// Página pública de estado
+app.get("/estado", (_req, res) => {
+  if (isConnected) {
+    return res.send(`
+      <h1>✅ Bot conectado a WhatsApp</h1>
+      <p>No es necesario escanear QR</p>
+    `)
+  } else if (lastQR) {
+    return res.send(`
+      <h1>❌ Bot no conectado</h1>
+      <p>Escanea este QR para vincularlo:</p>
+      <img src="/qr.png" style="max-width:300px;">
+    `)
+  } else {
+    return res.send(`
+      <h1>❌ Bot no conectado</h1>
+      <p>No hay QR disponible en este momento.</p>
+    `)
+  }
+})
+
 app.listen(PORT, () => {
   console.log(`🌐 Servidor web escuchando en el puerto ${PORT}`)
   startBot().catch((e) => console.error("Fallo al iniciar el bot:", e))
 })
 
-// --- Baileys + reconexión con backoff y QR en logs/PNG
 const AUTH_DIR = "auth_info"
 let reconnectAttempts = 0
 
@@ -54,7 +76,6 @@ async function startBot() {
   if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true })
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
-  // 👇 Obtener la última versión soportada de WhatsApp Web
   const { version } = await fetchLatestBaileysVersion()
   console.log("ℹ️ Versión WA Web usada por Baileys:", version)
 
@@ -62,8 +83,8 @@ async function startBot() {
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
     auth: state,
-    version,                                        // 👈 importantísimo para evitar 405
-    browser: Browsers.macOS("Desktop"),             // 👈 fingerprint de navegador válido
+    version,
+    browser: Browsers.macOS("Desktop"),
     syncFullHistory: false,
     connectTimeoutMs: 30000
   })
@@ -73,6 +94,7 @@ async function startBot() {
 
     if (qr) {
       lastQR = qr
+      isConnected = false
       console.log("📲 Escanéalo YA (caduca en ~20s). También disponible en /qr.png")
       qrcodeTerminal.generate(qr, { small: true })
     }
@@ -80,10 +102,12 @@ async function startBot() {
     if (connection === "open") {
       reconnectAttempts = 0
       lastQR = null
+      isConnected = true
       console.log("✅ Bot conectado a WhatsApp correctamente.")
     }
 
     if (connection === "close") {
+      isConnected = false
       const err = lastDisconnect?.error
       const status = err?.output?.statusCode ?? err?.status ?? "desconocido"
       const msg = err?.message ?? String(err ?? "")
@@ -93,21 +117,19 @@ async function startBot() {
         status === DisconnectReason.loggedOut ||
         /logged.?out|invalid|bad session/i.test(msg)
 
-      // Backoff 1s → 30s
       if (shouldRelogin || reconnectAttempts < 8) {
         const waitMs = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts))
         reconnectAttempts++
         console.log(`🔄 Reintentando en ${waitMs}ms...`)
         setTimeout(() => startBot().catch(console.error), waitMs)
       } else {
-        console.log("🛑 Demasiados reintentos. Me quedo vivo gracias a Express; revisa /qr.png si pide nuevo enlace.")
+        console.log("🛑 Demasiados reintentos. Revisa /qr.png si pide nuevo enlace.")
       }
     }
   })
 
   sock.ev.on("creds.update", saveCreds)
 
-  // Mensajes -> GPT-4o-mini
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages?.[0]
     if (!msg?.message || msg.key.fromMe) return
