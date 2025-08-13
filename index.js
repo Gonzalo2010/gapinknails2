@@ -1,6 +1,6 @@
 // index.js — Gapink Nails WhatsApp Bot
-// DeepSeek + extracción JSON + sesiones seguras + TZ + confirmación fina
-// + cola de envío con reintentos (Baileys Timed Out fix)
+// DeepSeek + extracción JSON + TZ + confirmación fina
+// Cola de envío Baileys + ANTI-DUPLICADOS: índice único (staff_id,start_iso) + pending-lock + idempotencia Square
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -9,7 +9,7 @@ import qrcode from "qrcode"
 import qrcodeTerminal from "qrcode-terminal"
 import "dotenv/config"
 import fs from "fs"
-import { webcrypto } from "crypto"
+import { webcrypto, createHash } from "crypto"
 import Database from "better-sqlite3"
 import dayjs from "dayjs"
 import utc from "dayjs/plugin/utc.js"
@@ -52,7 +52,7 @@ async function dsChat(messages, { temperature=0.4 } = {}) {
 }
 
 const SYS_TONE = `Eres el asistente de WhatsApp de Gapink Nails (España).
-Habla natural, breve y sin emojis. No menciones que eres IA.
+Habla natural, breve y sin emojis. No digas que eres IA.
 Si la hora pedida está libre, ofrécela tal cual; si no, propone la más cercana y pide confirmación.
 No ofrezcas elegir profesional. Pago siempre en persona.`
 
@@ -77,7 +77,6 @@ Devuelve SOLO un JSON válido (omite claves que no apliquen):
     return JSON.parse(jsonStr)
   } catch { return { intent:"other", polite_reply:"" } }
 }
-
 async function aiSay(contextSummary) {
   return await dsChat([
     { role:"system", content: SYS_TONE },
@@ -100,7 +99,6 @@ function normalizePhoneES(raw) {
   if (digits.startsWith("00")) return `+${digits.slice(2)}`
   return `+${digits}`
 }
-
 function detectServiceFree(text="") {
   const low = rmDiacritics(text.toLowerCase())
   const map = { "unas acrilicas":"uñas acrílicas", "uñas acrilicas":"uñas acrílicas", "uñas acrílicas":"uñas acrílicas" }
@@ -108,7 +106,6 @@ function detectServiceFree(text="") {
   for (const k of Object.keys(SERVICES)) if (low.includes(rmDiacritics(k))) return k
   return null
 }
-
 function parseDateTimeES(dtText) {
   if (!dtText) return null
   const t = rmDiacritics(dtText.toLowerCase())
@@ -144,7 +141,6 @@ function parseDateTimeES(dtText) {
   if (hour===null) return null
   return base.hour(hour).minute(minute).second(0).millisecond(0)
 }
-
 const fmtES = (d)=> {
   const t = d.tz(EURO_TZ)
   const dias = ["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]
@@ -169,7 +165,6 @@ async function squareCheckCredentials() {
     console.log(`✅ Square listo. Location ${locationId}, TZ=${LOCATION_TZ}`)
   } catch (e) { console.error("⛔ Square:", e?.message || e) }
 }
-
 async function squareFindCustomerByPhone(phoneRaw) {
   try {
     const e164 = normalizePhoneES(phoneRaw)
@@ -178,7 +173,6 @@ async function squareFindCustomerByPhone(phoneRaw) {
     return (resp?.result?.customers || [])[0] || null
   } catch (e) { console.error("Square search:", e?.message || e); return null }
 }
-
 async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
   try {
     const phone = normalizePhoneES(phoneNumber)
@@ -190,14 +184,16 @@ async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
     return resp?.result?.customer || null
   } catch (e) { console.error("Square create:", e?.message || e); return null }
 }
-
 async function getServiceVariationVersion(serviceVariationId) {
   try {
     const resp = await square.catalogApi.retrieveCatalogObject(serviceVariationId, true)
     return resp?.result?.object?.version
   } catch (e) { console.error("getServiceVariationVersion:", e?.message || e); return undefined }
 }
-
+function stableKey({ locationId, serviceVariationId, startISO, customerId }) {
+  const raw = `${locationId}|${serviceVariationId}|${startISO}|${customerId}`
+  return createHash('sha256').update(raw).digest('hex').slice(0, 48)
+}
 async function createSquareBooking({ startEU, serviceKey, customerId, teamMemberId }) {
   try {
     const serviceVariationId = SERVICE_VARIATIONS[serviceKey]
@@ -206,10 +202,8 @@ async function createSquareBooking({ startEU, serviceKey, customerId, teamMember
     if (!version) return null
 
     const startISO = startEU.tz("UTC").toISOString()
-    const endISO = startEU.clone().add(SERVICES[serviceKey],"minute").tz("UTC").toISOString()
-
     const body = {
-      idempotencyKey: `book_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+      idempotencyKey: stableKey({ locationId, serviceVariationId, startISO, customerId }),
       booking: {
         locationId,
         startAt: startISO,
@@ -225,7 +219,7 @@ async function createSquareBooking({ startEU, serviceKey, customerId, teamMember
       }
     }
     const resp = await square.bookingsApi.createBooking(body)
-    return { booking: resp?.result?.booking || null, startISO, endISO }
+    return resp?.result?.booking || null
   } catch (e) { console.error("createSquareBooking:", e?.message || e); return null }
 }
 
@@ -243,7 +237,7 @@ CREATE TABLE IF NOT EXISTS appointments (
   start_iso TEXT,
   end_iso TEXT,
   staff_id TEXT,
-  status TEXT,
+  status TEXT,            -- 'pending' | 'confirmed' | 'cancelled'
   created_at TEXT,
   square_booking_id TEXT
 );
@@ -252,11 +246,16 @@ CREATE TABLE IF NOT EXISTS sessions (
   data_json TEXT,
   updated_at TEXT
 );
+-- Índice único: un staff no puede tener dos citas al mismo inicio (pending o confirmed)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_slot
+ON appointments(staff_id, start_iso)
+WHERE status IN ('pending','confirmed');
 `)
 const insertAppt = db.prepare(`INSERT INTO appointments
 (id, customer_name, customer_phone, customer_square_id, service, duration_min, start_iso, end_iso, staff_id, status, created_at, square_booking_id)
 VALUES (@id, @customer_name, @customer_phone, @customer_square_id, @service, @duration_min, @start_iso, @end_iso, @staff_id, @status, @created_at, @square_booking_id)`)
-
+const updateAppt = db.prepare(`UPDATE appointments SET status=@status, square_booking_id=@square_booking_id WHERE id=@id`)
+const deleteAppt = db.prepare(`DELETE FROM appointments WHERE id=@id`)
 const getSessionRow = db.prepare(`SELECT * FROM sessions WHERE phone=@phone`)
 const upsertSession = db.prepare(`
 INSERT INTO sessions (phone, data_json, updated_at)
@@ -279,9 +278,13 @@ function saveSession(phone, data) {
   upsertSession.run({ phone, data_json: JSON.stringify(toSave), updated_at: new Date().toISOString() })
 }
 
-// ===== Disponibilidad local
+// ===== Disponibilidad (cuenta pending + confirmed)
 function getBookedIntervals(fromIso, toIso) {
-  const rows = db.prepare(`SELECT start_iso, end_iso, staff_id FROM appointments WHERE status='confirmed' AND start_iso < @to AND end_iso > @from`).all({ from: fromIso, to: toIso })
+  const rows = db.prepare(`
+    SELECT start_iso, end_iso, staff_id
+    FROM appointments
+    WHERE status IN ('pending','confirmed') AND start_iso < @to AND end_iso > @from
+  `).all({ from: fromIso, to: toIso })
   return rows.map(r => ({ start: dayjs(r.start_iso), end: dayjs(r.end_iso), staff_id: r.staff_id }))
 }
 function staffHasFree(intervals, start, end) {
@@ -312,7 +315,6 @@ function suggestOrExact(startEU, durationMin) {
     }
     return { exact:null, suggestion:null }
   }
-
   if (staffHasFree(intervals, startEU.tz("UTC"), endEU.tz("UTC"))) return { exact:startEU, suggestion:null }
 
   const dayStart = startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
@@ -339,10 +341,9 @@ app.get("/qr.png", async (_req,res)=>{
   res.set("Content-Type","image/png").send(png)
 })
 
-// ===== Cola de envío con reintentos (Baileys Timed Out fix)
+// ===== Cola de envío con reintentos
 const wait = (ms) => new Promise(r => setTimeout(r, ms))
 
-// ===== Bot
 app.listen(PORT, async ()=>{
   console.log(`🌐 Web en puerto ${PORT}`)
   await squareCheckCredentials()
@@ -356,9 +357,7 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion()
 
-    let isOpen = false
-    let reconnecting = false
-
+    let isOpen = false, reconnecting = false
     const sock = makeWASocket({
       logger: pino({ level:"silent" }),
       printQRInTerminal: false,
@@ -369,60 +368,33 @@ async function startBot() {
       connectTimeoutMs: 30000
     })
 
-    // ===== Outbox
-    const outbox = []
-    let sending = false
-    const __SAFE_SEND__ = (jid, content) => new Promise((resolve, reject) => {
-      outbox.push({ jid, content, resolve, reject })
-      processOutbox().catch(console.error)
-    })
+    // Outbox
+    const outbox = []; let sending = false
+    const __SAFE_SEND__ = (jid, content) => new Promise((resolve, reject) => { outbox.push({ jid, content, resolve, reject }); processOutbox().catch(console.error) })
     async function processOutbox() {
-      if (sending) return
-      sending = true
+      if (sending) return; sending = true
       while (outbox.length) {
         const { jid, content, resolve, reject } = outbox.shift()
-        // Esperar conexión
-        let guard = 0
-        while (!isOpen && guard < 60) { await wait(1000); guard++ }
+        let guard = 0; while (!isOpen && guard < 60) { await wait(1000); guard++ }
         if (!isOpen) { reject(new Error("WA not connected")); continue }
-        // Reintentos
         let ok=false, err=null
         for (let attempt=1; attempt<=4; attempt++) {
           try { await sock.sendMessage(jid, content); ok=true; break }
-          catch (e) {
-            err = e
-            const msg = e?.data?.stack || e?.message || String(e)
-            if (/Timed Out/i.test(msg) || /Boom/i.test(msg)) { await wait(500*attempt); continue }
-            await wait(400)
-          }
+          catch (e) { err=e; const msg=e?.data?.stack||e?.message||String(e); if (/Timed Out/i.test(msg)||/Boom/i.test(msg)) { await wait(500*attempt); continue } await wait(400) }
         }
-        if (ok) resolve(true)
-        else {
-          console.error("sendMessage failed after retries:", err?.message || err)
-          reject(err)
-          if (/Timed Out/i.test(err?.message || "")) { try { await sock.ws.close() } catch {} }
-        }
+        if (ok) resolve(true); else { console.error("sendMessage failed:", err?.message||err); reject(err); if (/Timed Out/i.test(err?.message||"")) { try{ await sock.ws.close() }catch{} } }
       }
       sending = false
     }
 
     sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr })=>{
-      if (qr){ lastQR = qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
+      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
       if (connection==="open"){ lastQR=null; conectado=true; isOpen=true; console.log("✅ Conectado a WhatsApp"); processOutbox().catch(console.error) }
-      if (connection==="close"){
-        conectado=false; isOpen=false
-        const reason = lastDisconnect?.error?.message || String(lastDisconnect?.error || "")
-        console.log("❌ Conexión cerrada:", reason)
-        if (!reconnecting) {
-          reconnecting = true
-          await wait(2000)
-          try { await startBot() } finally { reconnecting=false }
-        }
-      }
+      if (connection==="close"){ conectado=false; isOpen=false; const reason=lastDisconnect?.error?.message||String(lastDisconnect?.error||""); console.log("❌ Conexión cerrada:", reason); if(!reconnecting){ reconnecting=true; await wait(2000); try{ await startBot() } finally { reconnecting=false } } }
     })
     sock.ev.on("creds.update", saveCreds)
 
-    // ===== Mensajes
+    // Mensajes
     sock.ev.on("messages.upsert", async ({ messages })=>{
       try {
         const m = messages?.[0]; if (!m?.message || m.key.fromMe) return
@@ -442,7 +414,8 @@ async function startBot() {
           name: null,
           email: null,
           confirmApproved: false,
-          confirmAsked: false
+          confirmAsked: false,
+          bookingInFlight: false
         }
 
         // IA: extracción
@@ -452,7 +425,7 @@ async function startBot() {
         if (!data.email && extra.email) data.email = extra.email
         if (YES_RE.test(textRaw) || extra.confirm === "yes") data.confirmApproved = true
         if (NO_RE.test(textRaw)  || extra.confirm === "no")  { data.confirmApproved = false; data.confirmAsked = false }
-        saveSession(phone, data) // guardamos confirmApproved ya
+        saveSession(phone, data) // persiste flags
 
         // Fecha/hora
         const whenText = extra.datetime_text || textRaw
@@ -460,7 +433,7 @@ async function startBot() {
         if (parsed) data.startEU = parsed
         if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
 
-        // Cancelación rápida (si quieres puedes ampliarla con DB futura)
+        // Cancelación rápida
         if ((extra.intent==="cancel") || /cancel(ar)? cita/i.test(textRaw)) {
           await __SAFE_SEND__(from,{ text: "Cancelación anotada. Si quieres, dime otra fecha y te busco hueco." })
           clearSession.run({ phone }); return
@@ -528,45 +501,83 @@ Mensaje del cliente: "${textRaw}"`
   }
 }
 
-// ===== Finalizar reserva
+// ===== Finalizar reserva con candado anti-dobles
 async function finalizeBooking({ from, phone, data, safeSend }) {
   try {
+    if (data.bookingInFlight) return
+    data.bookingInFlight = true
+    saveSession(phone, data)
+
+    // Cliente
     let customer = await squareFindCustomerByPhone(phone)
     if (!customer) {
-      if (!data.name || !data.email) { await safeSend(from,{ text: "Me falta tu nombre y email para crear la reserva." }); return }
+      if (!data.name || !data.email) {
+        await safeSend(from,{ text: "Me falta tu nombre y email para crear la reserva." })
+        data.bookingInFlight = false; saveSession(phone, data); return
+      }
       customer = await squareCreateCustomer({ givenName: data.name, emailAddress: data.email, phoneNumber: phone })
     }
-    if (!customer) { await safeSend(from,{ text: "Ahora mismo no puedo crear tu ficha. Probamos en un minuto." }); return }
+    if (!customer) { await safeSend(from,{ text: "Ahora mismo no puedo crear tu ficha. Probamos en un minuto." }); data.bookingInFlight=false; saveSession(phone,data); return }
 
-    const teamMemberId = TEAM_MEMBER_IDS[0] || null
-    const created = await createSquareBooking({ startEU: data.startEU, serviceKey: data.service, customerId: customer.id, teamMemberId })
-    if (!created?.booking) { await safeSend(from,{ text: "No he podido cerrar la cita ahora mismo. ¿Probamos otra vez?" }); return }
+    // Elegir staff (primero de la lista)
+    const teamMemberId = TEAM_MEMBER_IDS[0] || "any"
 
-    const id = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
-    insertAppt.run({
-      id,
-      customer_name: data.name || customer?.givenName || null,
-      customer_phone: phone,
-      customer_square_id: customer.id,
-      service: data.service,
-      duration_min: SERVICES[data.service],
-      start_iso: created.startISO,
-      end_iso: dayjs(created.startISO).add(SERVICES[data.service], "minute").toISOString(),
-      staff_id: teamMemberId,
-      status: "confirmed",
-      created_at: new Date().toISOString(),
-      square_booking_id: created.booking.id || null
-    })
+    // Claim local PENDING con índice único (candado)
+    const durationMin = SERVICES[data.service]
+    const startUTC = data.startEU.tz("UTC")
+    const endUTC   = startUTC.clone().add(durationMin,"minute")
+    const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
 
+    try {
+      insertAppt.run({
+        id: aptId,
+        customer_name: data.name || customer?.givenName || null,
+        customer_phone: phone,
+        customer_square_id: customer.id,
+        service: data.service,
+        duration_min: durationMin,
+        start_iso: startUTC.toISOString(),
+        end_iso: endUTC.toISOString(),
+        staff_id: teamMemberId,
+        status: "pending",
+        created_at: new Date().toISOString(),
+        square_booking_id: null
+      })
+    } catch (e) {
+      // violación del índice único = ya cogido
+      if (String(e?.message||"").includes("UNIQUE")) {
+        await safeSend(from,{ text: "Ese hueco se acaba de ocupar. Te propongo otra hora y te confirmo en un momento." })
+        data.bookingInFlight = false; saveSession(phone, data)
+        return
+      }
+      throw e
+    }
+
+    // Llamada a Square (idempotente)
+    const sq = await createSquareBooking({ startEU: data.startEU, serviceKey: data.service, customerId: customer.id, teamMemberId })
+    if (!sq) {
+      deleteAppt.run({ id: aptId }) // libera candado
+      await safeSend(from,{ text: "No he podido cerrar la cita ahora mismo. ¿Probamos otra vez?" })
+      data.bookingInFlight = false; saveSession(phone, data)
+      return
+    }
+
+    // Confirmar local
+    updateAppt.run({ id: aptId, status: "confirmed", square_booking_id: sq.id || null })
     clearSession.run({ phone })
+
     await safeSend(from,{ text:
 `Reserva confirmada.
 Servicio: ${data.service}
 Fecha: ${fmtES(data.startEU)}
-Duración: ${SERVICES[data.service]} min
+Duración: ${durationMin} min
 Pago en persona.` })
   } catch (e) {
     console.error("finalizeBooking:", e)
     await safeSend(from,{ text: "Ha fallado el cierre de la reserva. Lo reviso y te aviso." })
+  } finally {
+    data.bookingInFlight = false
+    // no guardo sesión si ya se limpió; da igual si falla
+    try { saveSession(phone, data) } catch {}
   }
 }
