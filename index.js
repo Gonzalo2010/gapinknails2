@@ -30,6 +30,7 @@ async function startBot() {
         return
     }
 
+
     const { state, saveCreds } = await useMultiFileAuthState(authFolder)
 
     const sock = makeWASocket({
