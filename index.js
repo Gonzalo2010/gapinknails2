@@ -16,75 +16,66 @@ if (!globalThis.crypto) globalThis.crypto = webcrypto
 const {
   makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers
 } = baileys
 
-// --------- CONFIG HORARIOS / NEGOCIO ----------
-const WORK_DAYS = [1,2,3,4,5,6] // 1=lun ... 6=sáb (dom=7 cerrado)
-const OPEN_HOUR = 10
+// =================== CONFIG NEGOCIO ===================
+const WORK_DAYS = [1,2,3,4,5,6]         // 1=lun ... 6=sáb (7=dom cerrado)
+const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
-const SLOT_MIN = 30
+const SLOT_MIN   = 30
 
-// Servicios (duración aprox)
+// Servicios y duraciones
 const SERVICES = {
-  "manicura": 45,
-  "pedicura": 60,
   "uñas acrílicas": 90,
-  "relleno": 75,
-  "semipermanente": 45
+  // si luego añades más:
+  // "manicura": 45,
+  // "pedicura": 60,
+  // "relleno": 75,
+  // "semipermanente": 45
 }
 
-// Técnicas internas (no mostrar nombres)
-const STAFF = [
-  { id: "s1", name: "Ana" },
-  { id: "s2", name: "Laura" },
-  { id: "s3", name: "Marta" },
-  { id: "s4", name: "Sara" }
-]
+// Mapear servicios → service_variation_id (solo acrílicas ahora)
+const SERVICE_VARIATIONS = {
+  "uñas acrílicas": process.env.SQ_SV_UNAS_ACRILICAS || ""
+}
 
-// --------- OPENAI ----------
+// Técnicas (IDs reales de Square). No mostramos nombres.
+const TEAM_MEMBER_IDS = (process.env.SQ_TEAM_IDS || "")
+  .split(",").map(s => s.trim()).filter(Boolean)
+
+// =================== OPENAI ===================
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Prompt “humano” y sin revelar técnica
 const SYSTEM_PROMPT = `Eres el asistente de WhatsApp de Gapink Nails. Tu objetivo es sonar humano (natural y cercano), no robótico.
-Reglas clave:
+Reglas:
 - Nunca reveles el nombre de la técnica ni ofrezcas elegir profesional.
-- Prioriza siempre rellenar los huecos más próximos de la semana. Propón el primer hueco disponible que encaje.
-- Sé breve y claro (frases cortas). Nada de párrafos eternos. No repitas información.
-- No uses emojis. Tono amable y profesional, con calidez.
-- El pago siempre es en persona; no ofrezcas pagos online.
-- Si el cliente es nuevo y falta dato, pide SOLO lo imprescindible (nombre y email) sin agobiar.
-- Si el mensaje NO trata de reservas, cambios, cancelaciones, disponibilidad u horarios de atención, no respondas.
-- Si pide algo muy específico (ej. una técnica concreta), redirígelo con tacto: “Te propongo el primer hueco disponible” sin mencionar nombres.
-- En confirmaciones, incluye servicio, fecha/hora y que el pago será en persona.
-- Lenguaje: español de España, correcto pero cercano.
-- Jamás hables de que eres una IA ni de “modelos” o “prompts”.`
+- Prioriza rellenar huecos cercanos de la semana, salvo que el cliente pida hora/día concreto (intenta respetarlo).
+- Mensajes cortos y claros, sin emojis.
+- Pago siempre en persona.
+- Si faltan datos para alta nueva, pide solo nombre y email.
+- Si el mensaje NO trata de reservas/cambios/cancelaciones/disponibilidad, no respondas.
+- En confirmaciones incluye servicio, fecha/hora y que el pago será en persona.
+- Español de España. Nunca hables de que eres IA.`
 
-// Clasificador: decide si responder (solo citas/reservas)
 async function isBookingIntent(text) {
   try {
     const r = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         { role: "system", content:
-`Eres un clasificador. Devuelve SOLO una palabra:
-- "BOOKING" si el mensaje trata de reservar, cita, pedir hora, disponibilidad, cambiar o cancelar cita, servicio de uñas o precios/horarios relacionados con reservar.
-- "IGNORE" en cualquier otro caso.` },
+`Devuelve SOLO:
+BOOKING -> si el mensaje trata de reservar/cita/disponibilidad/cambiar/cancelar.
+IGNORE  -> en cualquier otro caso.` },
         { role: "user", content: text || "" }
       ],
       temperature: 0
     })
-    const out = (r.choices[0].message.content || "").trim().toUpperCase()
-    return out.startsWith("BOOKING")
-  } catch (e) {
-    console.error("Classifier error:", e)
-    return false // silencioso
-  }
+    return (r.choices[0].message.content || "").trim().toUpperCase().startsWith("BOOKING")
+  } catch (e) { console.error("Classifier error:", e); return false }
 }
 
-// Generador de respuesta breve y humana (solo para mensajes de cita)
 async function aiReply(text) {
   try {
     const r = await openai.chat.completions.create({
@@ -96,16 +87,11 @@ async function aiReply(text) {
       temperature: 0.4
     })
     return r.choices[0].message.content?.trim() || ""
-  } catch (e) {
-    console.error("AI reply error:", e)
-    return "" // silencioso
-  }
+  } catch (e) { console.error("AI reply error:", e); return "" }
 }
 
-// --------- HELPERS TELÉFONO (ES) ----------
-function onlyDigits(s="") { return (s || "").replace(/\D+/g, "") }
-
-// Normaliza a E.164 España: +34XXXXXXXXX cuando es móvil/fijo español típico
+// =================== HELPERS TELÉFONO ===================
+const onlyDigits = (s="") => (s || "").replace(/\D+/g, "")
 function normalizePhoneES(raw) {
   const digits = onlyDigits(raw)
   if (!digits) return null
@@ -113,61 +99,37 @@ function normalizePhoneES(raw) {
   if (digits.length === 9) return `+34${digits}`
   if (digits.startsWith("00")) return `+${digits.slice(2)}`
   if (raw.startsWith("+")) return raw
-  return `+${digits}` // fallback
+  return `+${digits}`
 }
 
-// --------- SQUARE ----------
+// =================== SQUARE SDK ===================
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment: process.env.SQUARE_ENV === "production" ? Environment.Production : Environment.Sandbox
 })
 const locationId = process.env.SQUARE_LOCATION_ID
+let LOCATION_TZ = "Europe/Madrid" // solo para logs
 
-// Diagnóstico al arrancar (para detectar 401/mismatch sandbox/production)
 async function squareCheckCredentials() {
   try {
-    const env = (process.env.SQUARE_ENV || "sandbox").toLowerCase()
-    const masked = (process.env.SQUARE_ACCESS_TOKEN || "").slice(0, 8) + "…"
-    console.log(`🔎 Square env: ${env} | token: ${masked} | location: ${locationId || "(sin LOCATION_ID)"}`)
     const locs = await square.locationsApi.listLocations()
-    const ids = (locs.result.locations || []).map(l => `${l.id}:${l.name}`).join(", ") || "(ninguna)"
-    console.log(`✅ Square OK. Locations visibles: ${ids}`)
-    if (locationId) {
-      const found = (locs.result.locations || []).some(l => l.id === locationId)
-      if (!found) console.warn("⚠️ SQUARE_LOCATION_ID no aparece en este entorno. ¿Seguro que coincide sandbox/production?")
-    }
-  } catch (e) {
-    const msg = e?.message || String(e)
-    console.error(`⛔ Square credenciales no válidas (401 suele ser token/entorno): ${msg}`)
-  }
+    const loc = (locs.result.locations || []).find(l => l.id === locationId) || (locs.result.locations || [])[0]
+    if (loc?.timezone) LOCATION_TZ = loc.timezone
+    console.log(`✅ Square listo. Location ${locationId}, TZ: ${LOCATION_TZ}`)
+  } catch (e) { console.error("⛔ Square creds/location:", e?.message || e) }
 }
 
 async function squareFindCustomerByPhone(phoneRaw) {
   try {
     const e164 = normalizePhoneES(phoneRaw)
-    const candidates = Array.from(new Set([
-      e164,
-      (e164 || "").replace("+", ""),  // sin +
-      onlyDigits(phoneRaw)            // solo dígitos
-    ])).filter(Boolean)
-
+    const candidates = Array.from(new Set([ e164, (e164||"").replace("+",""), onlyDigits(phoneRaw) ])).filter(Boolean)
     for (const ph of candidates) {
-      try {
-        const resp = await square.customersApi.searchCustomers({
-          query: { filter: { phoneNumber: { exact: ph } } }
-        })
-        const list = resp?.result?.customers || []
-        if (list[0]) return list[0]
-      } catch (inner) {
-        // Si es 401, no insistimos más
-        if (String(inner?.status) === "401") throw inner
-      }
+      const resp = await square.customersApi.searchCustomers({ query: { filter: { phoneNumber: { exact: ph } } } })
+      const list = resp?.result?.customers || []
+      if (list[0]) return list[0]
     }
     return null
-  } catch (e) {
-    console.error("Square search error:", e?.message || e)
-    return null
-  }
+  } catch (e) { console.error("Square search error:", e?.message || e); return null }
 }
 
 async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
@@ -175,22 +137,54 @@ async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
     const phone = normalizePhoneES(phoneNumber)
     const resp = await square.customersApi.createCustomer({
       idempotencyKey: `cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
-      givenName,
-      emailAddress,
+      givenName, emailAddress,
       phoneNumber: phone || undefined,
       note: "Creado desde bot WhatsApp Gapink Nails"
     })
     return resp?.result?.customer || null
-  } catch (e) {
-    console.error("Square create error:", e?.message || e)
-    return null
-  }
+  } catch (e) { console.error("Square create error:", e?.message || e); return null }
 }
 
-// --------- DB ----------
+// Obtener versión de variación de servicio (para Bookings)
+async function getServiceVariationVersion(serviceVariationId) {
+  try {
+    const resp = await square.catalogApi.retrieveCatalogObject(serviceVariationId, true)
+    return resp?.result?.object?.version
+  } catch (e) { console.error("getServiceVariationVersion error:", e?.message || e); return undefined }
+}
+
+// Crear booking real en Square
+async function createSquareBooking({ startISO, serviceKey, customerId, teamMemberId }) {
+  try {
+    const serviceVariationId = SERVICE_VARIATIONS[serviceKey]
+    if (!serviceVariationId || !teamMemberId || !locationId) return null
+    const version = await getServiceVariationVersion(serviceVariationId)
+    if (!version) return null
+
+    const body = {
+      idempotencyKey: `book_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+      booking: {
+        locationId,
+        startAt: startISO, // UTC
+        customerId,
+        appointmentSegments: [
+          {
+            teamMemberId,
+            serviceVariationId,
+            serviceVariationVersion: Number(version),
+            durationMinutes: SERVICES[serviceKey] || 45
+          }
+        ]
+      }
+    }
+    const resp = await square.bookingsApi.createBooking(body)
+    return resp?.result?.booking || null
+  } catch (e) { console.error("createSquareBooking error:", e?.message || e); return null }
+}
+
+// =================== DB ===================
 const db = new Database("gapink.db")
 db.pragma("journal_mode = WAL")
-
 db.exec(`
 CREATE TABLE IF NOT EXISTS appointments (
   id TEXT PRIMARY KEY,
@@ -202,45 +196,33 @@ CREATE TABLE IF NOT EXISTS appointments (
   start_iso TEXT,
   end_iso TEXT,
   staff_id TEXT,
-  status TEXT,         -- confirmed | cancelled
-  created_at TEXT
+  status TEXT,
+  created_at TEXT,
+  square_booking_id TEXT
 );
-
-CREATE TABLE IF NOT EXISTS holds (
-  token TEXT PRIMARY KEY,
-  phone TEXT,
-  service TEXT,
-  duration_min INTEGER,
-  start_iso TEXT,
-  end_iso TEXT,
-  expires_at TEXT,
-  created_at TEXT
-);
-
 CREATE TABLE IF NOT EXISTS sessions (
   phone TEXT PRIMARY KEY,
-  state TEXT,          -- ask_name | ask_email | idle
+  state TEXT,
   data_json TEXT,
   updated_at TEXT
 );
 `)
 
 const insertAppt = db.prepare(`INSERT INTO appointments
-(id, customer_name, customer_phone, customer_square_id, service, duration_min, start_iso, end_iso, staff_id, status, created_at)
-VALUES (@id, @customer_name, @customer_phone, @customer_square_id, @service, @duration_min, @start_iso, @end_iso, @staff_id, @status, @created_at)`)
+(id, customer_name, customer_phone, customer_square_id, service, duration_min, start_iso, end_iso, staff_id, status, created_at, square_booking_id)
+VALUES (@id, @customer_name, @customer_phone, @customer_square_id, @service, @duration_min, @start_iso, @end_iso, @staff_id, @status, @created_at, @square_booking_id)`)
 
 const listApptsBetween = db.prepare(`SELECT * FROM appointments WHERE status='confirmed' AND start_iso < @to AND end_iso > @from`)
-const updateApptStatus = db.prepare(`UPDATE appointments SET status=@status WHERE id=@id`)
+const updateApptStatus   = db.prepare(`UPDATE appointments SET status=@status WHERE id=@id`)
 const getUpcomingByPhone = db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso ASC LIMIT 1`)
 
 const upsertSession = db.prepare(`
 INSERT INTO sessions (phone, state, data_json, updated_at) VALUES (@phone, @state, @data_json, @updated_at)
-ON CONFLICT(phone) DO UPDATE SET state=excluded.state, data_json=excluded.data_json, updated_at=excluded.updated_at
-`)
-const getSession = db.prepare(`SELECT * FROM sessions WHERE phone=@phone`)
+ON CONFLICT(phone) DO UPDATE SET state=excluded.state, data_json=excluded.data_json, updated_at=excluded.updated_at`)
+const getSession   = db.prepare(`SELECT * FROM sessions WHERE phone=@phone`)
 const clearSession = db.prepare(`DELETE FROM sessions WHERE phone=@phone`)
 
-// --------- UTIL SLOTS ----------
+// =================== SLOTS & PARSEO DE PREFERENCIAS ===================
 function* slotsGenerator(fromDay, daysAhead = 10) {
   const start = dayjs(fromDay)
   for (let d=0; d<daysAhead; d++) {
@@ -255,56 +237,98 @@ function* slotsGenerator(fromDay, daysAhead = 10) {
     }
   }
 }
-
-function overlaps(aStart, aEnd, bStart, bEnd) {
-  return (aStart < bEnd) && (bStart < aEnd)
-}
-
+const overlaps = (aStart,aEnd,bStart,bEnd)=> (aStart < bEnd) && (bStart < aEnd)
 function getBookedIntervals(fromIso, toIso) {
   const appts = listApptsBetween.all({ from: fromIso, to: toIso })
   return appts.map(a => ({ start: dayjs(a.start_iso), end: dayjs(a.end_iso), staff_id: a.staff_id }))
 }
-
 function staffHasFree(intervals, start, end) {
-  for (const st of STAFF) {
-    const busy = intervals
-      .filter(i => i.staff_id === st.id)
-      .some(i => overlaps(start, end, i.start, i.end))
+  const staffIds = TEAM_MEMBER_IDS.length ? TEAM_MEMBER_IDS : ["any"]
+  for (const st of staffIds) {
+    const busy = intervals.filter(i => i.staff_id === st).some(i => overlaps(start,end,i.start,i.end))
     if (!busy) return true
   }
   return false
 }
 
-// Primer hueco de la semana (prioriza llenar huecos cercanos)
-function firstSlotThisWeek(service, durationMin) {
+// Parsea “hoy/mañana/lunes… a las 20/20:30”
+const WEEKDAYS = ["domingo","lunes","martes","miércoles","miercoles","jueves","viernes","sábado","sabado"]
+function parsePreference(text) {
+  const t = (text || "").toLowerCase()
+  let day = null
+  if (/hoy\b/.test(t)) day = dayjs()
+  else if (/mañana|manana/.test(t)) day = dayjs().add(1,"day")
+  else {
+    for (let i=0;i<WEEKDAYS.length;i++){
+      const name = WEEKDAYS[i]
+      if (t.includes(name)) {
+        const today = dayjs()
+        let targetDow = i===0?7:(i)
+        let dowToday = (today.day()+6)%7 + 1
+        let diff = (targetDow - dowToday + 7) % 7
+        if (diff===0) diff = 7
+        day = today.add(diff,"day")
+        break
+      }
+    }
+  }
+  let hour = null, minute = 0
+  const m1 = t.match(/(?:a las |a la |a )?(\d{1,2})(?:[:h](\d{2}))?\b/)
+  if (m1) {
+    hour = parseInt(m1[1],10)
+    if (m1[2]) minute = parseInt(m1[2],10)
+  }
+  if (!day && (hour!==null)) day = dayjs()
+  return { day, hour, minute }
+}
+
+// Encuentra hueco: respeta preferencia si cabe; si no, earliest
+function findBestSlot(serviceKey, durationMin, preference) {
   const now = dayjs().second(0).millisecond(0)
-  const endOfWeek = now.day() === 0 ? now.add(6, "day") : now.day(6) // sábado
-  const intervals = getBookedIntervals(now.toISOString(), endOfWeek.endOf("day").toISOString())
+  const endOfWeek = now.day() === 0 ? now.add(6,"day") : now.day(6)
+  const intervalsWeek = getBookedIntervals(now.toISOString(), endOfWeek.endOf("day").toISOString())
+
+  if (preference?.day && preference.hour !== null) {
+    let start = preference.day.hour(preference.hour).minute(preference.minute || 0).second(0).millisecond(0)
+    const latestStart = preference.day.hour(CLOSE_HOUR).minute(0).subtract(durationMin,"minute")
+    if (start.isBefore(preference.day.hour(OPEN_HOUR))) start = preference.day.hour(OPEN_HOUR)
+    if (start.isAfter(latestStart)) start = latestStart
+    if (start.isBefore(now.add(30,"minute"))) start = now.add(30,"minute")
+    const end = start.add(durationMin,"minute")
+    const dow = (start.day()+6)%7 + 1
+    if (WORK_DAYS.includes(dow) && end.hour()<=CLOSE_HOUR && staffHasFree(intervalsWeek, start, end)) {
+      return { start, end }
+    }
+    const endOfDay = preference.day.hour(CLOSE_HOUR).minute(0)
+    let probe = start
+    while (probe.add(SLOT_MIN,"minute").isSameOrBefore(endOfDay)) {
+      const s = probe, e = probe.add(durationMin,"minute")
+      if (e.hour()<=CLOSE_HOUR && staffHasFree(intervalsWeek, s, e)) return { start:s, end:e }
+      probe = probe.add(SLOT_MIN,"minute")
+    }
+  }
+
   for (const s of slotsGenerator(now, 7)) {
     if (s.isAfter(endOfWeek.endOf("day"))) break
-    const start = s
-    const end = s.add(durationMin, "minute")
-    if (start.isBefore(now.add(30, "minute"))) continue
-    if (end.hour() > CLOSE_HOUR || (end.hour() === CLOSE_HOUR && end.minute() > 0)) continue
-    if (staffHasFree(intervals, start, end)) return { start, end }
+    const start = s, end = s.add(durationMin,"minute")
+    if (start.isBefore(now.add(30,"minute"))) continue
+    if (end.hour()>CLOSE_HOUR || (end.hour()===CLOSE_HOUR && end.minute()>0)) continue
+    if (staffHasFree(intervalsWeek, start, end)) return { start, end }
   }
-  // Si no hay en la semana, el primero en 10 días
-  const intervals10 = getBookedIntervals(now.toISOString(), now.add(10, "day").toISOString())
+
+  const intervals10 = getBookedIntervals(now.toISOString(), now.add(10,"day").toISOString())
   for (const s of slotsGenerator(now, 10)) {
-    const start = s
-    const end = s.add(durationMin, "minute")
-    if (start.isBefore(now.add(30, "minute"))) continue
-    if (end.hour() > CLOSE_HOUR || (end.hour() === CLOSE_HOUR && end.minute() > 0)) continue
+    const start = s, end = s.add(durationMin,"minute")
+    if (start.isBefore(now.add(30,"minute"))) continue
+    if (end.hour()>CLOSE_HOUR || (end.hour()===CLOSE_HOUR && end.minute()>0)) continue
     if (staffHasFree(intervals10, start, end)) return { start, end }
   }
   return null
 }
 
-function randomId(prefix="apt") {
-  return `${prefix}_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
-}
+const randomId = (p="apt") => `${p}_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
 
-// --------- WEB (estado/QR bonito) ----------
+// =================== WEB ESTADO/QR ===================
 const app = express()
 const PORT = process.env.PORT || 8080
 
@@ -312,62 +336,31 @@ let lastQR = null
 let conectado = false
 
 app.get("/", (_req, res) => {
-  res.send(`
-<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Gapink Nails – Estado</title>
-<style>
-  :root{--bg1:#fce4ec;--bg2:#f8bbd0;--fg:#4a148c;}
-  *{box-sizing:border-box}
-  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,"Helvetica Neue",Arial;background:linear-gradient(135deg,var(--bg1),var(--bg2));margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;color:var(--fg)}
-  .card{background:#fff;padding:24px 28px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);max-width:480px;width:92%;text-align:center}
-  h1{margin:0 0 6px;font-size:28px}
-  .status{font-weight:600;margin-bottom:10px}
-  img{margin-top:12px;max-width:100%;border-radius:12px}
-  footer{margin-top:16px;opacity:.8;font-size:13px}
-  footer a{color:var(--fg);text-decoration:none}
-  footer a:hover{text-decoration:underline}
-  .hint{margin-top:8px;font-size:13px;opacity:.8}
-</style></head><body>
-<div class="card">
-<h1>Gapink Nails</h1>
-<div class="status">Estado: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
-${!conectado && lastQR ? `<img src="/qr.png" alt="QR para vincular" /> <div class="hint">Escanear en WhatsApp → Dispositivos vinculados</div>` : ""}
-<footer>Desarrollado por <a href="https://gonzalog.co" target="_blank" rel="noopener">Gonzalo García Aranda</a></footer>
-</div></body></html>
-  `)
+  res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c} .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}</style><div class="card"><h1>Gapink Nails</h1><p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}<p><small>Desarrollado por <a href="https://gonzalog.co" target="_blank">Gonzalo García Aranda</a></small></p></div>`)
 })
-
-app.get("/estado", (_req, res) => {
-  res.json({ conectado, qr: !conectado && lastQR ? "/qr.png" : null })
-})
-
+app.get("/estado", (_req,res)=>res.json({ conectado, qr: !conectado && lastQR ? "/qr.png" : null }))
 app.get("/qr.png", async (_req, res) => {
   try {
-    if (!lastQR) return res.status(404).send("No hay QR activo ahora mismo")
+    if (!lastQR) return res.status(404).send("No hay QR activo")
     const png = await qrcode.toBuffer(lastQR, { type: "png", margin: 1, width: 512 })
     res.set("Content-Type", "image/png").send(png)
-  } catch (e) {
-    console.error("QR route error:", e)
-    res.status(500).send("Error")
-  }
+  } catch(e){ console.error("QR route error:", e); res.status(500).send("Error") }
 })
 
-// --------- ARRANQUE WEB + BOT ----------
+// =================== ARRANQUE ===================
 app.listen(PORT, async () => {
-  console.log(`🌐 Web escuchando en puerto ${PORT}`)
-  await squareCheckCredentials()  // 👈 diagnóstico de credenciales al iniciar
-  startBot().catch((e)=>console.error("Fallo al iniciar bot:", e))
+  console.log(`🌐 Web en puerto ${PORT}`)
+  await squareCheckCredentials()
+  startBot().catch(e=>console.error("Fallo al iniciar bot:", e))
 })
 
-// --------- BOT ----------
+// =================== BOT ===================
 async function startBot() {
   console.log("🚀 Iniciando bot Gapink Nails...")
-
   try {
     if (!fs.existsSync("auth_info")) fs.mkdirSync("auth_info", { recursive: true })
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion()
-    console.log("ℹ️ Versión WA Web:", version)
 
     const sock = makeWASocket({
       logger: pino({ level: "silent" }),
@@ -379,82 +372,65 @@ async function startBot() {
       connectTimeoutMs: 30000
     })
 
-    sock.ev.on("connection.update", (update) => {
-      const { connection, lastDisconnect, qr } = update
-      if (qr) {
-        lastQR = qr
-        conectado = false
-        console.log("QR listo (caduca ~20s). También en /qr.png")
-        try { qrcodeTerminal.generate(qr, { small: true }) } catch {}
-      }
-      if (connection === "open") {
-        lastQR = null
-        conectado = true
-        console.log("Bot conectado a WhatsApp.")
-      }
+    sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+      if (qr) { lastQR = qr; conectado = false; try { qrcodeTerminal.generate(qr, { small:true }) } catch{} }
+      if (connection === "open") { lastQR = null; conectado = true; console.log("✅ Conectado a WhatsApp") }
       if (connection === "close") {
         conectado = false
-        const err = lastDisconnect?.error
-        const status = err?.output?.statusCode ?? err?.status ?? "desconocido"
-        const msg = err?.message ?? String(err ?? "")
-        console.log(`Conexión cerrada. Status: ${status}. Motivo: ${msg}`)
+        console.log("❌ Conexión cerrada:", lastDisconnect?.error?.message || String(lastDisconnect?.error || ""))
         setTimeout(()=>startBot().catch(console.error), 3000)
       }
     })
     sock.ev.on("creds.update", saveCreds)
 
-    // Helper para enviar sin romper el flujo
-    async function safeSend(jid, content) {
-      try { await sock.sendMessage(jid, content) } catch (e) { console.error("sendMessage error:", e) }
-    }
+    const safeSend = async (jid, content) => { try { await sock.sendMessage(jid, content) } catch(e){ console.error("sendMessage error:", e) } }
 
-    // Mensajería
     sock.ev.on("messages.upsert", async ({ messages }) => {
       try {
         const msg = messages?.[0]
         if (!msg?.message || msg.key.fromMe) return
 
         const from = msg.key.remoteJid
-        const phoneRaw = from?.split("@")[0] || ""
+        const phoneRaw  = from?.split("@")[0] || ""
         const phoneE164 = normalizePhoneES(phoneRaw) || phoneRaw
         const body =
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          ""
+          msg.message?.imageMessage?.caption || ""
         const low = (body || "").trim().toLowerCase()
 
-        // STATE MACHINE (si ya estamos pidiendo datos, saltamos clasificador)
+        // Sesión (alta de cliente)
         const sess = getSession.get({ phone: phoneE164 })
         if (sess?.state === "ask_name") {
-          const name = (body || "").trim().replace(/\s+/g, " ").slice(0,80)
-          const data = JSON.parse(sess.data_json || "{}")
-          data.name = name
+          const name = (body || "").trim().replace(/\s+/g," ").slice(0,80)
+          const data = JSON.parse(sess.data_json || "{}"); data.name = name
           upsertSession.run({ phone: phoneE164, state: "ask_email", data_json: JSON.stringify(data), updated_at: new Date().toISOString() })
           await safeSend(from, { text: "¿Cuál es tu email? (para enviarte la confirmación)" })
           return
         }
         if (sess?.state === "ask_email") {
           const email = (body || "").trim()
-          const data = JSON.parse(sess.data_json || "{}")
-          data.email = email
+          const data = JSON.parse(sess.data_json || "{}"); data.email = email
 
           let sq = null
-          try {
-            sq = await squareCreateCustomer({
-              givenName: data.name || "Cliente",
-              emailAddress: email || undefined,
-              phoneNumber: phoneE164
-            })
-          } catch (e) { console.error("createCustomer error:", e) }
+          try { sq = await squareCreateCustomer({ givenName: data.name || "Cliente", emailAddress: email || undefined, phoneNumber: phoneE164 }) } catch(e){ console.error(e) }
+          if (!sq) { clearSession.run({ phone: phoneE164 }); return }
 
-          if (!sq) { clearSession.run({ phone: phoneE164 }); return } // silencio
-
-          // Agendar primer hueco de la semana
-          const dur = data.durationMin
-          const svc = data.service
-          const slot = firstSlotThisWeek(svc, dur)
+          const dur = data.durationMin, svc = data.service
+          const pref = parsePreference(data.preferenceText || "")
+          const slot = findBestSlot(svc, dur, pref)
           if (!slot) { clearSession.run({ phone: phoneE164 }); return }
+
+          const teamMemberId = TEAM_MEMBER_IDS[0] || null
+          let squareBooking = null
+          try {
+            squareBooking = await createSquareBooking({
+              startISO: slot.start.toISOString(),
+              serviceKey: svc,
+              customerId: sq.id,
+              teamMemberId
+            })
+          } catch (e) { console.error("square booking (new) error:", e) }
 
           const aptId = randomId("apt")
           insertAppt.run({
@@ -466,9 +442,10 @@ async function startBot() {
             duration_min: dur,
             start_iso: slot.start.toISOString(),
             end_iso: slot.end.toISOString(),
-            staff_id: null,
+            staff_id: teamMemberId,
             status: "confirmed",
-            created_at: new Date().toISOString()
+            created_at: new Date().toISOString(),
+            square_booking_id: squareBooking?.id || null
           })
 
           clearSession.run({ phone: phoneE164 })
@@ -481,7 +458,7 @@ Pago en persona.` })
           return
         }
 
-        // ---- CLASIFICACIÓN: si no es de cita, NO respondemos
+        // Clasificador: si no es de cita, no respondemos
         const seemsBooking = await isBookingIntent(body || "")
         if (!seemsBooking) return
 
@@ -490,15 +467,16 @@ Pago en persona.` })
           const upcoming = getUpcomingByPhone.get({ phone: phoneE164, now: new Date().toISOString() })
           if (!upcoming) return
           updateApptStatus.run({ id: upcoming.id, status: "cancelled" })
-          await safeSend(from, { text: "Tu cita ha sido cancelada. Si quieres, pide una nueva con “cita manicura”." })
+          await safeSend(from, { text: "Cita cancelada. Si quieres, pide una nueva con “cita uñas acrílicas”." })
           return
         }
 
-        // Cambiar / mover
+        // Cambiar
         if (/(cambiar cita|mover cita|reprogramar)/i.test(low)) {
           const upcoming = getUpcomingByPhone.get({ phone: phoneE164, now: new Date().toISOString() })
           if (!upcoming) return
-          const slot = firstSlotThisWeek(upcoming.service, upcoming.duration_min)
+          const pref = parsePreference(body)
+          const slot = findBestSlot(upcoming.service, upcoming.duration_min, pref)
           if (!slot) return
           db.prepare(`UPDATE appointments SET start_iso=@s, end_iso=@e WHERE id=@id`).run({
             id: upcoming.id, s: slot.start.toISOString(), e: slot.end.toISOString()
@@ -510,63 +488,72 @@ Pago en persona.` })
           return
         }
 
-        // “cita / reservar / disponibilidad” con servicio
+        // Pedir cita (solo “uñas acrílicas” de momento)
         const svc = Object.keys(SERVICES).find(s => low.includes(s))
         if (/(reserva|reservar|cita|disponible|disponibilidad|pedir hora|hueco)/i.test(low) && svc) {
           const durationMin = SERVICES[svc]
           let customer = null
-          try { customer = await squareFindCustomerByPhone(phoneE164) } catch (e) { console.error("findCustomer error:", e) }
+          try { customer = await squareFindCustomerByPhone(phoneE164) } catch(e){ console.error(e) }
 
+          const pref = parsePreference(body)
+          const slot = findBestSlot(svc, durationMin, pref)
+          if (!slot) return
+
+          const teamMemberId = TEAM_MEMBER_IDS[0] || null
+          let squareBooking = null
           if (customer) {
-            const slot = firstSlotThisWeek(svc, durationMin)
-            if (!slot) return
-            const aptId = randomId("apt")
-            insertAppt.run({
-              id: aptId,
-              customer_name: customer.givenName || null,
-              customer_phone: phoneE164,
-              customer_square_id: customer.id,
-              service: svc,
-              duration_min: durationMin,
-              start_iso: slot.start.toISOString(),
-              end_iso: slot.end.toISOString(),
-              staff_id: null,
-              status: "confirmed",
-              created_at: new Date().toISOString()
-            })
-            await safeSend(from, { text:
+            try {
+              squareBooking = await createSquareBooking({
+                startISO: slot.start.toISOString(),
+                serviceKey: svc,
+                customerId: customer.id,
+                teamMemberId
+              })
+            } catch (e) { console.error("square booking (existing) error:", e) }
+          }
+
+          const aptId = randomId("apt")
+          insertAppt.run({
+            id: aptId,
+            customer_name: customer?.givenName || null,
+            customer_phone: phoneE164,
+            customer_square_id: customer?.id || null,
+            service: svc,
+            duration_min: durationMin,
+            start_iso: slot.start.toISOString(),
+            end_iso: slot.end.toISOString(),
+            staff_id: teamMemberId,
+            status: "confirmed",
+            created_at: new Date().toISOString(),
+            square_booking_id: squareBooking?.id || null
+          })
+
+          await safeSend(from, { text:
 `Reserva confirmada.
 Servicio: ${svc}
 Fecha: ${slot.start.format("dddd DD/MM HH:mm")}
 Duración: ${durationMin} min
 Pago en persona.` })
-            return
-          } else {
-            const data = { service: svc, durationMin }
-            upsertSession.run({ phone: phoneE164, state: "ask_name", data_json: JSON.stringify(data), updated_at: new Date().toISOString() })
-            await safeSend(from, { text: "Para confirmar la reserva, dime tu nombre y apellidos." })
-            return
-          }
+          return
         }
 
-        // Disponibilidad pero SIN servicio → pedimos servicio (breve)
+        // Si pregunta disponibilidad pero sin decir servicio → pedirlo
         if (/(reserva|reservar|cita|disponible|disponibilidad|pedir hora|hueco)/i.test(low) && !Object.keys(SERVICES).some(s=>low.includes(s))) {
           const txt = Object.keys(SERVICES).map(s=>`• ${s} (${SERVICES[s]} min)`).join("\n")
           await safeSend(from, { text:
 `¿Qué servicio necesitas?
 ${txt}
 
-Ejemplos:
-- "cita manicura"
-- "reservar pedicura"` })
+Ejemplo:
+- "cita uñas acrílicas hoy a las 19"` })
           return
         }
 
-        // Fallback breve (solo si es booking)
+        // Fallback corto (solo booking)
         const reply = await aiReply(body)
         if (reply) await safeSend(from, { text: reply })
       } catch (e) {
-        console.error("messages.upsert handler error:", e) // nunca se envía al usuario
+        console.error("messages.upsert error:", e) // nada al usuario
       }
     })
   } catch (e) {
