@@ -84,14 +84,16 @@ async function aiReply(text) {
 
 // =================== HELPERS TELÉFONO & CONTACTO ===================
 const onlyDigits = (s="") => (s || "").replace(/\D+/g, "")
+
 function normalizePhoneES(raw) {
   const digits = onlyDigits(raw)
   if (!digits) return null
+  // Normalizamos a E.164 (España por defecto)
+  if (raw.startsWith("+") && digits.length >= 8 && digits.length <= 15) return `+${digits}`
   if (digits.startsWith("34") && digits.length === 11) return `+${digits}`
   if (digits.length === 9) return `+34${digits}`
   if (digits.startsWith("00")) return `+${digits.slice(2)}`
-  if (raw.startsWith("+")) return raw
-  return `+${digits}`
+  return `+${digits}` // último intento
 }
 
 // Heurística para sacar nombre y email de un mensaje libre
@@ -100,7 +102,6 @@ function extractContact(text="") {
   const emailMatch = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)
   const email = emailMatch ? emailMatch[0] : null
 
-  // pistas “me llamo …”, “soy …”, “mi nombre es …”
   const nameHints = [
     /(?:^|\b)(?:me llamo|soy|mi nombre es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ' -]{2,80})/i,
   ]
@@ -109,20 +110,16 @@ function extractContact(text="") {
     const m = t.match(re)
     if (m && m[1]) { name = m[1].trim() ; break }
   }
-  // si dijo “Nombre y email” en una frase tipo “Pepe García y pepe@…”
   if (!name && email) {
     const idx = t.indexOf(email)
     const left = t.slice(0, idx).replace(/[,.;:]/g, " ")
     const ySplit = left.split(/\by\b/i)
     const candidate = (ySplit[0] || left).trim()
-    // filtrar cosas muy cortas o que parezcan pregunta
     if (candidate && candidate.length >= 2 && !/[?]/.test(candidate)) {
       name = candidate.slice(-80)
     }
   }
-  // limpiar nombre (caps y espacios)
   if (name) name = name.replace(/\s+/g, " ").replace(/^y\s+/i,"").trim()
-
   return { name: name || null, email }
 }
 
@@ -140,20 +137,29 @@ async function squareCheckCredentials() {
     const loc = (locs.result.locations || []).find(l => l.id === locationId) || (locs.result.locations || [])[0]
     if (loc?.timezone) LOCATION_TZ = loc.timezone
     console.log(`✅ Square listo. Location ${locationId}, TZ: ${LOCATION_TZ}`)
-  } catch (e) { console.error("⛔ Square creds/location:", e?.message || e) }
+  } catch (e) {
+    console.error("⛔ Square creds/location:", e?.message || e, e?.result?.errors || "")
+  }
 }
 
+// 🔧 FIX: buscar por teléfono SOLAMENTE si tenemos E.164 válido
 async function squareFindCustomerByPhone(phoneRaw) {
   try {
     const e164 = normalizePhoneES(phoneRaw)
-    const candidates = Array.from(new Set([ e164, (e164||"").replace("+",""), onlyDigits(phoneRaw) ])).filter(Boolean)
-    for (const ph of candidates) {
-      const resp = await square.customersApi.searchCustomers({ query: { filter: { phoneNumber: { exact: ph } } } })
-      const list = resp?.result?.customers || []
-      if (list[0]) return list[0]
+    if (!e164 || !e164.startsWith("+") || e164.length < 8 || e164.length > 16) {
+      // Si el formato es dudoso, no llamamos a la API (evita 400)
+      return null
     }
+    const resp = await square.customersApi.searchCustomers({
+      query: { filter: { phoneNumber: { exact: e164 } } }
+    })
+    const list = resp?.result?.customers || []
+    return list[0] || null
+  } catch (e) {
+    // Log fino pero sin bloquear el flujo
+    console.error("Square search error:", e?.message || e, e?.result?.errors || "")
     return null
-  } catch (e) { console.error("Square search error:", e?.message || e); return null }
+  }
 }
 
 async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
@@ -166,7 +172,10 @@ async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
       note: "Creado desde bot WhatsApp Gapink Nails"
     })
     return resp?.result?.customer || null
-  } catch (e) { console.error("Square create error:", e?.message || e); return null }
+  } catch (e) {
+    console.error("Square create error:", e?.message || e, e?.result?.errors || "")
+    return null
+  }
 }
 
 // Obtener versión de variación de servicio
@@ -174,7 +183,7 @@ async function getServiceVariationVersion(serviceVariationId) {
   try {
     const resp = await square.catalogApi.retrieveCatalogObject(serviceVariationId, true)
     return resp?.result?.object?.version
-  } catch (e) { console.error("getServiceVariationVersion error:", e?.message || e); return undefined }
+  } catch (e) { console.error("getServiceVariationVersion error:", e?.message || e, e?.result?.errors || ""); return undefined }
 }
 
 // Crear booking real en Square
@@ -203,7 +212,10 @@ async function createSquareBooking({ startISO, serviceKey, customerId, teamMembe
     }
     const resp = await square.bookingsApi.createBooking(body)
     return resp?.result?.booking || null
-  } catch (e) { console.error("createSquareBooking error:", e?.message || e); return null }
+  } catch (e) {
+    console.error("createSquareBooking error:", e?.message || e, e?.result?.errors || "")
+    return null
+  }
 }
 
 // =================== DB ===================
@@ -438,10 +450,9 @@ async function startBot() {
           if (inlineEmail) data.email = inlineEmail
 
           if (!data.name || !data.email) {
-            // faltan datos → pedir SOLO lo que falta, pero sin spamear
             const now = Date.now()
             const last = Date.parse(sess.last_prompt_at || 0)
-            if (now - last > 60_000) { // 60s de margen para no repetir
+            if (now - last > 60_000) {
               const need = !data.name ? "tu nombre y apellidos" : "tu email"
               await safeSend(from, { text: `Para confirmarte la reserva necesito ${need}.` })
               upsertSession.run({
