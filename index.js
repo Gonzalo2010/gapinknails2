@@ -1,6 +1,6 @@
 // index.js — Gapink Nails WhatsApp Bot (DeepSeek + extracción JSON + sesiones seguras + TZ)
+// Arreglo clave: confirmar también los huecos "sugeridos" y no repetir la pregunta.
 
-// ====== Imports & setup
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
 import pino from "pino"
@@ -51,7 +51,7 @@ async function dsChat(messages, { temperature=0.4 } = {}) {
 }
 
 const SYS_TONE = `Eres el asistente de WhatsApp de un salón de uñas en España (Gapink Nails).
-Habla natural y corto; no menciones que eres IA.
+Habla natural, corto y sin emojis.
 Si la hora pedida está libre, ofrécela tal cual; si no, propone la más cercana y pide confirmación.
 No ofrezcas profesionales. Pago siempre en persona.`
 
@@ -268,15 +268,13 @@ function loadSession(phone) {
   if (!row?.data_json) return null
   const raw = JSON.parse(row.data_json)
   const data = { ...raw }
-  // Rehidratar dayjs
   if (raw.startEUISO) data.startEU = dayjs.tz(raw.startEUISO, EURO_TZ)
   return data
 }
 function saveSession(phone, data) {
   const toSave = { ...data }
-  // Persistir ISO en vez de objeto
   toSave.startEUISO = data.startEU?.toISOString?.() ? data.startEU.toISOString() : (data.startEUISO || null)
-  delete toSave.startEU // no guardamos objetos dayjs
+  delete toSave.startEU
   upsertSession.run({ phone, data_json: JSON.stringify(toSave), updated_at: new Date().toISOString() })
 }
 
@@ -306,7 +304,6 @@ function suggestOrExact(startEU, durationMin) {
   const insideHours = startEU.hour()>=OPEN_HOUR && (endEU.hour()<CLOSE_HOUR || (endEU.hour()===CLOSE_HOUR && endEU.minute()===0))
 
   if (dow===7 || !WORK_DAYS.includes(dow) || !insideHours || startEU.isBefore(now)) {
-    // sugerir primer hueco del día
     const dayStart = startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
     const dayEnd   = startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
     for (let t = dayStart.clone(); !t.isAfter(dayEnd); t = t.add(SLOT_MIN,"minute")) {
@@ -400,40 +397,49 @@ async function startBot() {
     if (!data.name && extra.name) data.name = extra.name
     if (!data.email && extra.email) data.email = extra.email
 
+    // Confirmación libre
     if (YES_RE.test(textRaw) || extra.confirm === "yes") data.confirmApproved = true
     if (NO_RE.test(textRaw)  || extra.confirm === "no")  { data.confirmApproved = false; data.confirmAsked = false }
+    saveSession(phone, data)  // 🔐 guarda el flag de confirmación ya mismo
 
+    // Fecha/hora
     const whenText = extra.datetime_text || textRaw
     const parsed = parseDateTimeES(whenText)
     if (parsed) data.startEU = parsed
 
     if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
 
-    // Cancelar rápido
+    // Cancelación rápida (si la usas)
     if ((extra.intent==="cancel") || /cancel(ar)? cita/i.test(textRaw)) {
       await safeSend(from,{ text: "Cancelación anotada. Si quieres, dime otra fecha y te busco hueco." })
       clearSession.run({ phone }); return
     }
 
-    // Si ya tenemos servicio + hora
+    // ====== DISPONIBILIDAD → PROPUESTA Y CONFIRMACIÓN ======
     if (data.service && data.startEU && data.durationMin) {
       const { exact, suggestion } = suggestOrExact(data.startEU, data.durationMin)
-      if (exact) {
-        data.startEU = exact
-        // si ya aprobó, cerrar
-        if (data.confirmApproved) { await finalizeBooking({ from, phone, data, safeSend }); return }
+
+      // ✅ PICK & CONFIRM: usar exacto o sugerido indistintamente
+      const pick = exact || suggestion
+      if (pick) {
+        data.startEU = pick
+        // Si ya aprobó (dijo "sí"/"vale"/etc.), agendamos sin repetir pregunta.
+        if (data.confirmApproved) {
+          saveSession(phone, data)
+          await finalizeBooking({ from, phone, data, safeSend })
+          return
+        }
+        // Aún no confirmó → preguntar UNA vez
         data.confirmAsked = true
         saveSession(phone, data)
-        await safeSend(from,{ text: `Tengo libre ${fmtES(data.startEU)} para ${data.service}. ¿Confirmo la cita?` })
+        const msg = exact
+          ? `Tengo libre ${fmtES(data.startEU)} para ${data.service}. ¿Confirmo la cita?`
+          : `No tengo ese hueco exacto. Te puedo ofrecer ${fmtES(data.startEU)}. ¿Confirmo?`
+        await safeSend(from,{ text: msg })
         return
       }
-      if (suggestion) {
-        data.startEU = suggestion
-        data.confirmAsked = true
-        saveSession(phone, data)
-        await safeSend(from,{ text: `No tengo ese hueco exacto. Te puedo ofrecer ${fmtES(data.startEU)}. ¿Confirmo?` })
-        return
-      }
+
+      // Sin hueco ese día
       data.confirmAsked = false
       saveSession(phone, data)
       await safeSend(from,{ text: "No veo hueco en esa franja. Dime otra hora o día y te digo." })
@@ -461,7 +467,7 @@ async function startBot() {
 - Fecha/Hora: ${data.startEU ? fmtES(data.startEU) : "?"}
 - Nombre: ${data.name || "?"}
 - Email: ${data.email || "?"}
-Escribe un único mensaje corto y humano que avance la reserva.
+Escribe un único mensaje corto y humano que avance la reserva, sin emojis.
 Si faltan datos (${missing.join(", ")}), pídelo amablemente con ejemplo.
 Mensaje del cliente: "${textRaw}"`
 
