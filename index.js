@@ -1,4 +1,4 @@
-// index.js — Bot WhatsApp Gapink Nails (DeepSeek, FSM arreglada)
+// index.js — Bot WhatsApp Gapink Nails (DeepSeek + FSM + confirmación)
 // ENV:
 // - DEEPSEEK_API_KEY=xxxxx
 // - DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions (opcional)
@@ -23,7 +23,6 @@ import dayjs from "dayjs"
 import { Client, Environment } from "square"
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto
-
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
 // =================== CONFIG NEGOCIO ===================
@@ -33,9 +32,7 @@ const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
 // Servicios y duraciones
-const SERVICES = {
-  "uñas acrílicas": 90,
-}
+const SERVICES = { "uñas acrílicas": 90 }
 // Mapeo a Square
 const SERVICE_VARIATIONS = {
   "uñas acrílicas": process.env.SQ_SV_UNAS_ACRILICAS || ""
@@ -51,26 +48,21 @@ async function dsChat(messages, { temperature = 0.4 } = {}) {
   try {
     const resp = await fetch(DEEPSEEK_API_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${DEEPSEEK_API_KEY}`
-      },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${DEEPSEEK_API_KEY}` },
       body: JSON.stringify({ model: DEEPSEEK_MODEL, messages, temperature })
     })
     if (!resp.ok) throw new Error(`DeepSeek HTTP ${resp.status} ${await resp.text()}`)
     const data = await resp.json()
     return (data?.choices?.[0]?.message?.content || "").trim()
-  } catch (e) {
-    console.error("DeepSeek error:", e?.message || e); return ""
-  }
+  } catch (e) { console.error("DeepSeek error:", e?.message || e); return "" }
 }
 
-const SYSTEM_PROMPT = `Eres el asistente de WhatsApp de Gapink Nails. Suena humano y cercano.
+const SYSTEM_PROMPT = `Eres el asistente de WhatsApp de Gapink Nails. Humano y cercano.
 - No reveles nombres del personal ni ofrezcas elegir profesional.
-- Si el cliente dice día/hora, respétalo si cabe; si no, ofrece el hueco más cercano.
+- Si el cliente dice día/hora, respétalo si cabe; si no, ofrece el hueco más cercano y pide confirmación.
 - Mensajes cortos, sin emojis. Pago siempre en persona.
 - Si falta dato para alta nueva, pide solo nombre y email.
-- Si es saludo (hola/buenas/qué tal), saluda y pregunta si quiere pedir cita o ver disponibilidad.
+- Si es saludo (hola/buenas), saluda y pregunta si quiere pedir cita o ver disponibilidad.
 - Nunca digas que eres IA.`
 
 async function aiReply(userText) {
@@ -92,8 +84,20 @@ OTHER    -> lo demás` },
   return (out || "OTHER").trim().toUpperCase()
 }
 
-// =================== HELPERS TELÉFONO & CONTACTO ===================
+// =================== HELPERS ===================
 const onlyDigits = (s="") => (s || "").replace(/\D+/g, "")
+const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu, "")
+const WEEKDAYS_ES = ["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]
+const MONTHS = {
+  enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,
+  ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12
+}
+function pad2(n){ return String(n).padStart(2,"0") }
+function formatES(d){
+  const wd = WEEKDAYS_ES[d.day()]
+  return `${wd} ${pad2(d.date())}/${pad2(d.month()+1)} ${pad2(d.hour())}:${pad2(d.minute())}`
+}
+
 function normalizePhoneES(raw) {
   const digits = onlyDigits(raw)
   if (!digits) return null
@@ -103,18 +107,14 @@ function normalizePhoneES(raw) {
   if (digits.startsWith("00")) return `+${digits.slice(2)}`
   return `+${digits}`
 }
+
 function extractContact(text="") {
   const t = text.trim()
   const emailMatch = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)
   const email = emailMatch ? emailMatch[0] : null
-  const nameHints = [
-    /(?:^|\b)(?:me llamo|soy|mi nombre es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ' -]{2,80})/i,
-  ]
+  const nameHints = [/(?:^|\b)(?:me llamo|soy|mi nombre es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ' -]{2,80})/i]
   let name = null
-  for (const re of nameHints) {
-    const m = t.match(re)
-    if (m?.[1]) { name = m[1].trim(); break }
-  }
+  for (const re of nameHints) { const m = t.match(re); if (m?.[1]) { name = m[1].trim(); break } }
   if (!name && email) {
     const idx = t.indexOf(email)
     const left = t.slice(0, idx).replace(/[,.;:]/g, " ")
@@ -126,48 +126,74 @@ function extractContact(text="") {
   return { name: name || null, email }
 }
 
-// Detecta servicio por texto
 function detectService(text="") {
-  const low = text.toLowerCase()
-  for (const k of Object.keys(SERVICES)) if (low.includes(k)) return k
+  const low = rmDiacritics(text.toLowerCase())
+  const map = { "unas acrilicas":"uñas acrílicas", "uñas acrilicas":"uñas acrílicas", "uñas acrílicas":"uñas acrílicas" }
+  for (const k of Object.keys(map)) if (low.includes(rmDiacritics(k))) return map[k]
+  for (const k of Object.keys(SERVICES)) if (low.includes(rmDiacritics(k))) return k
   return null
 }
 
-// ¿El texto parece tener hora/fecha?
-const WEEKDAYS = ["domingo","lunes","martes","miércoles","miercoles","jueves","viernes","sábado","sabado"]
+// Parser de fecha/hora en español
 function parsePreference(text) {
-  const t = (text || "").toLowerCase()
+  const t = rmDiacritics((text || "").toLowerCase())
   let day = null
+  // Relativas
   if (/\bhoy\b/.test(t)) day = dayjs()
-  else if (/mañana|manana/.test(t)) day = dayjs().add(1,"day")
-  else {
-    for (let i=0;i<WEEKDAYS.length;i++){
-      const name = WEEKDAYS[i]
-      if (t.includes(name)) {
-        const today = dayjs()
-        let targetDow = i===0?7:(i)
-        let dowToday = (today.day()+6)%7 + 1
-        let diff = (targetDow - dowToday + 7) % 7
-        if (diff===0) diff = 7
-        day = today.add(diff,"day")
-        break
-      }
+  else if (/\bmanana\b/.test(t)) day = dayjs().add(1,"day")
+  // "14 de agosto" (opcional año)
+  if (!day) {
+    const m = t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/)
+    if (m) {
+      const dd = parseInt(m[1],10)
+      const mm = MONTHS[m[2]] || null
+      const yy = m[3] ? parseInt(m[3],10) : dayjs().year()
+      if (mm) day = dayjs().year(yy).month(mm-1).date(dd)
     }
   }
+  // "14/08[/2025]" o "14-08"
+  if (!day) {
+    const m = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/)
+    if (m) {
+      const dd = parseInt(m[1],10)
+      const mm = parseInt(m[2],10)
+      let yy = m[3] ? parseInt(m[3],10) : dayjs().year()
+      if (yy < 100) yy += 2000
+      day = dayjs().year(yy).month(mm-1).date(dd)
+    }
+  }
+  // Día de la semana
+  if (!day) {
+    const m = t.match(/\b(domingo|lunes|martes|miercoles|jueves|viernes|sabado)\b/)
+    if (m) {
+      const target = ["domingo","lunes","martes","miercoles","jueves","viernes","sabado"].indexOf(m[1])
+      const today = dayjs()
+      let dowToday = (today.day()+6)%7 // 0=lun
+      let diff = (target - dowToday + 7) % 7
+      if (diff===0) diff = 7
+      day = today.add(diff,"day")
+    }
+  }
+  // Hora
   let hour = null, minute = 0
-  const m1 = t.match(/(?:a las |a la |a )?(\d{1,2})(?:[:h](\d{2}))?\s*(am|pm)?\b/)
-  if (m1) {
-    hour = parseInt(m1[1],10)
-    if (m1[3]) {
-      const ampm = m1[3]
-      if (ampm === "pm" && hour < 12) hour += 12
-      if (ampm === "am" && hour === 12) hour = 0
-    }
-    if (m1[2]) minute = parseInt(m1[2],10)
+  const hm = t.match(/\b(\d{1,2})(?:[:h](\d{2}))?\s*(am|pm)?\b/)
+  if (hm) {
+    hour = parseInt(hm[1],10)
+    if (hm[2]) minute = parseInt(hm[2],10)
+    const ap = hm[3]
+    if (ap === "pm" && hour < 12) hour += 12
+    if (ap === "am" && hour === 12) hour = 0
   }
-  if (!day && (hour!==null)) day = dayjs()
-  const hasTime = hour!==null
+  if (!day && hour!==null) day = dayjs() // si solo dan hora
+  const hasTime = (day && hour!==null)
   return { day, hour, minute, hasTime, raw: t }
+}
+
+// Redondeo opcional al múltiplo de SLOT_MIN (no lo usamos para cambiar sin avisar)
+function roundToStep(d) {
+  const m = d.minute()
+  const r = Math.round(m / SLOT_MIN) * SLOT_MIN
+  return d.minute(r).second(0).millisecond(0)
 }
 
 // =================== SQUARE ===================
@@ -177,7 +203,6 @@ const square = new Client({
 })
 const locationId = process.env.SQUARE_LOCATION_ID
 let LOCATION_TZ = "Europe/Madrid"
-
 async function squareCheckCredentials() {
   try {
     const locs = await square.locationsApi.listLocations()
@@ -186,7 +211,6 @@ async function squareCheckCredentials() {
     console.log(`✅ Square listo. Location ${locationId}, TZ: ${LOCATION_TZ}`)
   } catch (e) { console.error("⛔ Square creds/location:", e?.message || e, e?.result?.errors || "") }
 }
-
 async function squareFindCustomerByPhone(phoneRaw) {
   try {
     const e164 = normalizePhoneES(phoneRaw)
@@ -195,27 +219,23 @@ async function squareFindCustomerByPhone(phoneRaw) {
     return (resp?.result?.customers || [])[0] || null
   } catch (e) { console.error("Square search error:", e?.message || e, e?.result?.errors || ""); return null }
 }
-
 async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }) {
   try {
     const phone = normalizePhoneES(phoneNumber)
     const resp = await square.customersApi.createCustomer({
       idempotencyKey: `cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
-      givenName, emailAddress,
-      phoneNumber: phone || undefined,
+      givenName, emailAddress, phoneNumber: phone || undefined,
       note: "Creado desde bot WhatsApp Gapink Nails"
     })
     return resp?.result?.customer || null
   } catch (e) { console.error("Square create error:", e?.message || e, e?.result?.errors || ""); return null }
 }
-
 async function getServiceVariationVersion(serviceVariationId) {
   try {
     const resp = await square.catalogApi.retrieveCatalogObject(serviceVariationId, true)
     return resp?.result?.object?.version
   } catch (e) { console.error("getServiceVariationVersion error:", e?.message || e, e?.result?.errors || ""); return undefined }
 }
-
 async function createSquareBooking({ startISO, serviceKey, customerId, teamMemberId }) {
   try {
     const serviceVariationId = SERVICE_VARIATIONS[serviceKey]
@@ -225,7 +245,9 @@ async function createSquareBooking({ startISO, serviceKey, customerId, teamMembe
     const body = {
       idempotencyKey: `book_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
       booking: {
-        locationId, startAt: startISO, customerId,
+        locationId,
+        startAt: startISO, // ISO UTC
+        customerId,
         appointmentSegments: [
           { teamMemberId, serviceVariationId, serviceVariationVersion: Number(version), durationMinutes: SERVICES[serviceKey] || 45 }
         ]
@@ -256,7 +278,7 @@ CREATE TABLE IF NOT EXISTS appointments (
 );
 CREATE TABLE IF NOT EXISTS sessions (
   phone TEXT PRIMARY KEY,
-  state TEXT,
+  state TEXT, -- awaiting_service | awaiting_datetime | awaiting_contact | awaiting_confirm
   data_json TEXT,
   updated_at TEXT,
   last_prompt_at TEXT
@@ -310,23 +332,22 @@ function findBestSlot(serviceKey, durationMin, preference) {
 
   if (preference?.day && preference.hour !== null) {
     let start = preference.day.hour(preference.hour).minute(preference.minute || 0).second(0).millisecond(0)
-    const latestStart = preference.day.hour(CLOSE_HOUR).minute(0).subtract(durationMin,"minute")
-    if (start.isBefore(preference.day.hour(OPEN_HOUR))) start = preference.day.hour(OPEN_HOUR)
-    if (start.isAfter(latestStart)) start = latestStart
-    if (start.isBefore(now.add(30,"minute"))) start = now.add(30,"minute")
+    // No auto-mover: solo validamos
     const end = start.add(durationMin,"minute")
     const dow = (start.day()+6)%7 + 1
     if (WORK_DAYS.includes(dow) && end.hour()<=CLOSE_HOUR && staffHasFree(intervalsWeek, start, end)) {
       return { start, end }
     }
+    return null
   }
 
+  // Sugerir primer hueco libre cercano (si no dio hora)
+  const intervals10 = getBookedIntervals(now.toISOString(), now.add(10,"day").toISOString())
   for (const s of slotsGenerator(now, 10)) {
     const start = s, end = s.add(durationMin,"minute")
     if (start.isBefore(now.add(30,"minute"))) continue
     if (end.hour()>CLOSE_HOUR || (end.hour()===CLOSE_HOUR && end.minute()>0)) continue
-    const intervals = getBookedIntervals(now.toISOString(), start.add(durationMin,"minute").toISOString())
-    if (staffHasFree(intervals, start, end)) return { start, end }
+    if (staffHasFree(intervals10, start, end)) return { start, end }
   }
   return null
 }
@@ -357,7 +378,7 @@ app.listen(PORT, async () => {
 
 // =================== BOT ===================
 async function startBot() {
-  console.log("🚀 Iniciando bot Gapink Nails (DeepSeek + FSM)...")
+  console.log("🚀 Iniciando bot Gapink Nails (DeepSeek + Confirmación)...")
   try {
     if (!fs.existsSync("auth_info")) fs.mkdirSync("auth_info", { recursive: true })
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
@@ -398,183 +419,157 @@ async function startBot() {
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
           msg.message?.imageMessage?.caption || ""
-        let low = (body || "").trim().toLowerCase()
+        let low = body.trim().toLowerCase()
         low = low.replace(/\bcon\s+[a-záéíóúüñ]+/gi, "").trim()
 
         const sess = getSession.get({ phone: phoneE164 })
         const data = sess?.data_json ? JSON.parse(sess.data_json) : {}
 
-        // --- Clasificación suave (pero nunca bloquea el flujo) ---
         const tag = await classify(body || "")
 
-        // Detecta piezas por este mensaje
+        // Detecta piezas del mensaje actual
         const svcInMsg = detectService(body)
         const prefInMsg = parsePreference(body)
-
-        // Fusiona con lo que ya teníamos en sesión
         if (svcInMsg) data.service = svcInMsg
-        if (prefInMsg?.hasTime) {
-          data.preferenceText = body
-          data.durationMin = SERVICES[data.service || svcInMsg || "uñas acrílicas"] || 60
-        }
+        if (prefInMsg?.hasTime) { data.preferenceText = body; data.timeParsed = prefInMsg }
 
-        // ====== Estado: esperando contacto -> crear reserva si ya hay nombre/email ======
-        if (sess?.state === "awaiting_contact") {
-          const { name: inName, email: inEmail } = extractContact(body)
-          if (inName) data.name = inName
-          if (inEmail) data.email = inEmail
+        // ====== Confirmación explícita ======
+        const isYes = /\b(si|sí|ok|vale|confirmo|confirmar|perfecto)\b/i.test(low)
+        const isNo  = /\b(no|cambia|otra|mejor mas tarde|mas tarde|más tarde)\b/i.test(low)
 
-          if (data.name && data.email && data.service && data.preferenceText) {
-            // Crear cliente y reservar
-            const durationMin = SERVICES[data.service]
-            const pref = parsePreference(data.preferenceText)
-            const slot = findBestSlot(data.service, durationMin, pref)
-            if (!slot) { await safeSend(from, { text: "No tengo hueco en esa franja. ¿Te vale mañana por la tarde?" }); return }
-            let customer = await squareFindCustomerByPhone(phoneE164)
-            if (!customer) customer = await squareCreateCustomer({ givenName: data.name, emailAddress: data.email, phoneNumber: phoneE164 })
-            if (!customer) { await safeSend(from, { text: "No pude crear tu ficha ahora mismo. Prueba en unos minutos." }); return }
-
-            const teamMemberId = TEAM_MEMBER_IDS[0] || null
-            const sqBooking = await createSquareBooking({
-              startISO: slot.start.toISOString(),
-              serviceKey: data.service,
-              customerId: customer.id,
-              teamMemberId
-            })
-
-            const aptId = randomId("apt")
-            insertAppt.run({
-              id: aptId,
-              customer_name: data.name,
-              customer_phone: phoneE164,
-              customer_square_id: customer.id,
-              service: data.service,
-              duration_min: durationMin,
-              start_iso: slot.start.toISOString(),
-              end_iso: slot.end.toISOString(),
-              staff_id: teamMemberId,
-              status: "confirmed",
-              created_at: new Date().toISOString(),
-              square_booking_id: sqBooking?.id || null
-            })
-            clearSession.run({ phone: phoneE164 })
-            await safeSend(from, { text:
+        if (sess?.state === "awaiting_confirm") {
+          if (isNo) {
+            upsertSession.run({ phone: phoneE164, state: "awaiting_datetime", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+            await safeSend(from, { text: "Sin problema. Dime otra hora o día." })
+            return
+          }
+          if (!isYes) { await safeSend(from, { text: "¿Confirmo la cita? Responde “sí” para cerrar, o “no” para cambiar hora." }); return }
+          // Confirmamos → crear cliente si hace falta y reservar
+          const durationMin = SERVICES[data.service]
+          const slot = findBestSlot(data.service, durationMin, data.timeParsed)
+          if (!slot) { await safeSend(from, { text: "No tengo hueco exacto a esa hora. Dime otra franja y te digo el más cercano." }); return }
+          let customer = await squareFindCustomerByPhone(phoneE164)
+          if (!customer) {
+            if (!data.name || !data.email) {
+              await safeSend(from, { text: "Para cerrar la reserva necesito tu nombre y email." })
+              upsertSession.run({ phone: phoneE164, state: "awaiting_contact", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+              return
+            }
+            customer = await squareCreateCustomer({ givenName: data.name, emailAddress: data.email, phoneNumber: phoneE164 })
+            if (!customer) { await safeSend(from, { text: "No pude crear tu ficha ahora mismo. Inténtalo de nuevo en unos minutos." }); return }
+          }
+          const teamMemberId = TEAM_MEMBER_IDS[0] || null
+          const sqBooking = await createSquareBooking({
+            startISO: slot.start.toISOString(),
+            serviceKey: data.service,
+            customerId: customer.id,
+            teamMemberId
+          })
+          const aptId = randomId("apt")
+          insertAppt.run({
+            id: aptId,
+            customer_name: data.name || customer?.givenName || null,
+            customer_phone: phoneE164,
+            customer_square_id: customer.id,
+            service: data.service,
+            duration_min: durationMin,
+            start_iso: slot.start.toISOString(),
+            end_iso: slot.end.toISOString(),
+            staff_id: teamMemberId,
+            status: "confirmed",
+            created_at: new Date().toISOString(),
+            square_booking_id: sqBooking?.id || null
+          })
+          clearSession.run({ phone: phoneE164 })
+          await safeSend(from, { text:
 `Reserva confirmada.
 Servicio: ${data.service}
-Fecha: ${slot.start.format("dddd DD/MM HH:mm")}
+Fecha: ${formatES(slot.start)}
 Duración: ${durationMin} min
 Pago en persona.` })
-            return
-          }
-
-          // Falta algo
-          const need = !data.name ? "tu nombre y apellidos" : "tu email"
-          await safeSend(from, { text: `Para confirmarte la reserva necesito ${need}.` })
-          upsertSession.run({ phone: phoneE164, state: "awaiting_contact", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
           return
         }
 
-        // ====== Si ya tenemos servicio + hora en este mensaje ======
-        if (data.service && prefInMsg?.hasTime) {
-          data.preferenceText = body
-          data.durationMin = SERVICES[data.service]
-          // ¿Ya existe cliente?
-          let customer = await squareFindCustomerByPhone(phoneE164)
-          if (customer?.id) {
-            const pref = parsePreference(data.preferenceText)
-            const slot = findBestSlot(data.service, data.durationMin, pref)
-            if (!slot) { await safeSend(from, { text: "No tengo hueco en esa franja. ¿Te vale otra hora?" }); return }
-            const teamMemberId = TEAM_MEMBER_IDS[0] || null
-            const sqBooking = await createSquareBooking({
-              startISO: slot.start.toISOString(),
-              serviceKey: data.service,
-              customerId: customer.id,
-              teamMemberId
-            })
-            const aptId = randomId("apt")
-            insertAppt.run({
-              id: aptId,
-              customer_name: customer?.givenName || null,
-              customer_phone: phoneE164,
-              customer_square_id: customer.id,
-              service: data.service,
-              duration_min: data.durationMin,
-              start_iso: slot.start.toISOString(),
-              end_iso: slot.end.toISOString(),
-              staff_id: teamMemberId,
-              status: "confirmed",
-              created_at: new Date().toISOString(),
-              square_booking_id: sqBooking?.id || null
-            })
-            clearSession.run({ phone: phoneE164 })
-            await safeSend(from, { text:
-`Reserva confirmada.
-Servicio: ${data.service}
-Fecha: ${slot.start.format("dddd DD/MM HH:mm")}
-Duración: ${data.durationMin} min
-Pago en persona.` })
+        // ====== Si ya hay servicio + hora: proponemos y pedimos confirmar ======
+        if (data.service && data.timeParsed?.hasTime) {
+          const d = data.timeParsed
+          const pref = { day: d.day, hour: d.hour, minute: d.minute }
+          const durationMin = SERVICES[data.service]
+          const slot = findBestSlot(data.service, durationMin, pref)
+          if (!slot) {
+            // Sugerimos el más cercano SIN reservar
+            const alt = findBestSlot(data.service, durationMin, null)
+            if (alt) {
+              await safeSend(from, { text: `No tengo libre exactamente esa hora. Te puedo ofrecer: ${formatES(alt.start)}. ¿Confirmo?` })
+              data.timeParsed = { day: alt.start, hour: alt.start.hour(), minute: alt.start.minute(), hasTime: true }
+              upsertSession.run({ phone: phoneE164, state: "awaiting_confirm", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+            } else {
+              await safeSend(from, { text: "No veo hueco esta semana. Dime otra franja u otro día." })
+            }
             return
           }
-          // No hay cliente → pedir contacto y guardar TODO
-          await safeSend(from, { text: "Perfecto. Para confirmarte la reserva necesito tu nombre y email." })
-          upsertSession.run({ phone: phoneE164, state: "awaiting_contact", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+          await safeSend(from, { text: `Tengo libre ${formatES(slot.start)} para ${data.service}. ¿Confirmo la cita?` })
+          data.timeParsed = { day: slot.start, hour: slot.start.hour(), minute: slot.start.minute(), hasTime: true }
+          upsertSession.run({ phone: phoneE164, state: "awaiting_confirm", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
           return
         }
 
-        // ====== Si hay servicio, pero falta día/hora ======
-        if (data.service && !prefInMsg?.hasTime) {
-          await safeSend(from, { text: "¿Qué día y hora te viene bien? Ej: “mañana a las 10”." })
+        // ====== Pedir piezas que falten ======
+        if (data.service && !data.timeParsed?.hasTime) {
+          await safeSend(from, { text: "¿Qué día y hora te viene bien? Ej: “14 de agosto a las 10” o “mañana a las 10”." })
           upsertSession.run({ phone: phoneE164, state: "awaiting_datetime", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
           return
         }
-
-        // ====== Si hay hora, pero aún no sabemos servicio ======
-        if (!data.service && prefInMsg?.hasTime) {
+        if (!data.service && data.timeParsed?.hasTime) {
           await safeSend(from, { text: "¿Qué servicio necesitas? Por ejemplo: uñas acrílicas." })
-          upsertSession.run({ phone: phoneE164, state: "awaiting_service", data_json: JSON.stringify({ ...data, preferenceText: body }), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+          upsertSession.run({ phone: phoneE164, state: "awaiting_service", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
           return
         }
 
-        // ====== Estados básicos ======
+        // ====== Estados base ======
         if (sess?.state === "awaiting_service") {
           const s = detectService(body)
           if (!s) { await safeSend(from, { text: "Dime el servicio (p. ej., uñas acrílicas)." }); return }
           data.service = s
-          await safeSend(from, { text: "¿Qué día y hora? (p. ej., “viernes a las 18:30”)" })
+          await safeSend(from, { text: "¿Qué día y hora? (p. ej., “14/08 10:00” o “viernes 18:30”)" })
           upsertSession.run({ phone: phoneE164, state: "awaiting_datetime", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
           return
         }
         if (sess?.state === "awaiting_datetime") {
-          const pref = parsePreference(body)
-          if (!pref?.hasTime) { await safeSend(from, { text: "Necesito una hora concreta. Ej: “mañana a las 10:00”." }); return }
-          data.preferenceText = body
-          data.durationMin = SERVICES[data.service]
-          // Miramos si es cliente
-          let customer = await squareFindCustomerByPhone(phoneE164)
-          if (customer?.id) {
-            const slot = findBestSlot(data.service, data.durationMin, pref)
-            if (!slot) { await safeSend(from, { text: "No tengo hueco en esa franja. ¿Te vale otra hora?" }); return }
-            const teamMemberId = TEAM_MEMBER_IDS[0] || null
-            const sqBooking = await createSquareBooking({ startISO: slot.start.toISOString(), serviceKey: data.service, customerId: customer.id, teamMemberId })
-            const aptId = randomId("apt")
-            insertAppt.run({
-              id: aptId, customer_name: customer?.givenName || null, customer_phone: phoneE164,
-              customer_square_id: customer.id, service: data.service, duration_min: data.durationMin,
-              start_iso: slot.start.toISOString(), end_iso: slot.end.toISOString(), staff_id: teamMemberId,
-              status: "confirmed", created_at: new Date().toISOString(), square_booking_id: sqBooking?.id || null
-            })
-            clearSession.run({ phone: phoneE164 })
-            await safeSend(from, { text:
-`Reserva confirmada.
-Servicio: ${data.service}
-Fecha: ${slot.start.format("dddd DD/MM HH:mm")}
-Duración: ${data.durationMin} min
-Pago en persona.` })
+          const p = parsePreference(body)
+          if (!p?.hasTime) { await safeSend(from, { text: "Necesito una hora concreta. Ej: “mañana a las 10:00”." }); return }
+          data.timeParsed = p
+          // Proponemos y pedimos confirmar
+          const durationMin = SERVICES[data.service]
+          const slot = findBestSlot(data.service, durationMin, { day: p.day, hour: p.hour, minute: p.minute })
+          if (!slot) {
+            const alt = findBestSlot(data.service, durationMin, null)
+            if (alt) {
+              await safeSend(from, { text: `No tengo libre exactamente esa hora. Te puedo ofrecer: ${formatES(alt.start)}. ¿Confirmo?` })
+              data.timeParsed = { day: alt.start, hour: alt.start.hour(), minute: alt.start.minute(), hasTime: true }
+              upsertSession.run({ phone: phoneE164, state: "awaiting_confirm", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+            } else {
+              await safeSend(from, { text: "No veo hueco esta semana. Dime otra franja u otro día." })
+            }
             return
           }
-          // No cliente → pedimos contacto
-          await safeSend(from, { text: "Genial. Para confirmarte la reserva necesito tu nombre y email." })
-          upsertSession.run({ phone: phoneE164, state: "awaiting_contact", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+          await safeSend(from, { text: `Tengo libre ${formatES(slot.start)} para ${data.service}. ¿Confirmo la cita?` })
+          data.timeParsed = { day: slot.start, hour: slot.start.hour(), minute: slot.start.minute(), hasTime: true }
+          upsertSession.run({ phone: phoneE164, state: "awaiting_confirm", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+          return
+        }
+        if (sess?.state === "awaiting_contact") {
+          const { name: inName, email: inEmail } = extractContact(body)
+          if (inName) data.name = inName
+          if (inEmail) data.email = inEmail
+          if (!data.name || !data.email) {
+            const need = !data.name ? "tu nombre y apellidos" : "tu email"
+            await safeSend(from, { text: `Para cerrar, necesito ${need}.` })
+            upsertSession.run({ phone: phoneE164, state: "awaiting_contact", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
+            return
+          }
+          await safeSend(from, { text: "Perfecto, tengo tus datos. ¿Confirmo la cita?" })
+          upsertSession.run({ phone: phoneE164, state: "awaiting_confirm", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
           return
         }
 
@@ -589,25 +584,23 @@ Pago en persona.` })
         if (/(cambiar cita|mover cita|reprogramar)/i.test(low)) {
           const upcoming = getUpcomingByPhone.get({ phone: phoneE164, now: new Date().toISOString() })
           if (!upcoming) return
-          const pref = parsePreference(body)
-          const slot = findBestSlot(upcoming.service, upcoming.duration_min, pref)
+          const p = parsePreference(body)
+          const slot = findBestSlot(upcoming.service, upcoming.duration_min, { day: p.day, hour: p.hour, minute: p.minute })
           if (!slot) return
           db.prepare(`UPDATE appointments SET start_iso=@s, end_iso=@e WHERE id=@id`).run({ id: upcoming.id, s: slot.start.toISOString(), e: slot.end.toISOString() })
-          await safeSend(from, { text:
-`He movido tu cita a:
-${slot.start.format("dddd DD/MM HH:mm")}
-Pago en persona.` })
+          await safeSend(from, { text: `He movido tu cita a:\n${formatES(slot.start)}\nPago en persona.` })
           return
         }
 
-        // ====== Entrada inicial ======
+        // ====== Entrada inicial / saludo ======
         if (tag === "GREETING") {
           const reply = await aiReply(body)
           if (reply) await safeSend(from, { text: reply })
+          upsertSession.run({ phone: phoneE164, state: "awaiting_service", data_json: JSON.stringify(data), updated_at: new Date().toISOString(), last_prompt_at: new Date().toISOString() })
           return
         }
 
-        // Si menciona cita/disponibilidad pero sin servicio
+        // Menciona cita/disponibilidad pero sin servicio
         if (/(reserva|reservar|cita|disponible|disponibilidad|pedir hora|hueco)/i.test(low) && !detectService(low)) {
           const txt = Object.keys(SERVICES).map(s=>`• ${s} (${SERVICES[s]} min)`).join("\n")
           await safeSend(from, { text: `¿Qué servicio necesitas?\n${txt}\n\nEjemplo:\n- "cita uñas acrílicas mañana a las 10"` })
@@ -615,7 +608,7 @@ Pago en persona.` })
           return
         }
 
-        // Fallback corto
+        // Fallback
         const reply = await aiReply(body)
         if (reply) await safeSend(from, { text: reply })
 
