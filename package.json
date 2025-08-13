@@ -8,11 +8,12 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.8",
+    "better-sqlite3": "^9.4.3",
+    "dayjs": "^1.11.13",
     "dotenv": "^16.3.1",
     "express": "^4.19.2",
     "openai": "^4.0.0",
     "pino": "^8.14.1",
-    "pino-pretty": "^10.2.0",
     "qrcode": "^1.5.3",
     "qrcode-terminal": "^0.12.0"
   }
