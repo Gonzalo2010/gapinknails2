@@ -11,11 +11,16 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 async function startBot() {
     console.log("🚀 Iniciando bot de Gapink Nails...")
 
-    const { state, saveCreds } = await useMultiFileAuthState("auth_info")
+    const authFolder = "auth_info"
+    if (!fs.existsSync(authFolder) || fs.readdirSync(authFolder).length === 0) {
+        console.log("⚠️ No hay sesión guardada. Se pedirá QR para vincular.")
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder)
 
     const sock = makeWASocket({
         logger: pino({ level: "silent" }),
-        printQRInTerminal: true,
+        printQRInTerminal: false,
         auth: state
     })
 
@@ -23,15 +28,18 @@ async function startBot() {
         const { connection, lastDisconnect, qr } = update
 
         if (qr) {
-            console.log("📲 Escanea este QR en WhatsApp → Dispositivos vinculados → Vincular dispositivo")
+            console.log("📲 Escanea este QR desde WhatsApp → Dispositivos vinculados")
             qrcode.generate(qr, { small: true })
         }
 
         if (connection === "close") {
             const reason = lastDisconnect?.error?.output?.statusCode
             console.log("❌ Conexión cerrada. Razón:", reason)
-            if (reason !== DisconnectReason.loggedOut) {
+            if (reason !== DisconnectReason.loggedOut && fs.existsSync(authFolder) && fs.readdirSync(authFolder).length > 0) {
+                console.log("🔄 Reintentando conexión...")
                 startBot()
+            } else {
+                console.log("⚠️ Sesión inválida o cerrada. Necesitas escanear QR otra vez.")
             }
         } else if (connection === "open") {
             console.log("✅ Bot conectado a WhatsApp correctamente.")
