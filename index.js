@@ -1,9 +1,10 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys"
+import baileys from "@whiskeysockets/baileys"
 import qrcode from "qrcode-terminal"
 import pino from "pino"
 import "dotenv/config"
 import OpenAI from "openai"
 
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
 async function startBot() {
