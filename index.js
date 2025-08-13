@@ -1,10 +1,21 @@
+// index.js — Bot WhatsApp Gapink Nails (DeepSeek)
+// ENV necesarias:
+// - DEEPSEEK_API_KEY=xxxxx
+// - DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions (por defecto)
+// - DEEPSEEK_MODEL=deepseek-chat (recomendado)
+// - SQUARE_ACCESS_TOKEN=xxxxx
+// - SQUARE_ENV=production|sandbox
+// - SQUARE_LOCATION_ID=XXXXX
+// - SQ_TEAM_IDS=tmid1,tmid2
+// - SQ_SV_UNAS_ACRILICAS=service_variation_id
+// - PORT=8080 (opcional)
+
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
 import pino from "pino"
 import qrcode from "qrcode"
 import qrcodeTerminal from "qrcode-terminal"
 import "dotenv/config"
-import OpenAI from "openai"
 import fs from "fs"
 import { webcrypto } from "crypto"
 import Database from "better-sqlite3"
@@ -26,7 +37,7 @@ const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
-// Servicios y duraciones (de momento 1)
+// Servicios y duraciones
 const SERVICES = {
   "uñas acrílicas": 90,
 }
@@ -40,46 +51,66 @@ const SERVICE_VARIATIONS = {
 const TEAM_MEMBER_IDS = (process.env.SQ_TEAM_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean)
 
-// =================== OPENAI ===================
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+// =================== DEEPSEEK ===================
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
+const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/chat/completions"
+const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL   || "deepseek-chat"
+
+async function dsChat(messages, { temperature = 0.4 } = {}) {
+  try {
+    const resp = await fetch(DEEPSEEK_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${DEEPSEEK_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages,
+        temperature
+      })
+    })
+    if (!resp.ok) {
+      const txt = await resp.text().catch(()=> "")
+      throw new Error(`DeepSeek HTTP ${resp.status} ${txt}`)
+    }
+    const data = await resp.json()
+    return (data?.choices?.[0]?.message?.content || "").trim()
+  } catch (e) {
+    console.error("DeepSeek error:", e?.message || e)
+    return ""
+  }
+}
 
 const SYSTEM_PROMPT = `Eres el asistente de WhatsApp de Gapink Nails. Suena humano y cercano.
 - No reveles nombres del personal ni ofrezcas elegir profesional.
 - Si el cliente indica hora/día, respétalo si cabe; si no, ofrece el hueco más cercano.
 - Mensajes cortos, sin emojis. Pago siempre en persona.
 - Si falta dato para alta nueva, pide solo nombre y email.
-- Si el mensaje no trata de reservar/cambiar/cancelar/disponibilidad/horarios, no respondas.
+- Si el mensaje solo es un saludo (hola, buenas, etc.), respóndele breve y pregunta si quiere pedir cita o consultar disponibilidad.
+- Si el mensaje no trata de reservas/cambios/cancelaciones/disponibilidad/horarios ni es un saludo, responde de forma muy breve o redirígelo a pedir cita.
 - Nunca digas que eres IA.`
 
 async function isBookingIntent(text) {
-  try {
-    const r = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content:
-`Devuelve SOLO:
-BOOKING -> si es sobre reservas/citas/disponibilidad/cambios/cancelaciones.
+  const out = await dsChat([
+    { role: "system", content:
+`Devuelve SOLO una palabra:
+BOOKING -> si es sobre reservar/citas/disponibilidad/cambios/cancelaciones/horarios.
+GREETING -> si es saludo (hola, buenas, qué tal, etc.).
 IGNORE  -> lo demás.` },
-        { role: "user", content: text || "" }
-      ],
-      temperature: 0
-    })
-    return (r.choices[0].message.content || "").trim().toUpperCase().startsWith("BOOKING")
-  } catch (e) { console.error("Classifier error:", e); return false }
+    { role: "user", content: text || "" }
+  ], { temperature: 0 })
+  const tag = (out || "").toUpperCase().trim()
+  return tag.startsWith("BOOKING") ? "BOOKING"
+       : tag.startsWith("GREETING") ? "GREETING"
+       : "IGNORE"
 }
 
 async function aiReply(text) {
-  try {
-    const r = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: text }
-      ],
-      temperature: 0.4
-    })
-    return r.choices[0].message.content?.trim() || ""
-  } catch (e) { console.error("AI reply error:", e); return "" }
+  return await dsChat([
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: text || "" }
+  ], { temperature: 0.4 })
 }
 
 // =================== HELPERS TELÉFONO & CONTACTO ===================
@@ -88,12 +119,11 @@ const onlyDigits = (s="") => (s || "").replace(/\D+/g, "")
 function normalizePhoneES(raw) {
   const digits = onlyDigits(raw)
   if (!digits) return null
-  // Normalizamos a E.164 (España por defecto)
   if (raw.startsWith("+") && digits.length >= 8 && digits.length <= 15) return `+${digits}`
   if (digits.startsWith("34") && digits.length === 11) return `+${digits}`
   if (digits.length === 9) return `+34${digits}`
   if (digits.startsWith("00")) return `+${digits.slice(2)}`
-  return `+${digits}` // último intento
+  return `+${digits}`
 }
 
 // Heurística para sacar nombre y email de un mensaje libre
@@ -147,7 +177,6 @@ async function squareFindCustomerByPhone(phoneRaw) {
   try {
     const e164 = normalizePhoneES(phoneRaw)
     if (!e164 || !e164.startsWith("+") || e164.length < 8 || e164.length > 16) {
-      // Si el formato es dudoso, no llamamos a la API (evita 400)
       return null
     }
     const resp = await square.customersApi.searchCustomers({
@@ -156,7 +185,6 @@ async function squareFindCustomerByPhone(phoneRaw) {
     const list = resp?.result?.customers || []
     return list[0] || null
   } catch (e) {
-    // Log fino pero sin bloquear el flujo
     console.error("Square search error:", e?.message || e, e?.result?.errors || "")
     return null
   }
@@ -393,7 +421,7 @@ app.listen(PORT, async () => {
 
 // =================== BOT ===================
 async function startBot() {
-  console.log("🚀 Iniciando bot Gapink Nails...")
+  console.log("🚀 Iniciando bot Gapink Nails (DeepSeek)...")
   try {
     if (!fs.existsSync("auth_info")) fs.mkdirSync("auth_info", { recursive: true })
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
@@ -513,9 +541,17 @@ Pago en persona.` })
           return
         }
 
-        // Clasificador: si no es de cita, no respondemos
-        const seemsBooking = await isBookingIntent(body || "")
-        if (!seemsBooking) return
+        // Clasificador: BOOKING / GREETING / IGNORE
+        const intent = await isBookingIntent(body || "")
+
+        // Saludos → contestar también (sin “respuesta automática” global, solo cuando saludan)
+        if (intent === "GREETING") {
+          const reply = await aiReply(body)
+          if (reply) await safeSend(from, { text: reply })
+          return
+        }
+
+        if (intent === "IGNORE") return
 
         // Cancelar
         if (/(cancel(ar)? cita)/i.test(low)) {
@@ -668,11 +704,12 @@ Ejemplo:
           return
         }
 
-        // Fallback corto (solo booking)
+        // Fallback corto para casos de booking
         const reply = await aiReply(body)
         if (reply) await safeSend(from, { text: reply })
+
       } catch (e) {
-        console.error("messages.upsert error:", e) // nada al usuario
+        console.error("messages.upsert error:", e)
       }
     })
   } catch (e) {
