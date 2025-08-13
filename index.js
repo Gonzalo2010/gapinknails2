@@ -6,6 +6,10 @@ import qrcodeTerminal from "qrcode-terminal"
 import "dotenv/config"
 import OpenAI from "openai"
 import fs from "fs"
+import { webcrypto } from "crypto"          // 🔧 FIX WebCrypto
+
+// Exponer WebCrypto como global (Baileys lo espera)
+if (!globalThis.crypto) globalThis.crypto = webcrypto
 
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -15,6 +19,7 @@ const app = express()
 const PORT = process.env.PORT || 8080
 
 app.get("/", (_req, res) => res.send("Gapink Nails WhatsApp Bot ✅ OK"))
+
 // QR como PNG en vivo
 let lastQR = null
 app.get("/qr.png", async (_req, res) => {
@@ -70,13 +75,12 @@ async function startBot() {
       const msg = err?.message ?? String(err ?? "")
       console.log(`❌ Conexión cerrada. Status: ${status}. Motivo: ${msg}`)
 
-      // Si la sesión es inválida o cerrada desde el móvil, pediremos QR y reintentamos.
       const shouldRelogin =
         status === DisconnectReason.loggedOut ||
         /logged.?out|invalid|bad session/i.test(msg)
 
       if (shouldRelogin || reconnectAttempts < 8) {
-        const waitMs = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts)) // 1s->30s
+        const waitMs = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts)) // 1s→30s
         reconnectAttempts++
         console.log(`🔄 Reintentando en ${waitMs}ms...`)
         setTimeout(() => startBot().catch(console.error), waitMs)
