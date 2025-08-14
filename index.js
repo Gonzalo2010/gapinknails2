@@ -1,11 +1,10 @@
-// index.js — Gapink Nails WhatsApp Bot (Square-only + Web QR + Botones) — FIX servicios=0
+// index.js — Gapink Nails WhatsApp Bot (Square-only + Web QR + Botones)
 // - Sin DB; todo en Square
-// - OpenAI 4o-mini para intención + servicio más parecido
-// - Carga de servicios: detecta variaciones con appointmentServiceVariationData (más robusto)
-// - Fallback opcional desde env SQ_SERVICES_FALLBACK (JSON: [{name,variationId,durationMin}])
-// - Botones "Sí / No" para confirmar reservar / cancelar / editar
-// - Web QR para vincular Baileys
-// - TZ Europe/Madrid; sin mensajes de error técnicos al cliente
+// - OpenAI 4o-mini para intención + mapeo del servicio más parecido
+// - Carga robusta de servicios (soporta SQ_FORCE_SERVICE_ID y fallback JSON)
+// - Botones “Sí / No” para confirmar (reservar / cancelar / editar)
+// - Web del QR para vincular Baileys
+// - Español (ES), TZ Europe/Madrid; errores solo a logs
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -28,7 +27,6 @@ const EURO_TZ = "Europe/Madrid"
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
 // ===== Config negocio
-const WORK_DAYS = [1,2,3,4,5,6] // L-S
 const OPEN_HOUR = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN  = 30
@@ -142,16 +140,41 @@ async function sqREST(path, method="GET", body) {
 let SERVICE_BY_NAME = new Map() // name -> { itemId, variationId, durationMin }
 let SERVICES_LIST = []          // nombres visibles
 
+async function injectServiceById(itemId){
+  try{
+    const j = await sqREST(`/catalog/objects/${itemId}?include_related_objects=true`, "GET")
+    const item = j?.object
+    const related = j?.related_objects || []
+    if (item?.type !== "ITEM") return
+
+    const baseName = (item?.itemData?.name || "Servicio").trim()
+    const vars = related.filter(o => o.type === "ITEM_VARIATION" && o.itemVariationData?.itemId === itemId)
+
+    for (const v of vars){
+      const ivd  = v.itemVariationData || {}
+      const asvd = ivd.appointmentServiceVariationData || v.appointmentServiceVariationData
+      if (!asvd) continue               // solo variaciones de citas
+      const varName = (ivd?.name || "").trim()
+      const name = varName && varName.toLowerCase()!=="standard" ? `${baseName} ${varName}`.trim() : baseName
+      const durSec = asvd?.serviceDuration ?? null
+      const durationMin = durSec ? Math.max(15, Math.round(Number(durSec)/60)) : 60
+
+      SERVICE_BY_NAME.set(name.toLowerCase(), { itemId, variationId: v.id, durationMin })
+      if (!SERVICES_LIST.includes(name)) SERVICES_LIST.push(name)
+    }
+  }catch(e){ console.error("injectServiceById:", e?.message||e) }
+}
+
 async function loadServicesFromSquare(){
   SERVICE_BY_NAME.clear(); SERVICES_LIST=[]
   let cursor=null
-  const all = []
-  do {
-    const j = await sqREST(`/catalog/list?types=ITEM,ITEM_VARIATION${cursor?`&cursor=${encodeURIComponent(cursor)}`:""}`,"GET")
+  const all=[]
+  do{
+    const j = await sqREST(`/catalog/list?types=ITEM,ITEM_VARIATION${cursor?`&cursor=${encodeURIComponent(cursor)}`:""}`, "GET")
     if (!j) break
     if (Array.isArray(j.objects)) all.push(...j.objects)
     cursor = j.cursor || null
-  } while(cursor)
+  }while(cursor)
 
   const items = all.filter(o=>o.type==="ITEM")
   const itemMap = new Map(items.map(i=>[i.id,i]))
@@ -160,33 +183,51 @@ async function loadServicesFromSquare(){
   for (const v of vars){
     const ivd = v.itemVariationData || {}
     const asvd = ivd.appointmentServiceVariationData || v.appointmentServiceVariationData
-    if (!asvd) continue // solo las variaciones que realmente son de cita
+    if (!asvd) continue
     const item = itemMap.get(ivd.itemId)
     const baseName = (item?.itemData?.name || "Servicio").trim()
     const varName  = (ivd?.name || "").trim()
     const name = varName && varName.toLowerCase()!=="standard" ? `${baseName} ${varName}`.trim() : baseName
-    const durSec = asvd?.serviceDuration ?? v?.serviceDuration ?? null
+    const durSec = asvd?.serviceDuration ?? null
     const durationMin = durSec ? Math.max(15, Math.round(Number(durSec)/60)) : 60
-    SERVICE_BY_NAME.set(name.toLowerCase(), { itemId:item?.id || null, variationId:v.id, durationMin })
+    SERVICE_BY_NAME.set(name.toLowerCase(), { itemId:item?.id||null, variationId:v.id, durationMin })
     SERVICES_LIST.push(name)
   }
 
-  // Fallback opcional por env si no hay nada en Square
+  // Si no hemos cargado nada, intenta forzar por ITEM ID (tu caso)
+  if (SERVICES_LIST.length===0) {
+    const forcedItem = process.env.SQ_FORCE_SERVICE_ID
+    if (forcedItem) await injectServiceById(forcedItem)
+  }
+  // Si se quiere forzar una variación concreta
+  if (process.env.SQ_FORCE_VARIATION_ID && SERVICES_LIST.length>0) {
+    const vid = process.env.SQ_FORCE_VARIATION_ID
+    for (const [k,v] of SERVICE_BY_NAME.entries()){
+      if (v.variationId !== vid) SERVICE_BY_NAME.delete(k)
+      else { SERVICES_LIST = [k] ; break }
+    }
+  }
+
+  // Fallback opcional desde env JSON
   if (SERVICES_LIST.length===0) {
     try{
       const raw = process.env.SQ_SERVICES_FALLBACK || ""
       if (raw) {
-        const list = JSON.parse(raw) // [{name, variationId, durationMin}]
+        const list = JSON.parse(raw) // [{name,variationId,durationMin}]
         for (const s of list) {
           if (!s?.name || !s?.variationId) continue
-          SERVICE_BY_NAME.set(String(s.name).toLowerCase(), { itemId:null, variationId:String(s.variationId), durationMin: Number(s.durationMin)||60 })
+          SERVICE_BY_NAME.set(String(s.name).toLowerCase(), {
+            itemId: null,
+            variationId: String(s.variationId),
+            durationMin: Number(s.durationMin)||60
+          })
           SERVICES_LIST.push(String(s.name))
         }
       }
     }catch(e){ console.error("SQ_SERVICES_FALLBACK parse:", e?.message||e) }
   }
 
-  console.log(`🗂️ Servicios cargados: ${SERVICES_LIST.length}`)
+  console.log(`🗂️ Servicios cargados: ${SERVICES_LIST.length} -> ${SERVICES_LIST.join(", ")}`)
 }
 
 async function matchServiceOrClosest(userText){
@@ -198,16 +239,15 @@ async function matchServiceOrClosest(userText){
   const lowText = rmDiacritics((userText||"").toLowerCase())
 
   // 1) match directo por inclusión
-  for (const name of SERVICES_LIST){
-    const nm = String(name||"")
-    if (!nm) continue
-    if (lowText.includes(rmDiacritics(nm.toLowerCase()))) {
-      const e = SERVICE_BY_NAME.get(nm.toLowerCase())
-      if (e) return { name:nm, ...e }
+  for (const nm of SERVICES_LIST){
+    const name = String(nm||"")
+    if (name && lowText.includes(rmDiacritics(name.toLowerCase()))) {
+      const e = SERVICE_BY_NAME.get(name.toLowerCase())
+      if (e) return { name, ...e }
     }
   }
 
-  // 2) IA elige el más parecido (pero protegido)
+  // 2) IA elige el más parecido (protegido)
   const list = SERVICES_LIST.join(" | ")
   const pick = await aiChat([
     { role:"system", content:`${SYS}\nElige de la lista el servicio más parecido al texto del cliente. Responde SOLO con un nombre EXACTO de la lista, sin explicaciones.` },
@@ -219,7 +259,7 @@ async function matchServiceOrClosest(userText){
   const e = key ? SERVICE_BY_NAME.get(key) : null
   if (e) return { name: chosen, ...e }
 
-  // 3) fallback: primer servicio disponible (ya no rompe si no hay)
+  // 3) fallback: primero disponible
   const fallback = SERVICES_LIST[0]
   if (!fallback) return null
   const ef = SERVICE_BY_NAME.get(fallback.toLowerCase())
@@ -382,6 +422,9 @@ async function startBot(){
             return
           }
         }
+        // Por si el cliente escribe “sí/no” en vez de pulsar
+        if (session?.pending && YES_RE.test(text)) { await onConfirmYes({ from, phone, session, safeSend }); return }
+        if (session?.pending && NO_RE.test(text))  { await onConfirmNo({ from, phone, session, safeSend });  return }
 
         // Texto normal → IA
         const extra = await extractFromText(text)
@@ -534,15 +577,17 @@ async function startBot(){
             const svId = p.service.variationId
             const svVer = await getServiceVariationVersion(svId)
             const startISO = p.startEU.tz("UTC").toISOString()
+            const tmId = p.staffId || TEAM_MEMBER_IDS[0] // evita "any" al crear
+            if (!tmId) { await safeSend(from,{ text:"No tengo profesional configurado todavía. Te escribo en cuanto lo tenga listo." }); return }
             const body = {
-              idempotencyKey: stableKey({loc:LOCATION_ID, sv:svId, st:startISO, cust:customer.id, tm:p.staffId||"any"}),
+              idempotencyKey: stableKey({loc:LOCATION_ID, sv:svId, st:startISO, cust:customer.id, tm:tmId}),
               booking:{
                 locationId: LOCATION_ID,
                 customerId: customer.id,
                 startAt: startISO,
                 appointmentSegments:[
                   {
-                    teamMemberId: p.staffId || TEAM_MEMBER_IDS[0] || "any",
+                    teamMemberId: tmId,
                     serviceVariationId: svId,
                     serviceVariationVersion: Number(svVer||1),
                     durationMinutes: p.service.durationMin
