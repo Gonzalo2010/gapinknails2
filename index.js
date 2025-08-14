@@ -4,6 +4,11 @@
 // Confirmación SOLO si el mensaje ACTUAL contiene “sí/confirmo/ok/vale”
 // Persistencia de hora en ms (sin UTC shift) + validaciones
 // Disponibilidad forward-first + cancelar/editar reales en Square
+// FIXES:
+//  - Acepta SQ_FORCE_SERVICE_ID como fallback de servicio
+//  - Autodescubre team_member_id si no se define SQ_TEAM_IDS
+//  - Logs detallados de errores Square (para depurar por qué no “entra”)
+//  - Aviso: en SANDBOX no hay SMS reales; en producción activa Communications
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -18,7 +23,7 @@ import dayjs from "dayjs"
 import utc from "dayjs/plugin/utc.js"
 import tz from "dayjs/plugin/timezone.js"
 import "dayjs/locale/es.js"
-import { Client, Environment } from "square"
+import { Client, Environment, ApiError } from "square"
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto
 dayjs.extend(utc); dayjs.extend(tz); dayjs.locale("es")
@@ -32,8 +37,12 @@ const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 const SERVICES = { "uñas acrílicas": 90 }
-const SERVICE_VARIATIONS = { "uñas acrílicas": process.env.SQ_SV_UNAS_ACRILICAS || "" }
-const TEAM_MEMBER_IDS = (process.env.SQ_TEAM_IDS || "").split(",").map(s=>s.trim()).filter(Boolean)
+// Acepta dos nombres de variable para el mismo servicio (evita “no entra a Square” por ID vacío)
+const SERVICE_VARIATIONS = {
+  "uñas acrílicas": process.env.SQ_SV_UNAS_ACRILICAS || process.env.SQ_FORCE_SERVICE_ID || ""
+}
+// TEAM MEMBERS (si vienen vacíos, los descubrimos vía API)
+let TEAM_MEMBER_IDS = (process.env.SQ_TEAM_IDS || "").split(",").map(s=>s.trim()).filter(Boolean)
 
 // ===== OpenAI
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY
@@ -41,6 +50,7 @@ const OPENAI_API_URL  = process.env.OPENAI_API_URL || "https://api.openai.com/v1
 const OPENAI_MODEL    = process.env.OPENAI_MODEL || "gpt-4o-mini"
 
 async function aiChat(messages, { temperature=0.4 } = {}) {
+  if (!OPENAI_API_KEY) return ""
   try {
     const r = await fetch(OPENAI_API_URL, {
       method: "POST",
@@ -96,27 +106,155 @@ function normalizePhoneES(raw){const d=onlyDigits(raw);if(!d)return null;if(raw.
 function detectServiceFree(text=""){const low=rmDiacritics(text.toLowerCase());const map={"unas acrilicas":"uñas acrílicas","uñas acrilicas":"uñas acrílicas","uñas acrílicas":"uñas acrílicas"};for(const k of Object.keys(map))if(low.includes(rmDiacritics(k)))return map[k];for(const k of Object.keys(SERVICES))if(low.includes(rmDiacritics(k)))return k;return null}
 function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
-// Redondeo a slot (ceil) — ¡SOLO UNA DEFINICIÓN!
+// Redondeo a slot (ceil)
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
 // ===== Square
 const square = new Client({ accessToken: process.env.SQUARE_ACCESS_TOKEN, environment: process.env.SQUARE_ENV==="production"?Environment.Production:Environment.Sandbox })
 const locationId = process.env.SQUARE_LOCATION_ID
 let LOCATION_TZ = EURO_TZ
-async function squareCheckCredentials(){try{const locs=await square.locationsApi.listLocations();const loc=(locs.result.locations||[]).find(l=>l.id===locationId)||(locs.result.locations||[])[0];if(loc?.timezone)LOCATION_TZ=loc.timezone;console.log(`✅ Square listo. Location ${locationId}, TZ=${LOCATION_TZ}`)}catch(e){console.error("⛔ Square:",e?.message||e)}}
-async function squareFindCustomerByPhone(phoneRaw){try{const e164=normalizePhoneES(phoneRaw);if(!e164||!e164.startsWith("+")||e164.length<8||e164.length>16)return null;const resp=await square.customersApi.searchCustomers({query:{filter:{phoneNumber:{exact:e164}}}});return (resp?.result?.customers||[])[0]||null}catch(e){console.error("Square search:",e?.message||e);return null}}
-async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){try{const phone=normalizePhoneES(phoneNumber);const resp=await square.customersApi.createCustomer({idempotencyKey:`cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,givenName,emailAddress,phoneNumber:phone||undefined,note:"Creado desde bot WhatsApp Gapink Nails"});return resp?.result?.customer||null}catch(e){console.error("Square create:",e?.message||e);return null}}
-async function getServiceVariationVersion(id){try{const resp=await square.catalogApi.retrieveCatalogObject(id,true);return resp?.result?.object?.version}catch(e){console.error("getServiceVariationVersion:",e?.message||e);return undefined}}
-function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`;return createHash("sha256").update(raw).digest("hex").slice(0,48)}
-async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId}){try{const serviceVariationId=SERVICE_VARIATIONS[serviceKey];if(!serviceVariationId||!teamMemberId||!locationId)return null;const version=await getServiceVariationVersion(serviceVariationId);if(!version)return null;const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}};const resp=await square.bookingsApi.createBooking(body);return resp?.result?.booking||null}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
-async function cancelSquareBooking(bookingId){try{const r=await square.bookingsApi.cancelBooking(bookingId);return !!r?.result?.booking?.id}catch(e){console.error("cancelSquareBooking:",e?.message||e);return false}}
-async function updateSquareBooking(bookingId,{startEU,serviceKey,customerId,teamMemberId}){try{
-  const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking;if(!booking)return null
-  const serviceVariationId=SERVICE_VARIATIONS[serviceKey];const version=await getServiceVariationVersion(serviceVariationId)
-  const startISO=startEU.tz("UTC").toISOString()
-  const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}}
-  const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null
-}catch(e){console.error("updateSquareBooking:",e?.message||e);return null}}
+
+function prettyApiError(e){
+  if (e instanceof ApiError) {
+    const code = e.statusCode
+    const errs = e.result?.errors || []
+    return `Square ${code}: ${errs.map(x=>`${x.category||''}/${x.code||''} ${x.detail||''}`.trim()).join(" | ")}`
+  }
+  return e?.message || String(e)
+}
+
+async function squareCheckCredentials(){
+  try{
+    const locs=await square.locationsApi.listLocations()
+    const loc=(locs.result.locations||[]).find(l=>l.id===locationId)||(locs.result.locations||[])[0]
+    if(loc?.timezone) LOCATION_TZ=loc.timezone
+    console.log(`✅ Square listo. Location ${locationId||loc?.id}, TZ=${LOCATION_TZ}`)
+    // Validación servicio:
+    const sv = SERVICE_VARIATIONS["uñas acrílicas"]
+    if(!sv){ console.error("⛔ Falta ID de servicio. Define SQ_SV_UNAS_ACRILICAS o SQ_FORCE_SERVICE_ID"); }
+    // Autodescubre team members si no hay env:
+    if (!TEAM_MEMBER_IDS.length) {
+      const ids = await discoverTeamMembers()
+      TEAM_MEMBER_IDS = ids
+      console.log(`👥 TEAM_MEMBER_IDS autodescubiertos: ${TEAM_MEMBER_IDS.join(", ")}`)
+    } else {
+      console.log(`👥 TEAM_MEMBER_IDS (env): ${TEAM_MEMBER_IDS.join(", ")}`)
+    }
+  }catch(e){
+    console.error("⛔ Square init:", prettyApiError(e))
+  }
+}
+
+async function discoverTeamMembers() {
+  try{
+    // bookable_only + location para asegurarnos que sirven para reservas
+    const r = await square.bookingsApi.listTeamMemberBookingProfiles({
+      bookableOnly: true,
+      locationId: locationId
+    })
+    const list = r?.result?.teamMemberBookingProfiles || []
+    const ids = list.filter(x=>x?.isBookable!==false && x?.teamMemberId).map(x=>x.teamMemberId)
+    if (!ids.length) console.error("⚠️ No hay team members bookables en esta location.")
+    return ids
+  }catch(e){
+    console.error("listTeamMemberBookingProfiles:", prettyApiError(e))
+    return []
+  }
+}
+
+async function squareFindCustomerByPhone(phoneRaw){
+  try{
+    const e164=normalizePhoneES(phoneRaw)
+    if(!e164||!e164.startsWith("+")||e164.length<8||e164.length>16) return null
+    const resp=await square.customersApi.searchCustomers({query:{filter:{phoneNumber:{exact:e164}}}})
+    return (resp?.result?.customers||[])[0]||null
+  }catch(e){ console.error("Square search:", prettyApiError(e)); return null }
+}
+async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){
+  try{
+    const phone=normalizePhoneES(phoneNumber)
+    const resp=await square.customersApi.createCustomer({
+      idempotencyKey:`cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+      givenName,emailAddress,phoneNumber:phone||undefined,
+      note:"Creado desde bot WhatsApp Gapink Nails"
+    })
+    return resp?.result?.customer||null
+  }catch(e){ console.error("Square create:", prettyApiError(e)); return null }
+}
+async function getServiceVariationVersion(id){
+  try{
+    const resp=await square.catalogApi.retrieveCatalogObject(id,true)
+    return resp?.result?.object?.version
+  }catch(e){ console.error("getServiceVariationVersion:", prettyApiError(e)); return undefined }
+}
+function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){
+  const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`
+  return createHash("sha256").update(raw).digest("hex").slice(0,48)
+}
+async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId}){
+  try{
+    const serviceVariationId=SERVICE_VARIATIONS[serviceKey]
+    if(!serviceVariationId){ console.error("createSquareBooking: falta serviceVariationId"); return null }
+    if(!teamMemberId){ console.error("createSquareBooking: falta teamMemberId"); return null }
+    if(!locationId){ console.error("createSquareBooking: falta locationId"); return null }
+
+    const version=await getServiceVariationVersion(serviceVariationId)
+    if(!version){ console.error("createSquareBooking: no pude obtener serviceVariationVersion"); return null }
+
+    const startISO=startEU.tz("UTC").toISOString()
+    const body={
+      idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),
+      booking:{
+        locationId,
+        startAt:startISO,
+        customerId,
+        // Si quieres mostrar una nota en Square:
+        // customerNote: "Reserva creada por WhatsApp Bot",
+        appointmentSegments:[{
+          teamMemberId,
+          serviceVariationId,
+          serviceVariationVersion:Number(version),
+          durationMinutes:SERVICES[serviceKey] // seller-level: RW
+        }]
+      }
+    }
+    const resp=await square.bookingsApi.createBooking(body)
+    return resp?.result?.booking||null
+  }catch(e){
+    console.error("createSquareBooking:", prettyApiError(e))
+    return null
+  }
+}
+async function cancelSquareBooking(bookingId){
+  try{
+    const r=await square.bookingsApi.cancelBooking(bookingId)
+    return !!r?.result?.booking?.id
+  }catch(e){ console.error("cancelSquareBooking:", prettyApiError(e)); return false }
+}
+async function updateSquareBooking(bookingId,{startEU,serviceKey,customerId,teamMemberId}){
+  try{
+    const get=await square.bookingsApi.retrieveBooking(bookingId)
+    const booking=get?.result?.booking
+    if(!booking) return null
+    const serviceVariationId=SERVICE_VARIATIONS[serviceKey]
+    const version=await getServiceVariationVersion(serviceVariationId)
+    const startISO=startEU.tz("UTC").toISOString()
+    const body={
+      idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),
+      booking:{
+        id:bookingId, version:booking.version,
+        locationId, customerId, startAt:startISO,
+        appointmentSegments:[{
+          teamMemberId, serviceVariationId,
+          serviceVariationVersion:Number(version),
+          durationMinutes:SERVICES[serviceKey]
+        }]
+      }
+    }
+    const resp=await square.bookingsApi.updateBooking(bookingId, body)
+    return resp?.result?.booking||null
+  }catch(e){ console.error("updateSquareBooking:", prettyApiError(e)); return null }
+}
 
 // ===== DB & sesiones
 const db=new Database("gapink.db");db.pragma("journal_mode = WAL")
@@ -170,13 +308,13 @@ function saveSession(phone,data){
   upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
 }
 
-// ===== Disponibilidad
+// ===== Disponibilidad (usa solo DB local; Square puede rechazar por solape si hay citas externas)
 function getBookedIntervals(fromIso,toIso){
   const rows=db.prepare(`SELECT start_iso,end_iso,staff_id FROM appointments WHERE status IN ('pending','confirmed') AND start_iso < @to AND end_iso > @from`).all({from:fromIso,to:toIso})
   return rows.map(r=>({start:dayjs(r.start_iso),end:dayjs(r.end_iso),staff_id:r.staff_id}))
 }
 function findFreeStaff(intervals,start,end,preferred){
-  const base=TEAM_MEMBER_IDS.length?TEAM_MEMBER_IDS:["any"]
+  const base=TEAM_MEMBER_IDS.length?TEAM_MEMBER_IDS:["__MISSING__"]
   const ids = preferred && base.includes(preferred) ? [preferred, ...base.filter(x=>x!==preferred)] : base
   for(const id of ids){
     const busy = intervals.filter(i=>i.staff_id===id).some(i => (start<i.end) && (i.start<end))
@@ -212,12 +350,16 @@ function suggestOrExact(startEU,durationMin,preferredStaffId=null){
 const app=express()
 const PORT=process.env.PORT||8080
 let lastQR=null,conectado=false
-app.get("/",(_req,res)=>{res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c} .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}</style><div class="card"><h1>Gapink Nails</h1><p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}<p><small>Desarrollado por Gonzalo</small></p></div>`)})
+app.get("/",(_req,res)=>{res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c} .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}</style><div class="card"><h1>Gapink Nails</h1><p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}<p><small>Desarrollado por Gonzalo</small></p><p style="font-size:12px;color:#6b7280">Recuerda: para SMS/emails al cliente, activa Appointments → Settings → Communications.</p></div>`)})
 app.get("/qr.png",async(_req,res)=>{if(!lastQR)return res.status(404).send("No hay QR");const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1});res.set("Content-Type","image/png").send(png)})
 
 // ===== Cola envío Baileys
 const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
-app.listen(PORT,async()=>{console.log(`🌐 Web en puerto ${PORT}`);await squareCheckCredentials();startBot().catch(console.error)})
+app.listen(PORT,async()=>{
+  console.log(`🌐 Web en puerto ${PORT}`)
+  await squareCheckCredentials()
+  startBot().catch(console.error)
+})
 
 async function startBot(){
   console.log("🚀 Bot arrancando…")
@@ -368,9 +510,9 @@ Mensaje del cliente: "${textRaw}"`
           : "¿Qué día y a qué hora te viene bien?"
         saveSession(phone,data)
         await __SAFE_SEND__(from,{ text: say })
-      }catch(e){ console.error("messages.upsert error:",e) }
+      }catch(e){ console.error("messages.upsert error:", e?.message||e) }
     })
-  }catch(e){ console.error("startBot error:",e) }
+  }catch(e){ console.error("startBot error:", e?.message||e) }
 }
 
 // ===== Alta (silenciosa ante errores)
@@ -389,7 +531,15 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
     if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
 
-    const teamMemberId = data.selectedStaffId || TEAM_MEMBER_IDS[0] || "any"
+    // Asegurar team member válido:
+    let teamMemberId = data.selectedStaffId || TEAM_MEMBER_IDS[0]
+    if (!teamMemberId) {
+      const found = await discoverTeamMembers()
+      TEAM_MEMBER_IDS = found
+      teamMemberId = TEAM_MEMBER_IDS[0]
+    }
+    if (!teamMemberId) { console.error("No hay teamMemberId disponible"); data.bookingInFlight=false; saveSession(phone,data); return }
+
     const durationMin = SERVICES[data.service]
     const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
 
@@ -417,7 +567,7 @@ Servicio: ${data.service}
 Fecha: ${fmtES(startEU)}
 Duración: ${durationMin} min
 Pago en persona.` })
-  } catch (e) { console.error("finalizeBooking:", e) }
+  } catch (e) { console.error("finalizeBooking:", prettyApiError(e)) }
   finally { data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
 
@@ -434,7 +584,13 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
     if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
 
     const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(upc.duration_min,"minute")
-    const teamId   = data.selectedStaffId || upc.staff_id || TEAM_MEMBER_IDS[0] || "any"
+    let teamId   = data.selectedStaffId || upc.staff_id || TEAM_MEMBER_IDS[0]
+    if (!teamId) {
+      const found = await discoverTeamMembers()
+      TEAM_MEMBER_IDS = found
+      teamId = TEAM_MEMBER_IDS[0]
+    }
+    if (!teamId) { console.error("No hay teamMemberId para reprogramar"); data.bookingInFlight=false; saveSession(phone,data); return }
 
     let ok=false
     if (upc.square_booking_id) {
@@ -462,6 +618,6 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
 Servicio: ${upc.service}
 Nueva fecha: ${fmtES(startEU)}
 Duración: ${upc.duration_min} min` })
-  }catch(e){ console.error("finalizeReschedule:", e) }
+  }catch(e){ console.error("finalizeReschedule:", prettyApiError(e)) }
   finally{ data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
