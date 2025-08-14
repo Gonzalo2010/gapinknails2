@@ -1,12 +1,10 @@
 // index.js — Gapink Nails WhatsApp Bot
 // OpenAI gpt-4o-mini + extracción JSON + TZ Europe/Madrid
-// Sin mensajes de error al cliente: todos los errores se loguean y listo.
-// Confirmación fina (auto-reserva solo en exactos; sugeridos piden “¿confirmo?”)
-// FIX bucle: si hay propuesta previa y dice “sí/confirmo”, reservar directo SIN recalcular
-// Anti-dobles: idempotencia estable + lock pending + índice único (staff_id,start_iso)
-// Baileys: cola con reintentos/backoff para “Timed Out”
-// DISPONIBILIDAD: forward-first desde la hora pedida
-// Cancelar y editar (reschedule) en Square + SQLite
+// Silencioso ante errores (no enviar mensajes de error al cliente)
+// Confirmación SOLO si el mensaje actual contiene “sí/confirmo/ok/vale”
+// Anti-bucle de confirmación por sesión vieja
+// Persistencia de hora en ms (sin UTC shift) + validaciones
+// Disponibilidad forward-first + cancelar/editar reales en Square
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -30,7 +28,7 @@ const EURO_TZ = "Europe/Madrid"
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
 // ===== Negocio
-const WORK_DAYS = [1,2,3,4,5,6]          // L-S
+const WORK_DAYS = [1,2,3,4,5,6]          // L-S (domingo cerrado)
 const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
@@ -47,23 +45,13 @@ async function aiChat(messages, { temperature=0.4 } = {}) {
   try {
     const r = await fetch(OPENAI_API_URL, {
       method: "POST",
-      headers: {
-        "Content-Type":"application/json",
-        "Authorization":`Bearer ${OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages,
-        temperature
-      })
+      headers: { "Content-Type":"application/json", "Authorization":`Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature })
     })
     if (!r.ok) throw new Error(`OpenAI ${r.status}`)
     const j = await r.json()
     return (j?.choices?.[0]?.message?.content || "").trim()
-  } catch (e) {
-    console.error("OpenAI error:", e?.message || e)
-    return ""
-  }
+  } catch (e) { console.error("OpenAI error:", e?.message || e); return "" }
 }
 
 const SYS_TONE = `Eres el asistente de WhatsApp de Gapink Nails (España).
@@ -90,9 +78,7 @@ Devuelve SOLO un JSON válido (omite claves que no apliquen):
   try {
     const jsonStr = content.trim().replace(/^```(json)?/i,"").replace(/```$/,"")
     return JSON.parse(jsonStr)
-  } catch {
-    return { intent:"other", polite_reply:"" }
-  }
+  } catch { return { intent:"other", polite_reply:"" } }
 }
 async function aiSay(contextSummary) {
   return await aiChat([
@@ -110,7 +96,7 @@ const RESCH_RE = /\b(cambia|cambiar|modifica|mover|reprograma|reprogramar|edita|
 function normalizePhoneES(raw){const d=onlyDigits(raw);if(!d)return null;if(raw.startsWith("+")&&d.length>=8&&d.length<=15)return`+${d}`;if(d.startsWith("34")&&d.length===11)return`+${d}`;if(d.length===9)return`+34${d}`;if(d.startsWith("00"))return`+${d.slice(2)}`;return`+${d}`}
 function detectServiceFree(text=""){const low=rmDiacritics(text.toLowerCase());const map={"unas acrilicas":"uñas acrílicas","uñas acrilicas":"uñas acrílicas","uñas acrílicas":"uñas acrílicas"};for(const k of Object.keys(map))if(low.includes(rmDiacritics(k)))return map[k];for(const k of Object.keys(SERVICES))if(low.includes(rmDiacritics(k)))return k;return null}
 function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
-const fmtES=(d)=>{const t = (dayjs.isDayjs(d)? d : dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
+const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
 
 // Redondeo a slot (ceil)
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
@@ -127,29 +113,11 @@ function stableKey({locationId,serviceVariationId,startISO,customerId,teamMember
 async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId}){try{const serviceVariationId=SERVICE_VARIATIONS[serviceKey];if(!serviceVariationId||!teamMemberId||!locationId)return null;const version=await getServiceVariationVersion(serviceVariationId);if(!version)return null;const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}};const resp=await square.bookingsApi.createBooking(body);return resp?.result?.booking||null}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
 async function cancelSquareBooking(bookingId){try{const r=await square.bookingsApi.cancelBooking(bookingId);return !!r?.result?.booking?.id}catch(e){console.error("cancelSquareBooking:",e?.message||e);return false}}
 async function updateSquareBooking(bookingId,{startEU,serviceKey,customerId,teamMemberId}){try{
-  const get=await square.bookingsApi.retrieveBooking(bookingId)
-  const booking=get?.result?.booking
-  if(!booking) return null
-  const serviceVariationId=SERVICE_VARIATIONS[serviceKey]
-  const version=await getServiceVariationVersion(serviceVariationId)
+  const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking;if(!booking)return null
+  const serviceVariationId=SERVICE_VARIATIONS[serviceKey];const version=await getServiceVariationVersion(serviceVariationId)
   const startISO=startEU.tz("UTC").toISOString()
-  const body={ idempotencyKey: stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),
-    booking: {
-      id: bookingId,
-      version: booking.version,
-      locationId,
-      customerId,
-      startAt: startISO,
-      appointmentSegments: [{
-        teamMemberId,
-        serviceVariationId,
-        serviceVariationVersion:Number(version),
-        durationMinutes: SERVICES[serviceKey]
-      }]
-    }
-  }
-  const resp=await square.bookingsApi.updateBooking(bookingId, body)
-  return resp?.result?.booking||null
+  const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}}
+  const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null
 }catch(e){console.error("updateSquareBooking:",e?.message||e);return null}}
 
 // ===== DB & sesiones
@@ -165,7 +133,7 @@ CREATE TABLE IF NOT EXISTS appointments (
   start_iso TEXT,
   end_iso TEXT,
   staff_id TEXT,
-  status TEXT,            -- pending|confirmed|cancelled
+  status TEXT,
   created_at TEXT,
   square_booking_id TEXT
 );
@@ -194,17 +162,13 @@ const getUpcomingByPhone=db.prepare(`SELECT * FROM appointments WHERE customer_p
 
 // Persistimos MILLISECONDS locales para evitar desplazamientos TZ
 function loadSession(phone){
-  const row=getSessionRow.get({phone})
-  if(!row?.data_json) return null
-  const raw=JSON.parse(row.data_json)
-  const data={...raw}
+  const row=getSessionRow.get({phone}); if(!row?.data_json) return null
+  const raw=JSON.parse(row.data_json); const data={...raw}
   if (raw.startEU_ms) data.startEU = dayjs.tz(raw.startEU_ms, EURO_TZ)
   return data
 }
 function saveSession(phone,data){
-  const s={...data}
-  s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null
-  delete s.startEU
+  const s={...data}; s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null; delete s.startEU
   upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
 }
 
@@ -222,45 +186,28 @@ function findFreeStaff(intervals,start,end,preferred){
   }
   return null
 }
+function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 function suggestOrExact(startEU,durationMin,preferredStaffId=null){
   const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
-  const from=now.tz("UTC").toISOString()
-  const to=now.add(14,"day").tz("UTC").toISOString()
+  const from=now.tz("UTC").toISOString(), to=now.add(14,"day").tz("UTC").toISOString()
   const intervals=getBookedIntervals(from,to)
-
-  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
-  const dayEnd  =startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
-
-  let req = startEU.clone()
-  if (req.isBefore(dayStart)) req = dayStart
-  if (req.isAfter(dayEnd))    req = dayEnd
-
-  const dow=req.day()===0?7:req.day()
-  const endEU=req.clone().add(durationMin,"minute")
+  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0), dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
+  let req=startEU.clone(); if(req.isBefore(dayStart)) req=dayStart; if(req.isAfter(dayEnd)) req=dayEnd
+  const dow=req.day()===0?7:req.day(); const endEU=req.clone().add(durationMin,"minute")
   const insideHours=req.hour()>=OPEN_HOUR && (endEU.hour()<CLOSE_HOUR || (endEU.hour()===CLOSE_HOUR && endEU.minute()===0))
-  if (dow===7 || !WORK_DAYS.includes(dow) || !insideHours) return { exact:null, suggestion:null, staffId:null }
-
+  if (dow===7||!WORK_DAYS.includes(dow)||!insideHours) return { exact:null, suggestion:null, staffId:null }
   const scanStart = ceilToSlotEU(req.isBefore(now)? now.clone(): req.clone())
-  // exact
   const exactId = findFreeStaff(intervals, scanStart.tz("UTC"), scanStart.clone().add(durationMin,"minute").tz("UTC"), preferredStaffId)
   if (exactId && scanStart.valueOf()===startEU.valueOf()) return { exact: scanStart, suggestion:null, staffId: exactId }
-
-  // hacia delante
-  for (let t = scanStart.clone(); !t.isAfter(dayEnd); t = t.add(SLOT_MIN,"minute")) {
-    const e = t.clone().add(durationMin,"minute")
-    if (t.isBefore(now)) continue
+  for (let t=scanStart.clone(); !t.isAfter(dayEnd); t=t.add(SLOT_MIN,"minute")) {
+    const e=t.clone().add(durationMin,"minute"); if(t.isBefore(now)) continue
     if (t.isAfter(dayEnd) || e.isAfter(dayEnd)) break
-    const id = findFreeStaff(intervals, t.tz("UTC"), e.tz("UTC"), preferredStaffId)
-    if (id) return { exact:null, suggestion:t, staffId:id }
+    const id=findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"),preferredStaffId); if(id) return { exact:null, suggestion:t, staffId:id }
   }
-
-  // hacia atrás (solo si no hay más tarde)
-  for (let t = ceilToSlotEU(startEU.clone()).subtract(SLOT_MIN,"minute"); !t.isBefore(dayStart); t = t.subtract(SLOT_MIN,"minute")) {
-    const e = t.clone().add(durationMin,"minute")
-    const id = findFreeStaff(intervals, t.tz("UTC"), e.tz("UTC"), preferredStaffId)
-    if (id) return { exact:null, suggestion:t, staffId:id }
+  for (let t=ceilToSlotEU(startEU.clone()).subtract(SLOT_MIN,"minute"); !t.isBefore(dayStart); t=t.subtract(SLOT_MIN,"minute")) {
+    const e=t.clone().add(durationMin,"minute"); const id=findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"),preferredStaffId)
+    if(id) return { exact:null, suggestion:t, staffId:id }
   }
-
   return { exact:null, suggestion:null, staffId:null }
 }
 
@@ -312,7 +259,7 @@ async function startBot(){
           editBookingId:null
         }
 
-        // IA: extracción
+        // IA: extracción (solo para servicio/fecha/nombre/email; confirmación NO se fía de la IA)
         const extra=await extractFromText(textRaw)
         const incomingService = extra.service || detectServiceFree(textRaw)
         const incomingDt = extra.datetime_text || null
@@ -320,17 +267,11 @@ async function startBot(){
         // Cancelación explícita
         if (extra.intent==="cancel" || /\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
-          if (!upc) {
-            await __SAFE_SEND__(from,{ text:"No veo ninguna cita futura tuya. Si quieres, dime fecha y hora y te doy hueco." })
-          } else {
+          if (upc) {
             const ok = upc.square_booking_id ? await cancelSquareBooking(upc.square_booking_id) : true
-            if (ok) {
-              markCancelled.run({ id: upc.id })
-              clearSession.run({ phone })
-              await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` })
-            } else {
-              // silencioso: no enviamos mensaje de error
-            }
+            if (ok) { markCancelled.run({ id: upc.id }); clearSession.run({ phone }); await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` }) }
+          } else {
+            await __SAFE_SEND__(from,{ text:"No veo ninguna cita futura tuya. Si quieres, dime fecha y hora y te doy hueco." })
           }
           return
         }
@@ -338,19 +279,12 @@ async function startBot(){
         // ¿Pide reprogramar?
         if (extra.intent==="reschedule" || RESCH_RE.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
-          if (upc) {
-            data.editBookingId = upc.id
-            data.service = upc.service
-            data.durationMin = upc.duration_min
-            data.selectedStaffId = upc.staff_id
-          }
+          if (upc) { data.editBookingId = upc.id; data.service = upc.service; data.durationMin = upc.duration_min; data.selectedStaffId = upc.staff_id }
         }
 
         // Reset confirm si cambió servicio/fecha
         if ((incomingService && incomingService !== data.lastService) || (incomingDt && incomingDt !== data.lastUserDtText)) {
-          data.confirmApproved = false
-          data.confirmAsked = false
-          // mantener editBookingId si venimos de reschedule
+          data.confirmApproved = false; data.confirmAsked = false
         }
         if (!data.service) data.service = incomingService || data.service
         data.lastService = data.service || data.lastService
@@ -358,19 +292,22 @@ async function startBot(){
         if (!data.name && extra.name) data.name = extra.name
         if (!data.email && extra.email) data.email = extra.email
 
-        if (YES_RE.test(textRaw) || extra.confirm==="yes") data.confirmApproved = true
-        if (NO_RE.test(textRaw)  || extra.confirm==="no") { data.confirmApproved=false; data.confirmAsked=false }
+        // Confirmación basada SOLO en el mensaje actual
+        const userSaysYes = YES_RE.test(textRaw)
+        const userSaysNo  = NO_RE.test(textRaw)
+        if (userSaysYes) data.confirmApproved = true
+        if (userSaysNo)  { data.confirmApproved=false; data.confirmAsked=false }
 
-        const whenText = extra.datetime_text || textRaw
-        if (whenText) data.lastUserDtText = extra.datetime_text || data.lastUserDtText
-        const parsed = parseDateTimeES(whenText)
+        // Fecha/hora
+        if (extra.datetime_text) data.lastUserDtText = extra.datetime_text
+        const parsed = parseDateTimeES(extra.datetime_text ? extra.datetime_text : textRaw)
         if (parsed) data.startEU = parsed
 
         if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
         saveSession(phone, data)
 
-        // Si ya había propuesta y ahora dice "sí", cerramos/actualizamos
-        if (data.confirmAsked && data.confirmApproved && data.service && data.startEU && data.durationMin) {
+        // Cierre inmediato SOLO si el mensaje actual es afirmativo
+        if (data.confirmAsked && userSaysYes && data.service && data.startEU && data.durationMin) {
           if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
           else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
           return
@@ -381,9 +318,8 @@ async function startBot(){
           const preferred = data.editBookingId ? data.selectedStaffId : null
           const { exact, suggestion, staffId } = suggestOrExact(data.startEU, data.durationMin, preferred)
           if (exact) {
-            data.startEU = exact
-            data.selectedStaffId = staffId
-            if (data.confirmApproved) { saveSession(phone,data);
+            data.startEU = exact; data.selectedStaffId = staffId
+            if (userSaysYes) { saveSession(phone,data);
               if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
               else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
               return
@@ -393,11 +329,8 @@ async function startBot(){
             return
           }
           if (suggestion) {
-            data.startEU = suggestion
-            data.selectedStaffId = staffId
-            data.confirmAsked = true
-            data.confirmApproved = false
-            saveSession(phone, data)
+            data.startEU = suggestion; data.selectedStaffId = staffId
+            data.confirmAsked = true; data.confirmApproved = false; saveSession(phone, data)
             await __SAFE_SEND__(from,{ text:`No tengo ese hueco exacto. Te puedo ofrecer ${fmtES(data.startEU)}. ¿Te viene bien? Si es sí, responde “confirmo”.` })
             return
           }
@@ -407,18 +340,18 @@ async function startBot(){
         }
 
         // Falta nombre/email tras “sí” (solo altas)
-        if (data.confirmApproved && (!data.name || !data.email) && !data.editBookingId) {
+        if (userSaysYes && (!data.name || !data.email) && !data.editBookingId) {
           saveSession(phone, data)
           await __SAFE_SEND__(from,{ text:"Para cerrar, dime tu nombre y email (ej: “Ana Pérez, ana@correo.com”)." })
           return
         }
-        if (data.confirmApproved && data.service && data.startEU) {
+        if (userSaysYes && data.service && data.startEU) {
           if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
           else if (data.name && data.email) await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
           return
         }
 
-        // Faltan datos → IA redacta (si OpenAI falla, usamos fallback neutro)
+        // Mensaje de avance (fallback silencioso si falla OpenAI)
         const missing=[]
         if(!data.service) missing.push("servicio")
         if(!data.startEU) missing.push(data.editBookingId?"nueva fecha y hora":"día y hora")
@@ -433,17 +366,12 @@ Escribe un único mensaje corto y humano que avance la ${data.editBookingId?"mod
 Si faltan datos (${missing.join(", ")}), pídelo con ejemplo.
 Mensaje del cliente: "${textRaw}"`
         let say=await aiSay(prompt)
-        if (!say) {
-          // Fallback sin IA ni errores
-          if (missing.length) {
-            say = `Necesito ${missing.join(", ")}. Ejemplo: "uñas acrílicas, martes 15 a las 11:00, Ana Pérez, ana@correo.com".`
-          } else {
-            say = "¿Te viene bien alguna fecha y hora en concreto?"
-          }
-        }
+        if (!say) say = missing.length
+          ? `Necesito ${missing.join(", ")}. Ejemplo: "uñas acrílicas, martes 15 a las 11:00, Ana Pérez, ana@correo.com".`
+          : "¿Qué día y hora te viene bien?"
         saveSession(phone,data)
         await __SAFE_SEND__(from,{ text: say })
-      }catch(e){ console.error("messages.upsert error:",e) /* silencio hacia cliente */ }
+      }catch(e){ console.error("messages.upsert error:",e) }
     })
   }catch(e){ console.error("startBot error:",e) }
 }
@@ -452,8 +380,7 @@ Mensaje del cliente: "${textRaw}"`
 async function finalizeBooking({ from, phone, data, safeSend }) {
   try {
     if (data.bookingInFlight) return
-    data.bookingInFlight = true
-    saveSession(phone, data)
+    data.bookingInFlight = true; saveSession(phone, data)
 
     let customer = await squareFindCustomerByPhone(phone)
     if (!customer) {
@@ -462,9 +389,12 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     }
     if (!customer) { data.bookingInFlight=false; saveSession(phone,data); return }
 
+    const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
+    if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return } // <- evita RangeError
     const teamMemberId = data.selectedStaffId || TEAM_MEMBER_IDS[0] || "any"
     const durationMin = SERVICES[data.service]
-    const startUTC = dayjs.tz(data.startEU_ms, EURO_TZ).tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
+    const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
+
     const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
     try {
       insertAppt.run({
@@ -474,72 +404,48 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
         staff_id: teamMemberId, status: "pending", created_at: new Date().toISOString(), square_booking_id: null
       })
     } catch (e) {
-      if (String(e?.message||"").includes("UNIQUE")) {
-        // hueco ya ocupado: silencio para cliente
-        data.bookingInFlight=false; saveSession(phone,data); return
-      }
+      if (String(e?.message||"").includes("UNIQUE")) { data.bookingInFlight=false; saveSession(phone,data); return }
       throw e
     }
 
-    const sq = await createSquareBooking({ startEU: dayjs.tz(data.startEU_ms, EURO_TZ), serviceKey: data.service, customerId: customer.id, teamMemberId })
-    if (!sq) {
-      deleteAppt.run({ id: aptId })
-      data.bookingInFlight=false; saveSession(phone,data); return
-    }
+    const sq = await createSquareBooking({ startEU, serviceKey: data.service, customerId: customer.id, teamMemberId })
+    if (!sq) { deleteAppt.run({ id: aptId }); data.bookingInFlight=false; saveSession(phone,data); return }
 
     updateAppt.run({ id: aptId, status: "confirmed", square_booking_id: sq.id || null })
     clearSession.run({ phone })
     await safeSend(from,{ text:
 `Reserva confirmada.
 Servicio: ${data.service}
-Fecha: ${fmtES(dayjs.tz(data.startEU_ms, EURO_TZ))}
+Fecha: ${fmtES(startEU)}
 Duración: ${durationMin} min
 Pago en persona.` })
-  } catch (e) {
-    console.error("finalizeBooking:", e)
-  } finally {
-    data.bookingInFlight = false
-    try{ saveSession(phone, data) }catch{}
-  }
+  } catch (e) { console.error("finalizeBooking:", e) }
+  finally { data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
 
 // ===== Edición (silenciosa ante errores)
 async function finalizeReschedule({ from, phone, data, safeSend }) {
   try{
     if (data.bookingInFlight) return
-    data.bookingInFlight = true
-    saveSession(phone, data)
+    data.bookingInFlight = true; saveSession(phone, data)
 
     const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
-    if (!upc || upc.id !== data.editBookingId) {
-      data.bookingInFlight=false; saveSession(phone,data)
-      // silencio
-      return
-    }
+    if (!upc || upc.id !== data.editBookingId) { data.bookingInFlight=false; saveSession(phone,data); return }
 
-    const startUTC = dayjs.tz(data.startEU_ms, EURO_TZ).tz("UTC")
-    const endUTC   = startUTC.clone().add(upc.duration_min,"minute")
+    const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
+    if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
+
+    const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(upc.duration_min,"minute")
     const teamId   = data.selectedStaffId || upc.staff_id || TEAM_MEMBER_IDS[0] || "any"
 
     let ok=false
     if (upc.square_booking_id) {
-      const sq = await updateSquareBooking(upc.square_booking_id, {
-        startEU: dayjs.tz(data.startEU_ms, EURO_TZ),
-        serviceKey: upc.service,
-        customerId: upc.customer_square_id,
-        teamMemberId: teamId
-      })
+      const sq = await updateSquareBooking(upc.square_booking_id, { startEU, serviceKey: upc.service, customerId: upc.customer_square_id, teamMemberId: teamId })
       if (sq) ok=true
     }
-
     if (!ok) {
       if (upc.square_booking_id) await cancelSquareBooking(upc.square_booking_id)
-      const sqNew = await createSquareBooking({
-        startEU: dayjs.tz(data.startEU_ms, EURO_TZ),
-        serviceKey: upc.service,
-        customerId: upc.customer_square_id,
-        teamMemberId: teamId
-      })
+      const sqNew = await createSquareBooking({ startEU, serviceKey: upc.service, customerId: upc.customer_square_id, teamMemberId: teamId })
       if (!sqNew) { data.bookingInFlight=false; saveSession(phone,data); return }
       markCancelled.run({ id: upc.id })
       const newId=`apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
@@ -556,12 +462,8 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
     await safeSend(from,{ text:
 `Cita actualizada.
 Servicio: ${upc.service}
-Nueva fecha: ${fmtES(dayjs.tz(data.startEU_ms, EURO_TZ))}
+Nueva fecha: ${fmtES(startEU)}
 Duración: ${upc.duration_min} min` })
-  }catch(e){
-    console.error("finalizeReschedule:", e)
-  }finally{
-    data.bookingInFlight=false
-    try{ saveSession(phone, data) }catch{}
-  }
+  }catch(e){ console.error("finalizeReschedule:", e) }
+  finally{ data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
