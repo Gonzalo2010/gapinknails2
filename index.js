@@ -247,11 +247,11 @@ async function loadServicesFromSquare() {
   try {
     console.log("🔄 Cargando servicios desde Square...")
     
-    // Obtener todos los objetos del catálogo
+    // Obtener variaciones del catálogo
     const catalogResp = await square.catalogApi.listCatalog(undefined, "ITEM_VARIATION")
     const variations = catalogResp?.result?.objects || []
     
-    // Filtrar solo las variaciones de servicio que están en nuestros team member IDs
+    // Filtrar las que tengan serviceVariationData (servicios reservables)
     const serviceVariations = variations.filter(obj => 
       obj.type === "ITEM_VARIATION" &&
       obj.itemVariationData?.itemId &&
@@ -268,20 +268,20 @@ async function loadServicesFromSquare() {
     for (const variation of serviceVariations) {
       const name = variation.itemVariationData?.name || "Servicio sin nombre"
       const serviceData = variation.itemVariationData?.serviceVariationData
-      const durationMs = serviceData?.durationMinutes || 60
+      const durationMin = Number(serviceData?.durationMinutes || 60)
       
       // Solo incluir servicios que tienen team members asignados
       const teamMemberIds = serviceData?.teamMemberIds || []
       const hasValidTeamMember = teamMemberIds.some(id => TEAM_MEMBER_IDS.includes(id)) || TEAM_MEMBER_IDS.length === 0
       
       if (hasValidTeamMember) {
-        SERVICES[name] = durationMs
+        SERVICES[name] = durationMin
         SERVICE_VARIATIONS[name] = variation.id
         
         // Generar palabras clave para cada servicio
         SERVICE_KEYWORDS[name] = generateServiceKeywords(name)
         
-        console.log(`✅ Servicio cargado: ${name} (${durationMs}min) - ID: ${variation.id}`)
+        console.log(`✅ Servicio cargado: ${name} (${durationMin}min) - ID: ${variation.id}`)
       } else {
         console.log(`⏭️ Servicio omitido (sin team members válidos): ${name}`)
       }
@@ -311,33 +311,24 @@ function generateServiceKeywords(serviceName) {
   const keywords = [serviceName]
   const words = serviceName.toLowerCase().split(/[\s\-_]+/)
   
-  // Añadir cada palabra individual
   keywords.push(...words)
   
-  // Añadir combinaciones específicas según el tipo de servicio
   const lowerName = serviceName.toLowerCase()
-  
   if (lowerName.includes("uñas") || lowerName.includes("nail")) {
     keywords.push("uñas", "nails", "manicura", "pedicura")
   }
-  
   if (lowerName.includes("acrílicas") || lowerName.includes("acrilicas")) {
     keywords.push("acrílicas", "acrilicas", "acrylic")
   }
-  
   if (lowerName.includes("gel")) {
     keywords.push("gel", "gelish")
   }
-  
   if (lowerName.includes("semipermanente")) {
     keywords.push("semipermanente", "semi")
   }
-  
   if (lowerName.includes("extensión") || lowerName.includes("extension")) {
     keywords.push("extensión", "extension", "alargamiento")
   }
-  
-  // Eliminar duplicados y elementos vacíos
   return [...new Set(keywords.filter(k => k && k.length > 2))]
 }
 
@@ -349,7 +340,6 @@ async function squareCheckCredentials() {
     if (loc?.timezone) LOCATION_TZ = loc.timezone
     console.log(`✅ Square listo. Location ${locationId}, TZ=${LOCATION_TZ}`)
     
-    // Cargar servicios después de verificar credenciales
     await loadServicesFromSquare()
     
   } catch(e) {
@@ -533,11 +523,9 @@ function staffHasFree(intervals, start, end, customerPhone = null) {
   const ids = TEAM_MEMBER_IDS.length ? TEAM_MEMBER_IDS : ["any"]
   
   for (const id of ids) {
-    // Verificar conflictos de staff
     const staffBusy = intervals.filter(i => i.staff_id === id)
       .some(i => (start < i.end) && (i.start < end))
     
-    // Verificar si el mismo cliente ya tiene cita en ese horario
     const customerBusy = customerPhone ? intervals
       .filter(i => i.customer_phone === customerPhone)
       .some(i => (start < i.end) && (i.start < end)) : false
@@ -560,7 +548,6 @@ function suggestOrExact(startEU, durationMin, customerPhone = null) {
   const insideHours = startEU.hour() >= OPEN_HOUR && 
     (endEU.hour() < CLOSE_HOUR || (endEU.hour() === CLOSE_HOUR && endEU.minute() === 0))
   
-  // Si es domingo, fuera de horario o en el pasado, buscar alternativa
   if (dow === 7 || !WORK_DAYS.includes(dow) || !insideHours || startEU.isBefore(now)) {
     const dayStart = startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
     const dayEnd = startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
@@ -576,12 +563,10 @@ function suggestOrExact(startEU, durationMin, customerPhone = null) {
     return {exact: null, suggestion: null}
   }
   
-  // Verificar si la hora exacta está libre
   if (staffHasFree(intervals, startEU.tz("UTC"), endEU.tz("UTC"), customerPhone)) {
     return {exact: startEU, suggestion: null}
   }
   
-  // Buscar alternativa en el mismo día
   const dayStart = startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
   const dayEnd = startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
   
