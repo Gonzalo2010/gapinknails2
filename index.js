@@ -1,9 +1,10 @@
-// index.js — Gapink Nails WhatsApp Bot
+// index.js — Gapink Nails WhatsApp Bot (100% Square, sin DB)
 // OpenAI gpt-4o-mini + extracción JSON + TZ Europe/Madrid
 // Silencioso ante errores (no enviar mensajes de error al cliente)
 // Confirmación SOLO si el mensaje ACTUAL contiene “sí/confirmo/ok/vale”
-// Persistencia de hora en ms (sin UTC shift) + validaciones
-// Disponibilidad forward-first + cancelar/editar reales en Square
+// Persistencia de hora en ms (sin UTC shift) + validaciones (en memoria)
+// Disponibilidad forward-first via Square SearchAvailability
+// Cancelar/editar reales en Square
 // Cancel/busca citas con teléfono flexible (solo dígitos) y/o fecha objetivo
 
 import express from "express"
@@ -14,7 +15,6 @@ import qrcodeTerminal from "qrcode-terminal"
 import "dotenv/config"
 import fs from "fs"
 import { webcrypto, createHash } from "crypto"
-import Database from "better-sqlite3"
 import dayjs from "dayjs"
 import utc from "dayjs/plugin/utc.js"
 import tz from "dayjs/plugin/timezone.js"
@@ -110,7 +110,25 @@ async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){try{co
 async function getServiceVariationVersion(id){try{const resp=await square.catalogApi.retrieveCatalogObject(id,true);return resp?.result?.object?.version}catch(e){console.error("getServiceVariationVersion:",e?.message||e);return undefined}}
 function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`;return createHash("sha256").update(raw).digest("hex").slice(0,48)}
 
-// Cancel con body { idempotencyKey, bookingVersion }
+// ——— Bookings helpers (100% Square)
+async function listUpcomingBookingsForCustomer(customerId,{fromISO,toISO}={}){
+  try{
+    const nowIso = fromISO || dayjs().utc().toISOString()
+    const params = { locationId, customerId, startAtMin: nowIso }
+    if (toISO) params.startAtMax = toISO
+    let out=[]
+    let cursor=null
+    do{
+      const resp = await square.bookingsApi.listBookings({ ...params, cursor })
+      out = out.concat(resp?.result?.bookings || [])
+      cursor = resp?.result?.cursor || null
+    }while(cursor)
+    // sólo futuros
+    return out.filter(b => b.startAt && dayjs(b.startAt).isAfter(dayjs()))
+              .sort((a,b)=> dayjs(a.startAt).valueOf() - dayjs(b.startAt).valueOf())
+  }catch(e){ console.error("listUpcomingBookingsForCustomer:", e?.message||e); return [] }
+}
+
 async function cancelSquareBooking(bookingId){
   try{
     const get = await square.bookingsApi.retrieveBooking(bookingId)
@@ -121,6 +139,7 @@ async function cancelSquareBooking(bookingId){
     return !!r?.result?.booking?.id
   }catch(e){ console.error("cancelSquareBooking:", e?.message||e); return false }
 }
+
 async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId}){try{
   const serviceVariationId=SERVICE_VARIATIONS[serviceKey]; if(!serviceVariationId||!teamMemberId||!locationId)return null
   const version=await getServiceVariationVersion(serviceVariationId); if(!version)return null
@@ -128,126 +147,116 @@ async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId})
   const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}}
   const resp=await square.bookingsApi.createBooking(body); return resp?.result?.booking||null
 }catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
-async function updateSquareBooking(bookingId,{startEU,serviceKey,customerId,teamMemberId}){try{
+
+async function updateSquareBooking(bookingId,{startEU,serviceVariationId,customerId,teamMemberId,durationMin}){try{
   const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking;if(!booking)return null
-  const serviceVariationId=SERVICE_VARIATIONS[serviceKey];const version=await getServiceVariationVersion(serviceVariationId)
+  const version=await getServiceVariationVersion(serviceVariationId); if(!version) return null
   const startISO=startEU.tz("UTC").toISOString()
-  const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}}
+  const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:durationMin}]}}
   const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null
 }catch(e){console.error("updateSquareBooking:",e?.message||e);return null}}
 
-// ===== DB & sesiones
-const db=new Database("gapink.db");db.pragma("journal_mode = WAL")
-db.exec(`
-CREATE TABLE IF NOT EXISTS appointments (
-  id TEXT PRIMARY KEY,
-  customer_name TEXT,
-  customer_phone TEXT,
-  customer_square_id TEXT,
-  service TEXT,
-  duration_min INTEGER,
-  start_iso TEXT,
-  end_iso TEXT,
-  staff_id TEXT,
-  status TEXT,            -- pending|confirmed|cancelled
-  created_at TEXT,
-  square_booking_id TEXT
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  phone TEXT PRIMARY KEY,
-  data_json TEXT,
-  updated_at TEXT
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_slot
-ON appointments(staff_id, start_iso)
-WHERE status IN ('pending','confirmed');
-`)
-const insertAppt=db.prepare(`INSERT INTO appointments
-(id, customer_name, customer_phone, customer_square_id, service, duration_min, start_iso, end_iso, staff_id, status, created_at, square_booking_id)
-VALUES (@id, @customer_name, @customer_phone, @customer_square_id, @service, @duration_min, @start_iso, @end_iso, @staff_id, @status, @created_at, @square_booking_id)`)
-const updateAppt=db.prepare(`UPDATE appointments SET status=@status, square_booking_id=@square_booking_id WHERE id=@id`)
-const updateApptTimes=db.prepare(`UPDATE appointments SET start_iso=@start_iso, end_iso=@end_iso, staff_id=@staff_id WHERE id=@id`)
-const markCancelled=db.prepare(`UPDATE appointments SET status='cancelled' WHERE id=@id`)
-const deleteAppt=db.prepare(`DELETE FROM appointments WHERE id=@id`)
-const getSessionRow=db.prepare(`SELECT * FROM sessions WHERE phone=@phone`)
-const upsertSession=db.prepare(`INSERT INTO sessions (phone, data_json, updated_at)
-VALUES (@phone, @data_json, @updated_at)
-ON CONFLICT(phone) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at`)
-const clearSession=db.prepare(`DELETE FROM sessions WHERE phone=@phone`)
-const listUpcomingStmt=db.prepare(`SELECT * FROM appointments WHERE status='confirmed' AND start_iso > @now ORDER BY start_iso ASC`)
+// ===== Memoria de sesión (en RAM, sin DB)
+const SESSIONS = new Map()
+function loadSession(phone){const s=SESSIONS.get(phone);if(!s)return null;const d={...s};if(s.startEU_ms) d.startEU=dayjs.tz(s.startEU_ms,EURO_TZ);return d}
+function saveSession(phone,data){const c={...data};c.startEU_ms=data.startEU?.valueOf?.() ?? data.startEU_ms ?? null;delete c.startEU;SESSIONS.set(phone,c)}
+function clearSession(phone){SESSIONS.delete(phone)}
 
-// Persistimos MILLISECONDS locales
-function loadSession(phone){
-  const row=getSessionRow.get({phone}); if(!row?.data_json) return null
-  const raw=JSON.parse(row.data_json); const data={...raw}
-  if (raw.startEU_ms) data.startEU = dayjs.tz(raw.startEU_ms, EURO_TZ)
-  return data
-}
-function saveSession(phone,data){
-  const s={...data}; s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null; delete s.startEU
-  upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
-}
-
-// ===== Finder flexible (tel y/o fecha objetivo)
-function findUpcomingForPhone(phone, targetEU=null){
+// ===== Buscar cita futura por teléfono (opcionalmente cerca de una fecha objetivo)
+async function findUpcomingForPhone(phone, targetEU=null){
   try{
-    const nowIso = dayjs().utc().toISOString()
-    const rows = listUpcomingStmt.all({ now: nowIso })
-    const d = onlyDigits(phone||"")
-    const last9 = d.slice(-9)
-    const cands = rows.filter(r=>{
-      const rd = onlyDigits(r.customer_phone||"")
-      return rd===d || rd.slice(-9)===last9 || last9===rd || rd.endsWith(last9)
-    })
-    if (!cands.length) return null
+    const cust = await squareFindCustomerByPhone(phone)
+    if (!cust) return null
+    const futures = await listUpcomingBookingsForCustomer(cust.id)
+    if (!futures.length) return null
     if (targetEU){
-      const dayStart = targetEU.clone().startOf("day").tz("UTC").toISOString()
-      const dayEnd   = targetEU.clone().endOf("day").tz("UTC").toISOString()
-      const sameDay = cands.filter(r => r.start_iso >= dayStart && r.start_iso <= dayEnd)
+      const sameDay = futures.filter(b=>{
+        const d=dayjs(b.startAt).tz(EURO_TZ)
+        return d.isSame(targetEU,"day")
+      })
       if (sameDay.length){
-        sameDay.sort((a,b)=>Math.abs(dayjs(a.start_iso).diff(targetEU)) - Math.abs(dayjs(b.start_iso).diff(targetEU)))
+        sameDay.sort((a,b)=> Math.abs(dayjs(a.startAt).diff(targetEU)) - Math.abs(dayjs(b.startAt).diff(targetEU)) )
         return sameDay[0]
       }
     }
-    return cands[0] // la más próxima
+    return futures[0]
   }catch(e){ console.error("findUpcomingForPhone:", e?.message||e); return null }
 }
 
-// ===== Disponibilidad
-function getBookedIntervals(fromIso,toIso){
-  const rows=db.prepare(`SELECT start_iso,end_iso,staff_id FROM appointments WHERE status IN ('pending','confirmed') AND start_iso < @to AND end_iso > @from`).all({from:fromIso,to:toIso})
-  return rows.map(r=>({start:dayjs(r.start_iso),end:dayjs(r.end_iso),staff_id:r.staff_id}))
+// ===== Disponibilidad (Square SearchAvailability, forward-first)
+function clampBusinessEU(req){
+  const dayStart=req.clone().hour(OPEN_HOUR).minute(0).second(0).millisecond(0)
+  const dayEnd=req.clone().hour(CLOSE_HOUR).minute(0).second(0).millisecond(0)
+  let t=req.clone()
+  if (t.isBefore(dayStart)) t=dayStart
+  if (t.isAfter(dayEnd)) t=dayEnd
+  return { t, dayStart, dayEnd }
 }
-function findFreeStaff(intervals,start,end,preferred){
-  const base=TEAM_MEMBER_IDS.length?TEAM_MEMBER_IDS:["any"]
-  const ids = preferred && base.includes(preferred) ? [preferred, ...base.filter(x=>x!==preferred)] : base
-  for(const id of ids){
-    const busy = intervals.filter(i=>i.staff_id===id).some(i => (start<i.end) && (i.start<end))
-    if(!busy) return id
+
+async function squareSearchAvail({startEU, serviceKey, preferredTeamId=null, forward=true}) {
+  const serviceVariationId = SERVICE_VARIATIONS[serviceKey]
+  if (!serviceVariationId || !locationId) return []
+  const { t, dayStart, dayEnd } = clampBusinessEU(startEU.clone())
+  const now = dayjs().tz(EURO_TZ).add(30,"minute")
+  const fromEU = ceilToSlotEU( t.isBefore(now) ? now : t )
+  const rangeStart = (forward ? fromEU : dayStart).tz("UTC").toISOString()
+  const rangeEnd   = (forward ? dayEnd : fromEU).tz("UTC").toISOString()
+  const teamFilter = preferredTeamId ? { all: [preferredTeamId] } :
+    (TEAM_MEMBER_IDS.length ? { all: TEAM_MEMBER_IDS } : undefined)
+  const query = {
+    query: {
+      filter: {
+        locationId,
+        startAtRange: { startAt: rangeStart, endAt: rangeEnd },
+        segmentFilters: [{
+          serviceVariationId,
+          teamMemberIdFilter: teamFilter
+        }]
+      }
+    }
   }
-  return null
+  try{
+    const r = await square.bookingsApi.searchAvailability(query)
+    const list = (r?.result?.availabilities || []).map(a=>{
+      const start = dayjs(a.startAt)
+      // primer segmento trae el team asignable
+      const seg = (a?.appointmentSegments||[])[0]
+      return { start, teamMemberId: seg?.teamMemberId || null }
+    })
+    // si buscamos atrás, ordenar descendente
+    return forward ? list.sort((a,b)=> a.start.valueOf()-b.start.valueOf())
+                   : list.sort((a,b)=> b.start.valueOf()-a.start.valueOf())
+  }catch(e){ console.error("searchAvailability:", e?.message||e); return [] }
 }
-function suggestOrExact(startEU,durationMin,preferredStaffId=null){
-  const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
-  const from=now.tz("UTC").toISOString(), to=now.add(14,"day").tz("UTC").toISOString()
-  const intervals=getBookedIntervals(from,to)
-  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0), dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
-  let req=startEU.clone(); if(req.isBefore(dayStart)) req=dayStart; if(req.isAfter(dayEnd)) req=dayEnd
-  const dow=req.day()===0?7:req.day(); const endEU=req.clone().add(durationMin,"minute")
-  const insideHours=req.hour()>=OPEN_HOUR && (endEU.hour()<CLOSE_HOUR || (endEU.hour()===CLOSE_HOUR && endEU.minute()===0))
-  if (dow===7||!WORK_DAYS.includes(dow)||!insideHours) return { exact:null, suggestion:null, staffId:null }
-  const scanStart = ceilToSlotEU(req.isBefore(now)? now.clone(): req.clone())
-  const exactId = findFreeStaff(intervals, scanStart.tz("UTC"), scanStart.clone().add(durationMin,"minute").tz("UTC"), preferredStaffId)
-  if (exactId && scanStart.valueOf()===startEU.valueOf()) return { exact: scanStart, suggestion:null, staffId: exactId }
-  for (let t=scanStart.clone(); !t.isAfter(dayEnd); t=t.add(SLOT_MIN,"minute")) {
-    const e=t.clone().add(durationMin,"minute"); if(t.isBefore(now)) continue
-    if (t.isAfter(dayEnd) || e.isAfter(dayEnd)) break
-    const id=findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"),preferredStaffId); if(id) return { exact:null, suggestion:t, staffId:id }
+
+async function suggestOrExactSquare(startEU, serviceKey, durationMin, preferredStaffId=null){
+  // día permitido + horario + domingo cerrado
+  const dow = startEU.day()===0?7:startEU.day()
+  if (dow===7 || !WORK_DAYS.includes(dow)) return { exact:null, suggestion:null, staffId:null }
+  const { t, dayStart, dayEnd } = clampBusinessEU(startEU)
+  const endEU = t.clone().add(durationMin,"minute")
+  const inside = t.hour()>=OPEN_HOUR && (endEU.hour()<CLOSE_HOUR || (endEU.hour()===CLOSE_HOUR && endEU.minute()===0))
+  if (!inside) return { exact:null, suggestion:null, staffId:null }
+
+  const want = ceilToSlotEU(t)
+  // forward-first
+  const forward = await squareSearchAvail({ startEU: want, serviceKey, preferredTeamId: preferredStaffId, forward: true })
+  const wantUTCiso = want.tz("UTC").toISOString()
+  const exact = forward.find(x => x.start.toISOString() === wantUTCiso)
+  if (exact) return { exact: want, suggestion: null, staffId: exact.teamMemberId || (preferredStaffId || TEAM_MEMBER_IDS[0] || "any") }
+
+  if (forward.length) {
+    const pick = forward[0]
+    return { exact:null, suggestion: pick.start.tz(EURO_TZ), staffId: pick.teamMemberId || (preferredStaffId || TEAM_MEMBER_IDS[0] || "any") }
   }
-  for (let t=ceilToSlotEU(startEU.clone()).subtract(SLOT_MIN,"minute"); !t.isBefore(dayStart); t=t.subtract(SLOT_MIN,"minute")) {
-    const e=t.clone().add(durationMin,"minute"); const id=findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"),preferredStaffId)
-    if(id) return { exact:null, suggestion:t, staffId:id }
+
+  // si no hay hacia delante, miramos hacia atrás el mismo día
+  const backward = await squareSearchAvail({ startEU: want, serviceKey, preferredTeamId: preferredStaffId, forward: false })
+  if (backward.length){
+    const pick = backward[0]
+    return { exact:null, suggestion: pick.start.tz(EURO_TZ), staffId: pick.teamMemberId || (preferredStaffId || TEAM_MEMBER_IDS[0] || "any") }
   }
+
   return { exact:null, suggestion:null, staffId:null }
 }
 
@@ -291,12 +300,12 @@ async function startBot(){
         const body=m.message.conversation||m.message.extendedTextMessage?.text||m.message?.imageMessage?.caption||""
         const textRaw=(body||"").trim()
 
-        // Sesión
+        // Sesión (en RAM)
         let data=loadSession(phone)||{
           service:null,startEU:null,durationMin:null,name:null,email:null,
           confirmApproved:false,confirmAsked:false,bookingInFlight:false,
           lastUserDtText:null,lastService:null, selectedStaffId:null,
-          editBookingId:null
+          editBookingId:null, editServiceVarId:null, editDurationMin:null, editCustomerId:null
         }
 
         // IA: extracción (confirmación NO se fía de la IA)
@@ -307,11 +316,10 @@ async function startBot(){
 
         // Cancelación explícita
         if (extra.intent==="cancel" || /\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
-          const upc = findUpcomingForPhone(phone, parsedInMessage || null)
+          const upc = await findUpcomingForPhone(phone, parsedInMessage || null)
           if (upc) {
-            const ok = upc.square_booking_id ? await cancelSquareBooking(upc.square_booking_id) : true
-            if (ok) { markCancelled.run({ id: upc.id }); clearSession.run({ phone }); await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` }) }
-            // si falla, silencioso (no enviamos error al cliente)
+            const ok = await cancelSquareBooking(upc.id)
+            if (ok) { clearSession(phone); await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.startAt))}.` }) }
           } else {
             await __SAFE_SEND__(from,{ text:"No veo ninguna cita futura tuya. Si quieres, dime fecha y hora y te doy hueco." })
           }
@@ -320,8 +328,17 @@ async function startBot(){
 
         // ¿Pide reprogramar?
         if (extra.intent==="reschedule" || RESCH_RE.test(textRaw)) {
-          const upc = findUpcomingForPhone(phone, parsedInMessage || null)
-          if (upc) { data.editBookingId = upc.id; data.service = upc.service; data.durationMin = upc.duration_min; data.selectedStaffId = upc.staff_id }
+          const upc = await findUpcomingForPhone(phone, parsedInMessage || null)
+          if (upc) {
+            const seg = (upc.appointmentSegments||[])[0] || {}
+            data.editBookingId = upc.id
+            data.service = incomingService || data.service || Object.keys(SERVICE_VARIATIONS).find(k=>SERVICE_VARIATIONS[k]===seg.serviceVariationId) || "uñas acrílicas"
+            data.durationMin = seg?.durationMinutes || SERVICES[data.service] || 60
+            data.selectedStaffId = seg?.teamMemberId || null
+            data.editServiceVarId = seg?.serviceVariationId || SERVICE_VARIATIONS[data.service]
+            data.editDurationMin = data.durationMin
+            data.editCustomerId = upc.customerId
+          }
         }
 
         // Reset confirm si cambió servicio/fecha
@@ -354,10 +371,10 @@ async function startBot(){
           return
         }
 
-        // DISPONIBILIDAD
+        // DISPONIBILIDAD (via Square)
         if (data.service && data.startEU && data.durationMin) {
           const preferred = data.editBookingId ? data.selectedStaffId : null
-          const { exact, suggestion, staffId } = suggestOrExact(data.startEU, data.durationMin, preferred)
+          const { exact, suggestion, staffId } = await suggestOrExactSquare(data.startEU, data.service, data.durationMin, preferred)
           if (exact) {
             data.startEU = exact; data.selectedStaffId = staffId
             if (userSaysYes) { saveSession(phone,data);
@@ -434,32 +451,16 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
 
     const teamMemberId = data.selectedStaffId || TEAM_MEMBER_IDS[0] || "any"
-    const durationMin = SERVICES[data.service]
-    const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
-
-    const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
-    try {
-      insertAppt.run({
-        id: aptId, customer_name: data.name || customer?.givenName || null, customer_phone: phone,
-        customer_square_id: customer.id, service: data.service, duration_min: durationMin,
-        start_iso: startUTC.toISOString(), end_iso: endUTC.toISOString(),
-        staff_id: teamMemberId, status: "pending", created_at: new Date().toISOString(), square_booking_id: null
-      })
-    } catch (e) {
-      if (String(e?.message||"").includes("UNIQUE")) { data.bookingInFlight=false; saveSession(phone,data); return }
-      throw e
-    }
 
     const sq = await createSquareBooking({ startEU, serviceKey: data.service, customerId: customer.id, teamMemberId })
-    if (!sq) { deleteAppt.run({ id: aptId }); data.bookingInFlight=false; saveSession(phone,data); return }
+    if (!sq) { data.bookingInFlight=false; saveSession(phone,data); return }
 
-    updateAppt.run({ id: aptId, status: "confirmed", square_booking_id: sq.id || null })
-    clearSession.run({ phone })
+    clearSession(phone)
     await safeSend(from,{ text:
 `Reserva confirmada.
 Servicio: ${data.service}
 Fecha: ${fmtES(startEU)}
-Duración: ${durationMin} min
+Duración: ${SERVICES[data.service]} min
 Pago en persona.` })
   } catch (e) { console.error("finalizeBooking:", e) }
   finally { data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
@@ -471,41 +472,29 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
     if (data.bookingInFlight) return
     data.bookingInFlight = true; saveSession(phone, data)
 
-    const upc = findUpcomingForPhone(phone, null)
+    const upc = await findUpcomingForPhone(phone, null)
     if (!upc || upc.id !== data.editBookingId) { data.bookingInFlight=false; saveSession(phone,data); return }
 
     const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
     if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
 
-    const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(upc.duration_min,"minute")
-    const teamId   = data.selectedStaffId || upc.staff_id || TEAM_MEMBER_IDS[0] || "any"
+    const seg = (upc.appointmentSegments||[])[0] || {}
+    const serviceVarId = data.editServiceVarId || seg.serviceVariationId || SERVICE_VARIATIONS[data.service]
+    const durationMin = data.editDurationMin || seg.durationMinutes || SERVICES[data.service] || 60
+    const teamId   = data.selectedStaffId || seg.teamMemberId || TEAM_MEMBER_IDS[0] || "any"
 
     let ok=false
-    if (upc.square_booking_id) {
-      const sq = await updateSquareBooking(upc.square_booking_id, { startEU, serviceKey: upc.service, customerId: upc.customer_square_id, teamMemberId: teamId })
-      if (sq) ok=true
-    }
-    if (!ok) {
-      if (upc.square_booking_id) await cancelSquareBooking(upc.square_booking_id)
-      const sqNew = await createSquareBooking({ startEU, serviceKey: upc.service, customerId: upc.customer_square_id, teamMemberId: teamId })
-      if (!sqNew) { data.bookingInFlight=false; saveSession(phone,data); return }
-      markCancelled.run({ id: upc.id })
-      const newId=`apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
-      insertAppt.run({
-        id:newId, customer_name: upc.customer_name, customer_phone: phone, customer_square_id: upc.customer_square_id,
-        service: upc.service, duration_min: upc.duration_min, start_iso: startUTC.toISOString(), end_iso: endUTC.toISOString(),
-        staff_id: teamId, status:"confirmed", created_at:new Date().toISOString(), square_booking_id: sqNew.id || null
-      })
-    } else {
-      updateApptTimes.run({ id: upc.id, start_iso: startUTC.toISOString(), end_iso: endUTC.toISOString(), staff_id: teamId })
-    }
+    const sq = await updateSquareBooking(upc.id, { startEU, serviceVariationId: serviceVarId, customerId: upc.customerId, teamMemberId: teamId, durationMin })
+    if (sq) ok=true
 
-    clearSession.run({ phone })
+    if (!ok) { data.bookingInFlight=false; saveSession(phone,data); return }
+
+    clearSession(phone)
     await safeSend(from,{ text:
 `Cita actualizada.
-Servicio: ${upc.service}
+Servicio: ${data.service}
 Nueva fecha: ${fmtES(startEU)}
-Duración: ${upc.duration_min} min` })
+Duración: ${durationMin} min` })
   }catch(e){ console.error("finalizeReschedule:", e) }
   finally{ data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
