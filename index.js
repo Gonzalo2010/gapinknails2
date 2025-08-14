@@ -4,7 +4,7 @@
 // Confirmación SOLO si el mensaje ACTUAL contiene “sí/confirmo/ok/vale”
 // Persistencia de hora en ms (sin UTC shift) + validaciones
 // Disponibilidad forward-first + cancelar/editar reales en Square
-// Finder híbrido: busca la cita en SQLite y, si no está, en Square por teléfono (y por fecha si la indicas)
+// Cancel/busca citas con teléfono flexible (solo dígitos) y/o fecha objetivo
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -97,7 +97,7 @@ function normalizePhoneES(raw){const d=onlyDigits(raw);if(!d)return null;if(raw.
 function detectServiceFree(text=""){const low=rmDiacritics(text.toLowerCase());const map={"unas acrilicas":"uñas acrílicas","uñas acrilicas":"uñas acrílicas","uñas acrílicas":"uñas acrílicas"};for(const k of Object.keys(map))if(low.includes(rmDiacritics(k)))return map[k];for(const k of Object.keys(SERVICES))if(low.includes(rmDiacritics(k)))return k;return null}
 function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
-// Redondeo a slot (ceil)
+// Redondeo a slot (ceil) — definición única
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
 // ===== Square
@@ -135,32 +135,6 @@ async function updateSquareBooking(bookingId,{startEU,serviceKey,customerId,team
   const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}}
   const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null
 }catch(e){console.error("updateSquareBooking:",e?.message||e);return null}}
-
-// Buscar en Square por customerId (rango ahora o día objetivo)
-async function squareFindUpcomingByPhone(phoneRaw, targetEU=null){
-  try{
-    const cust = await squareFindCustomerByPhone(phoneRaw)
-    if (!cust?.id) return null
-    const range = targetEU
-      ? { startAt: targetEU.clone().startOf("day").tz("UTC").toISOString(),
-          endAt:   targetEU.clone().endOf("day").tz("UTC").toISOString() }
-      : { startAt: dayjs().utc().toISOString() }
-    const body = {
-      limit: 50,
-      query: { filter: { locationId, customerIds: [cust.id], startAtRange: range } }
-    }
-    const r = await square.bookingsApi.searchBookings(body)
-    const arr = r?.result?.bookings || []
-    if (!arr.length) return null
-    if (!targetEU) {
-      arr.sort((a,b)=> new Date(a.startAt) - new Date(b.startAt))
-      return arr[0]
-    }
-    // el del día más cercano a targetEU
-    arr.sort((a,b)=> Math.abs(dayjs(a.startAt).diff(targetEU)) - Math.abs(dayjs(b.startAt).diff(targetEU)))
-    return arr[0]
-  }catch(e){ console.error("squareFindUpcomingByPhone:", e?.message||e); return null }
-}
 
 // ===== DB & sesiones
 const db=new Database("gapink.db");db.pragma("journal_mode = WAL")
@@ -214,8 +188,8 @@ function saveSession(phone,data){
   upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
 }
 
-// ===== Finder local (SQLite) y wrapper híbrido
-function findUpcomingLocal(phone, targetEU=null){
+// ===== Finder flexible (tel y/o fecha objetivo)
+function findUpcomingForPhone(phone, targetEU=null){
   try{
     const nowIso = dayjs().utc().toISOString()
     const rows = listUpcomingStmt.all({ now: nowIso })
@@ -223,7 +197,7 @@ function findUpcomingLocal(phone, targetEU=null){
     const last9 = d.slice(-9)
     const cands = rows.filter(r=>{
       const rd = onlyDigits(r.customer_phone||"")
-      return rd===d || rd.slice(-9)===last9 || rd.endsWith(last9)
+      return rd===d || rd.slice(-9)===last9 || last9===rd || rd.endsWith(last9)
     })
     if (!cands.length) return null
     if (targetEU){
@@ -235,15 +209,8 @@ function findUpcomingLocal(phone, targetEU=null){
         return sameDay[0]
       }
     }
-    return cands[0]
-  }catch(e){ console.error("findUpcomingLocal:", e?.message||e); return null }
-}
-async function findUpcomingAny(phone, targetEU=null){
-  const local = findUpcomingLocal(phone, targetEU)
-  if (local) return { source:"db", record: local }
-  const sq = await squareFindUpcomingByPhone(phone, targetEU)
-  if (!sq) return null
-  return { source:"square", record: sq }
+    return cands[0] // la más próxima
+  }catch(e){ console.error("findUpcomingForPhone:", e?.message||e); return null }
 }
 
 // ===== Disponibilidad
@@ -340,15 +307,11 @@ async function startBot(){
 
         // Cancelación explícita
         if (extra.intent==="cancel" || /\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
-          const hit = await findUpcomingAny(phone, parsedInMessage || null)
-          if (hit?.source==="db") {
-            const upc = hit.record
+          const upc = findUpcomingForPhone(phone, parsedInMessage || null)
+          if (upc) {
             const ok = upc.square_booking_id ? await cancelSquareBooking(upc.square_booking_id) : true
             if (ok) { markCancelled.run({ id: upc.id }); clearSession.run({ phone }); await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` }) }
-          } else if (hit?.source==="square") {
-            const b = hit.record
-            const ok = await cancelSquareBooking(b.id)
-            if (ok) { await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(b.startAt))}.` }) }
+            // si falla, silencioso (no enviamos error al cliente)
           } else {
             await __SAFE_SEND__(from,{ text:"No veo ninguna cita futura tuya. Si quieres, dime fecha y hora y te doy hueco." })
           }
@@ -357,17 +320,8 @@ async function startBot(){
 
         // ¿Pide reprogramar?
         if (extra.intent==="reschedule" || RESCH_RE.test(textRaw)) {
-          const hit = await findUpcomingAny(phone, parsedInMessage || null)
-          if (hit?.source==="db") {
-            const upc = hit.record
-            data.editBookingId = upc.id; data.service = upc.service; data.durationMin = upc.duration_min; data.selectedStaffId = upc.staff_id
-          } else if (hit?.source==="square") {
-            // almacenamos lo mínimo para poder actualizar vía Square (sin DB)
-            data.editBookingId = `SQ:${hit.record.id}`
-            data.service = "uñas acrílicas" // único servicio por ahora
-            data.durationMin = SERVICES["uñas acrílicas"]
-            data.selectedStaffId = TEAM_MEMBER_IDS[0] || "any"
-          }
+          const upc = findUpcomingForPhone(phone, parsedInMessage || null)
+          if (upc) { data.editBookingId = upc.id; data.service = upc.service; data.durationMin = upc.duration_min; data.selectedStaffId = upc.staff_id }
         }
 
         // Reset confirm si cambió servicio/fecha
@@ -395,21 +349,19 @@ async function startBot(){
 
         // Cierre inmediato SOLO si el mensaje actual es afirmativo
         if (data.confirmAsked && userSaysYes && data.service && data.startEU && data.durationMin) {
-          if (data.editBookingId?.startsWith?.("SQ:")) await finalizeRescheduleSquareOnly({ from, phone, data, safeSend: __SAFE_SEND__ })
-          else if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
+          if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
           else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
           return
         }
 
         // DISPONIBILIDAD
         if (data.service && data.startEU && data.durationMin) {
-          const preferred = data.editBookingId && !data.editBookingId.startsWith("SQ:") ? data.selectedStaffId : null
+          const preferred = data.editBookingId ? data.selectedStaffId : null
           const { exact, suggestion, staffId } = suggestOrExact(data.startEU, data.durationMin, preferred)
           if (exact) {
             data.startEU = exact; data.selectedStaffId = staffId
             if (userSaysYes) { saveSession(phone,data);
-              if (data.editBookingId?.startsWith?.("SQ:")) await finalizeRescheduleSquareOnly({ from, phone, data, safeSend: __SAFE_SEND__ })
-              else if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
+              if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
               else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
               return
             }
@@ -435,13 +387,12 @@ async function startBot(){
           return
         }
         if (userSaysYes && data.service && data.startEU) {
-          if (data.editBookingId?.startsWith?.("SQ:")) await finalizeRescheduleSquareOnly({ from, phone, data, safeSend: __SAFE_SEND__ })
-          else if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
+          if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
           else if (data.name && data.email) await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
           return
         }
 
-        // Mensaje de avance
+        // Mensaje de avance (fallback si falla OpenAI)
         const missing=[]
         if(!data.service) missing.push("servicio")
         if(!data.startEU) missing.push(data.editBookingId?"nueva fecha y hora":"día y hora")
@@ -514,14 +465,13 @@ Pago en persona.` })
   finally { data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
 
-// ===== Edición usando nuestra DB
+// ===== Edición (silenciosa ante errores)
 async function finalizeReschedule({ from, phone, data, safeSend }) {
   try{
     if (data.bookingInFlight) return
     data.bookingInFlight = true; saveSession(phone, data)
 
-    const upcHit = findUpcomingLocal(phone, null)
-    const upc = upcHit
+    const upc = findUpcomingForPhone(phone, null)
     if (!upc || upc.id !== data.editBookingId) { data.bookingInFlight=false; saveSession(phone,data); return }
 
     const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
@@ -557,38 +507,5 @@ Servicio: ${upc.service}
 Nueva fecha: ${fmtES(startEU)}
 Duración: ${upc.duration_min} min` })
   }catch(e){ console.error("finalizeReschedule:", e) }
-  finally{ data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
-}
-
-// ===== Edición cuando la cita SOLO existe en Square (no en nuestra DB)
-async function finalizeRescheduleSquareOnly({ from, phone, data, safeSend }) {
-  try{
-    if (data.bookingInFlight) return
-    data.bookingInFlight = true; saveSession(phone, data)
-
-    const squareId = data.editBookingId.replace("SQ:","")
-    const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
-    if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
-
-    const cust = await squareFindCustomerByPhone(phone)
-    const teamId = data.selectedStaffId || TEAM_MEMBER_IDS[0] || "any"
-
-    let ok=false
-    if (squareId) {
-      const sq = await updateSquareBooking(squareId, { startEU, serviceKey: data.service, customerId: cust?.id, teamMemberId: teamId })
-      if (sq) ok=true
-    }
-    if (!ok) {
-      if (squareId) await cancelSquareBooking(squareId)
-      if (!cust?.id) { data.bookingInFlight=false; saveSession(phone,data); return }
-      const sqNew = await createSquareBooking({ startEU, serviceKey: data.service, customerId: cust.id, teamMemberId: teamId })
-      if (!sqNew) { data.bookingInFlight=false; saveSession(phone,data); return }
-    }
-
-    clearSession.run({ phone })
-    await safeSend(from,{ text:
-`Cita actualizada.
-Nueva fecha: ${fmtES(startEU)}` })
-  }catch(e){ console.error("finalizeRescheduleSquareOnly:", e) }
   finally{ data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
