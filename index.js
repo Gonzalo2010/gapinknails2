@@ -1,9 +1,6 @@
-// index.js — Gapink Nails WhatsApp Bot (fix 429 + nombre “no” + disponibilidad sin staff)
-// OpenAI gpt-4o-mini + extracción JSON + TZ Europe/Madrid
-// Silencioso ante errores (no enviar mensajes de error al cliente)
-// Confirmación SOLO si el mensaje ACTUAL contiene “sí/confirmo/ok/vale”
-// Persistencia de hora en ms (sin UTC shift) + validaciones
-// Disponibilidad forward-first + cancelar/editar reales en Square
+// index.js — Gapink Nails WhatsApp Bot (fix separación nombre/fecha + 429 + email)
+// Silencioso ante errores (no mensajes raros al cliente).
+// Confirmación SOLO si el mensaje ACTUAL contiene “sí/confirmo/ok/vale”.
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -26,7 +23,7 @@ const EURO_TZ = "Europe/Madrid"
 
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
-// ===== Config negocio
+// ===== Negocio
 const WORK_DAYS = [1,2,3,4,5,6]          // L-S (domingo cerrado)
 const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
@@ -35,7 +32,7 @@ const SERVICES = { "uñas acrílicas": 90 }
 const SERVICE_VARIATIONS = {
   "uñas acrílicas": process.env.SQ_SV_UNAS_ACRILICAS || process.env.SQ_FORCE_SERVICE_ID || ""
 }
-let   TEAM_MEMBER_IDS = (process.env.SQ_TEAM_IDS || "").split(",").map(s=>s.trim()).filter(Boolean)
+let TEAM_MEMBER_IDS = (process.env.SQ_TEAM_IDS || "").split(",").map(s=>s.trim()).filter(Boolean)
 
 // ===== OpenAI (con backoff 429)
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY
@@ -43,7 +40,7 @@ const OPENAI_API_URL  = process.env.OPENAI_API_URL || "https://api.openai.com/v1
 const OPENAI_MODEL    = process.env.OPENAI_MODEL || "gpt-4o-mini"
 let AI_DISABLED_UNTIL = 0
 
-async function aiChat(messages, { temperature=0.4 } = {}) {
+async function aiChat(messages, { temperature=0.35 } = {}) {
   if (!OPENAI_API_KEY || Date.now() < AI_DISABLED_UNTIL) return ""
   try {
     const r = await fetch(OPENAI_API_URL, {
@@ -51,11 +48,7 @@ async function aiChat(messages, { temperature=0.4 } = {}) {
       headers: { "Content-Type":"application/json", "Authorization":`Bearer ${OPENAI_API_KEY}` },
       body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature })
     })
-    if (r.status === 429) {
-      console.error("OpenAI 429 — desactivando 5 min")
-      AI_DISABLED_UNTIL = Date.now() + 5*60*1000
-      return ""
-    }
+    if (r.status === 429) { console.error("OpenAI 429 — backoff 5min"); AI_DISABLED_UNTIL = Date.now() + 5*60*1000; return "" }
     if (!r.ok) throw new Error(`OpenAI ${r.status}`)
     const j = await r.json()
     return (j?.choices?.[0]?.message?.content || "").trim()
@@ -80,80 +73,116 @@ Devuelve SOLO un JSON válido (omite claves que no apliquen):
   "polite_reply": "respuesta breve y natural para avanzar"
 }`
   const content = await aiChat([
-    { role: "system", content: `${SYS_TONE}\n${schema}\nUsa español de España.` },
-    { role: "user", content: userText }
-  ], { temperature: 0.2 })
+    { role:"system", content:`${SYS_TONE}\n${schema}\nUsa español de España.` },
+    { role:"user", content:userText }
+  ], { temperature:0.2 })
   try {
-    const jsonStr = content.trim().replace(/^```(json)?/i,"").replace(/```$/,"")
+    const jsonStr = (content||"").trim().replace(/^```(json)?/i,"").replace(/```$/,"")
     return JSON.parse(jsonStr)
   } catch { return { intent:"other", polite_reply:"" } }
 }
-async function aiSay(contextSummary) {
-  const said = await aiChat([
-    { role:"system", content: SYS_TONE },
-    { role:"user", content: contextSummary }
-  ], { temperature: 0.35 })
-  return said || ""
-}
 
 // ===== Helpers
-const onlyDigits   = (s="") => (s||"").replace(/\D+/g,"")
+const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
 const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const EMAIL_RE     = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i
 const isValidEmail = (e) => !!(e && EMAIL_RE.test(String(e).trim()))
-// Tokens “limpios” (no pilla “no” en “nombre/noviembre”)
-function hasTokenAlternatives(text, groupPattern){
-  const re = new RegExp(`(?:^|[\\s,.;:!¡¿"'])(${groupPattern})(?:$|[\\s,.;:!¡¿"'])`,"i")
+const YES_TOKENS   = "si|sí|ok|vale|confirmo|confirmar|de acuerdo|perfecto"
+const NO_TOKENS    = "no|cancela|anula|no confirmo|otra|cambia|mejor mas tarde|mejor más tarde"
+function hasToken(text, group){
+  const re = new RegExp(`(?:^|[\\s,.;:!¡¿"'])(${group})(?:$|[\\s,.;:!¡¿"'])`,"i")
   return re.test(text)
-}
-const YES_TOKENS = "si|sí|ok|vale|confirmo|confirmar|de acuerdo|perfecto"
-const NO_TOKENS  = "no|cancela|anula|no confirmo|otra|cambia|mejor mas tarde|mejor más tarde"
-
-// Parser local de nombre/email en mensajes tipo:
-// “me llamo X”, “soy X”, “mi nombre es X”, “nombre X”, o “X, email@dominio.com”
-function parseNameEmailFree(textRaw="") {
-  const text = textRaw.trim()
-  let email = (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [null])[0]
-  let name = null
-
-  const patterns = [
-    /\bme\s+llamo\s+([a-záéíóúñü'\-]+(?:\s+[a-záéíóúñü'\-]+){0,3})/i,
-    /\bsoy\s+([a-záéíóúñü'\-]+(?:\s+[a-záéíóúñü'\-]+){0,3})/i,
-    /\bmi\s+nombre\s+es\s+([a-záéíóúñü'\-]+(?:\s+[a-záéíóúñü'\-]+){0,3})/i,
-    /\bnombre\s*[:\-]?\s*([a-záéíóúñü'\-]+(?:\s+[a-záéíóúñü'\-]+){0,3})/i
-  ]
-  for (const re of patterns) {
-    const m = text.match(re)
-    if (m && m[1]) { name = m[1].trim() ; break }
-  }
-  // Si no se ha dado un formato anterior, intenta coger lo que va antes del email “X, mail”
-  if (!name && email) {
-    const left = text.split(email)[0].trim().replace(/[,\s]+$/,"")
-    if (left && left.length >= 2) name = left
-  }
-
-  // Saneamos nombre (nunca “no/si/ok”, nunca con @, ni demasiado corto/largo)
-  if (name) {
-    const raw = name.replace(/["'.,;:()\[\]]/g,"").trim()
-    const low = rmDiacritics(raw.toLowerCase())
-    if (!raw || raw.length < 2 || raw.length > 60 || /@/.test(raw) ||
-        /^(si|sí|no|ok|vale|confirmo|confirmar)$/i.test(low)) name = null
-    else name = raw.replace(/\s+/g," ").replace(/\b\w/g, c=>c.toUpperCase())
-  }
-  if (email) email = email.toLowerCase()
-  return { name, email }
 }
 
 function normalizePhoneES(raw){const d=onlyDigits(raw);if(!d)return null;if(raw.startsWith("+")&&d.length>=8&&d.length<=15)return`+${d}`;if(d.startsWith("34")&&d.length===11)return`+${d}`;if(d.length===9)return`+34${d}`;if(d.startsWith("00"))return`+${d.slice(2)}`;return`+${d}`}
+
 function detectServiceFree(text=""){const low=rmDiacritics(text.toLowerCase());const map={"unas acrilicas":"uñas acrílicas","uñas acrilicas":"uñas acrílicas","uñas acrílicas":"uñas acrílicas"};for(const k of Object.keys(map))if(low.includes(rmDiacritics(k)))return map[k];for(const k of Object.keys(SERVICES))if(low.includes(rmDiacritics(k)))return k;return null}
-function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
+
+function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t)||/\bmañana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
+
+// ===== Nombre: extracción robusta (NO mete fechas/horas)
+const STOPWORDS = new Set([
+  "hoy","manana","mañana","pasado","ahora","tarde","noche","mediodia","mediodía",
+  "a","la","las","el","los","de","del","al","para","por","con","y","e",
+  "lunes","martes","miercoles","miércoles","jueves","viernes","sabado","sábado","domingo",
+  "enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","setiembre","octubre","noviembre","diciembre",
+  "ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"
+])
+function titleCaseWord(w){return w.replace(/^([a-záéíóúñü])/i,(c)=>c.toUpperCase())}
+function cleanNameCandidate(cand){
+  if(!cand) return null
+  let s = cand.replace(/[,"“”'()]+/g," ").replace(/\s+/g," ").trim()
+  s = s.replace(/\s+(y|e)\s*$/i,"")             // quita “... García y”
+  const parts = s.split(/\s+/).filter(w=>{
+    const x = rmDiacritics(w.toLowerCase())
+    if (STOPWORDS.has(x)) return false
+    if (/\d/.test(w)) return false              // quita 10, 10:00, etc
+    if (/^\d{1,2}(:|h)\d{0,2}$/i.test(x)) return false
+    if (/^(am|pm)$/i.test(x)) return false
+    return /^[a-záéíóúñü\-]+$/i.test(w)
+  }).slice(0,4) // 1–4 palabras
+  if (!parts.length) return null
+  return parts.map(titleCaseWord).join(" ")
+}
+// patrones explícitos
+const NAME_PATTERNS = [
+  /\bme\s+llamo\s+([^.,\n\r]+)/i,
+  /\bsoy\s+([^.,\n\r]+)/i,
+  /\bmi\s+nombre\s+es\s+([^.,\n\r]+)/i,
+  /\bnombre\s*[:\-]?\s*([^.,\n\r]+)/i
+]
+// fallback si mensaje = "Gonzalo García" y te lo pedimos
+function guessBareName(text, wantName){
+  if(!wantName) return null
+  if (hasToken(text, YES_TOKENS) || hasToken(text, NO_TOKENS)) return null
+  const t = rmDiacritics(text.toLowerCase())
+  if (/\b(hoy|mañana|manana|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b/.test(t)) return null
+  if (/\b(\d{1,2})(:|h)\d{0,2}\b/i.test(text)) return null
+  return cleanNameCandidate(text)
+}
+function extractNameEmailSmart(textRaw="", wantName=false){
+  const text = textRaw.trim()
+  // email fácil
+  const email = (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[null])[0]?.toLowerCase() || null
+  // 1) patrones explícitos
+  for (const re of NAME_PATTERNS){
+    const m = text.match(re)
+    if (m && m[1]) {
+      const n = cleanNameCandidate(m[1])
+      if (n) return { name:n, email }
+    }
+  }
+  // 2) nombre justo ANTES del email (tomamos las 2–4 últimas palabras válidas)
+  if (email){
+    const left = text.split(email)[0]
+    const toks = left.trim().split(/\s+/).slice(-4)
+    const n = cleanNameCandidate(toks.join(" "))
+    if (n) return { name:n, email }
+  }
+  // 3) fallback “bare name” si lo estamos pidiendo
+  const bare = guessBareName(text, wantName)
+  if (bare) return { name:bare, email }
+  return { name:null, email }
+}
+// separar nombre/apellidos para Square
+function splitPersonName(full=""){
+  const w = full.trim().split(/\s+/).filter(Boolean)
+  const conn = new Set(["y","e","de","del","la","las","los"])
+  const v = w.filter(x=>!conn.has(rmDiacritics(x.toLowerCase())))
+  if (v.length<=1) return { givenName:titleCaseWord(v[0]||""), familyName:undefined }
+  if (v.length===2) return { givenName:titleCaseWord(v[0]), familyName:titleCaseWord(v[1]) }
+  const family = v.slice(-2).map(titleCaseWord).join(" ")
+  const given  = v.slice(0,-2).map(titleCaseWord).join(" ")
+  return { givenName:given, familyName:family }
+}
 
 // ===== Square
 const square = new Client({ accessToken: process.env.SQUARE_ACCESS_TOKEN, environment: (process.env.SQUARE_ENV||"sandbox").toLowerCase()==="production"?Environment.Production:Environment.Sandbox })
 const locationId = process.env.SQUARE_LOCATION_ID
 let LOCATION_TZ = EURO_TZ
+
 function prettyApiError(e){
   if (e instanceof ApiError) {
     const code = e.statusCode
@@ -162,21 +191,20 @@ function prettyApiError(e){
   }
   return e?.message || String(e)
 }
+
 async function squareCheckCredentials(){
   try{
     const locs=await square.locationsApi.listLocations()
     const loc=(locs.result.locations||[]).find(l=>l.id===locationId)||(locs.result.locations||[])[0]
     if(loc?.timezone) LOCATION_TZ=loc.timezone
     console.log(`✅ Square listo. Location ${locationId||loc?.id}, TZ=${LOCATION_TZ}`)
-    // Servicio
     const sv = SERVICE_VARIATIONS["uñas acrílicas"]
     if(!sv){ console.error("⛔ Falta ID de servicio. Define SQ_SV_UNAS_ACRILICAS o SQ_FORCE_SERVICE_ID"); }
-    // Staff
     if (!TEAM_MEMBER_IDS.length) {
       const ids = await discoverTeamMembers()
       TEAM_MEMBER_IDS = ids
-      console.log(`👥 TEAM_MEMBER_IDS autodescubiertos: ${TEAM_MEMBER_IDS.join(", ") || "(vacío)"}`)
-      if (!TEAM_MEMBER_IDS.length) console.error("⚠️ No hay staff bookable en la location. Square no permitirá reservar sin team_member_id.")
+      console.log(`👥 TEAM_MEMBER_IDS: ${TEAM_MEMBER_IDS.join(", ") || "(vacío)"}`)
+      if (!TEAM_MEMBER_IDS.length) console.error("⚠️ No hay staff bookable en la location.")
     } else {
       console.log(`👥 TEAM_MEMBER_IDS (env): ${TEAM_MEMBER_IDS.join(", ")}`)
     }
@@ -187,10 +215,11 @@ async function discoverTeamMembers() {
     const r = await square.bookingsApi.listTeamMemberBookingProfiles(undefined, undefined, undefined, locationId)
     const list = r?.result?.teamMemberBookingProfiles || []
     const ids = list.filter(x=>x?.isBookable!==false && x?.teamMemberId).map(x=>x.teamMemberId)
-    if (!ids.length) console.error("listTeamMemberBookingProfiles: sin perfiles bookable en esta location.")
+    if (!ids.length) console.error("listTeamMemberBookingProfiles: sin perfiles bookable.")
     return ids
   }catch(e){ console.error("listTeamMemberBookingProfiles:", prettyApiError(e)); return [] }
 }
+
 async function squareFindCustomerByPhone(phoneRaw){
   try{
     const e164=normalizePhoneES(phoneRaw)
@@ -199,31 +228,35 @@ async function squareFindCustomerByPhone(phoneRaw){
     return (resp?.result?.customers||[])[0]||null
   }catch(e){ console.error("Square search:", prettyApiError(e)); return null }
 }
-async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){
+
+async function squareCreateCustomer({fullName, emailAddress, phoneNumber}){
   try{
     const phone=normalizePhoneES(phoneNumber)
+    const { givenName, familyName } = splitPersonName(fullName||"")
     const resp=await square.customersApi.createCustomer({
       idempotencyKey:`cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
-      givenName,emailAddress,phoneNumber:phone||undefined,
+      givenName: givenName || undefined,
+      familyName: familyName || undefined,
+      emailAddress,
+      phoneNumber: phone || undefined,
       note:"Creado desde bot WhatsApp Gapink Nails"
     })
-    return { customer: resp?.result?.customer || null, error: null }
+    return { customer: resp?.result?.customer||null, error:null }
   }catch(e){
-    let code = null
+    let code=null
     if (e instanceof ApiError) {
-      const errs = e.result?.errors || []
-      const invalidEmail = errs.find(x => (x.code||"").toUpperCase()==="INVALID_EMAIL_ADDRESS")
-      if (invalidEmail) code = "INVALID_EMAIL_ADDRESS"
+      const errs=e.result?.errors||[]
+      const invalid = errs.find(x => (x.code||"").toUpperCase()==="INVALID_EMAIL_ADDRESS")
+      if (invalid) code="INVALID_EMAIL_ADDRESS"
     }
     console.error("Square create:", prettyApiError(e))
-    return { customer: null, error: code || "OTHER" }
+    return { customer:null, error:code||"OTHER" }
   }
 }
+
 async function getServiceVariationVersion(id){
-  try{
-    const resp=await square.catalogApi.retrieveCatalogObject(id,true)
-    return resp?.result?.object?.version
-  }catch(e){ console.error("getServiceVariationVersion:", prettyApiError(e)); return undefined }
+  try{ const resp=await square.catalogApi.retrieveCatalogObject(id,true); return resp?.result?.object?.version }
+  catch(e){ console.error("getServiceVariationVersion:", prettyApiError(e)); return undefined }
 }
 function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){
   const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`
@@ -235,46 +268,26 @@ async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId})
     if(!serviceVariationId){ console.error("createSquareBooking: falta serviceVariationId"); return null }
     if(!teamMemberId || teamMemberId==="__ANY__"){ console.error("createSquareBooking: falta teamMemberId"); return null }
     if(!locationId){ console.error("createSquareBooking: falta locationId"); return null }
-
-    const version=await getServiceVariationVersion(serviceVariationId)
-    if(!version){ console.error("createSquareBooking: no pude obtener serviceVariationVersion"); return null }
-
+    const version=await getServiceVariationVersion(serviceVariationId); if(!version) return null
     const startISO=startEU.tz("UTC").toISOString()
-    const body={
-      idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),
-      booking:{
-        locationId, startAt:startISO, customerId,
-        appointmentSegments:[{
-          teamMemberId, serviceVariationId,
-          serviceVariationVersion:Number(version),
-          durationMinutes:SERVICES[serviceKey]
-        }]
-      }
-    }
+    const body={ idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),
+      booking:{ locationId, startAt:startISO, customerId,
+        appointmentSegments:[{ teamMemberId, serviceVariationId, serviceVariationVersion:Number(version), durationMinutes:SERVICES[serviceKey] }]
+    }}
     const resp=await square.bookingsApi.createBooking(body)
     return resp?.result?.booking||null
   }catch(e){ console.error("createSquareBooking:", prettyApiError(e)); return null }
 }
-async function cancelSquareBooking(bookingId){
-  try{const r=await square.bookingsApi.cancelBooking(bookingId);return !!r?.result?.booking?.id}
-  catch(e){ console.error("cancelSquareBooking:", prettyApiError(e)); return false }
-}
+async function cancelSquareBooking(bookingId){ try{const r=await square.bookingsApi.cancelBooking(bookingId);return !!r?.result?.booking?.id}catch(e){console.error("cancelSquareBooking:",prettyApiError(e));return false} }
 async function updateSquareBooking(bookingId,{startEU,serviceKey,customerId,teamMemberId}){
   try{
-    const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking
-    if(!booking) return null
-    const serviceVariationId=SERVICE_VARIATIONS[serviceKey]
-    const version=await getServiceVariationVersion(serviceVariationId)
+    const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking; if(!booking) return null
+    const serviceVariationId=SERVICE_VARIATIONS[serviceKey];const version=await getServiceVariationVersion(serviceVariationId)
     const startISO=startEU.tz("UTC").toISOString()
-    const body={
-      idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),
-      booking:{
-        id:bookingId, version:booking.version, locationId, customerId, startAt:startISO,
-        appointmentSegments:[{ teamMemberId, serviceVariationId, serviceVariationVersion:Number(version), durationMinutes:SERVICES[serviceKey]}]
-      }
-    }
-    const resp=await square.bookingsApi.updateBooking(bookingId, body)
-    return resp?.result?.booking||null
+    const body={ idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),
+      booking:{ id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,
+        appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}}
+    const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null
   }catch(e){ console.error("updateSquareBooking:", prettyApiError(e)); return null }
 }
 
@@ -318,16 +331,8 @@ ON CONFLICT(phone) DO UPDATE SET data_json=excluded.data_json, updated_at=exclud
 const clearSession=db.prepare(`DELETE FROM sessions WHERE phone=@phone`)
 const getUpcomingByPhone=db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso ASC LIMIT 1`)
 
-function loadSession(phone){
-  const row=getSessionRow.get({phone}); if(!row?.data_json) return null
-  const raw=JSON.parse(row.data_json); const data={...raw}
-  if (raw.startEU_ms) data.startEU = dayjs.tz(raw.startEU_ms, EURO_TZ)
-  return data
-}
-function saveSession(phone,data){
-  const s={...data}; s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null; delete s.startEU
-  upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
-}
+function loadSession(phone){const row=getSessionRow.get({phone}); if(!row?.data_json) return null; const raw=JSON.parse(row.data_json); const data={...raw}; if (raw.startEU_ms) data.startEU = dayjs.tz(raw.startEU_ms, EURO_TZ); return data}
+function saveSession(phone,data){const s={...data}; s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null; delete s.startEU; upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})}
 
 // ===== Disponibilidad
 function getBookedIntervals(fromIso,toIso){
@@ -335,11 +340,9 @@ function getBookedIntervals(fromIso,toIso){
   return rows.map(r=>({start:dayjs(r.start_iso),end:dayjs(r.end_iso),staff_id:r.staff_id}))
 }
 function findFreeStaff(intervals,start,end,preferred){
-  // Si no hay staff configurado, devolvemos "__ANY__" para poder sugerir huecos
   const base=TEAM_MEMBER_IDS.length?TEAM_MEMBER_IDS:["__ANY__"]
   const ids = preferred && base.includes(preferred) ? [preferred, ...base.filter(x=>x!==preferred)] : base
   for(const id of ids){
-    // "__ANY__" nunca está ocupado en nuestra DB local
     if(id==="__ANY__") return id
     const busy = intervals.filter(i=>i.staff_id===id).some(i => (start<i.end) && (i.start<end))
     if(!busy) return id
@@ -422,17 +425,18 @@ async function startBot(){
           editBookingId:null
         }
 
-        // IA + Parsers locales
-        const extra=await extractFromText(textRaw) // puede venir vacío si 429
+        // IA (si está) + parsers locales
+        const extra = await extractFromText(textRaw)  // puede venir vacío si 429
         const incomingService = extra.service || detectServiceFree(textRaw)
         const incomingDt = extra.datetime_text || null
 
-        // Nombre/email locales (resistentes a 429)
-        const pe = parseNameEmailFree(textRaw)
-        if (!data.name && pe.name)   data.name = pe.name
-        if (!data.email && pe.email) data.email = pe.email
+        // Nombre/Email robustos
+        const needName = !data.editBookingId && (!data.name || !isValidEmail(data.email) || /email/i.test(textRaw))
+        const ne = extractNameEmailSmart(textRaw, needName)
+        if (!data.name && ne.name) data.name = ne.name
+        if (!data.email && ne.email) data.email = ne.email
 
-        // Cancelación explícita
+        // Cancelar
         if (extra.intent==="cancel" || /\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
           if (upc) {
@@ -445,7 +449,7 @@ async function startBot(){
         }
 
         // Reprogramar
-        if (extra.intent==="reschedule" || hasTokenAlternatives(textRaw, "(cambia|modifica|mover|reprograma|reprogramar|edita)")) {
+        if (extra.intent==="reschedule" || hasToken(textRaw,"cambia|modifica|mover|reprograma|reprogramar|edita")) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
           if (upc) { data.editBookingId = upc.id; data.service = upc.service; data.durationMin = upc.duration_min; data.selectedStaffId = upc.staff_id }
         }
@@ -457,9 +461,9 @@ async function startBot(){
         if (!data.service) data.service = incomingService || data.service
         data.lastService = data.service || data.lastService
 
-        // Confirmación tokenizada (no pilla “no” en “nombre/noviembre”)
-        const userSaysYes = hasTokenAlternatives(textRaw, YES_TOKENS)
-        const userSaysNo  = hasTokenAlternatives(textRaw, NO_TOKENS)
+        // Confirmación tokenizada (no caza “no” en “nombre”)
+        const userSaysYes = hasToken(textRaw, YES_TOKENS)
+        const userSaysNo  = hasToken(textRaw, NO_TOKENS)
         if (userSaysYes) data.confirmApproved = true
         if (userSaysNo)  { data.confirmApproved=false; data.confirmAsked=false }
 
@@ -471,7 +475,7 @@ async function startBot(){
         if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
         saveSession(phone, data)
 
-        // Cierre inmediato SOLO si el mensaje actual es afirmativo
+        // Cierre inmediato si el mensaje actual es afirmativo
         if (data.confirmAsked && userSaysYes && data.service && data.startEU && data.durationMin) {
           if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
           else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
@@ -499,8 +503,6 @@ async function startBot(){
             await __SAFE_SEND__(from,{ text:`No tengo ese hueco exacto. Te puedo ofrecer ${fmtES(data.startEU)}. Si te encaja, responde “confirmo”.` })
             return
           }
-          // Si llegamos aquí, normalmente es por falta de staff o fuera de horario
-          saveSession(phone,data)
           await __SAFE_SEND__(from,{ text:"Ahora mismo no veo hueco en esa franja. Dime otra hora o día y te digo." })
           return
         }
@@ -519,7 +521,7 @@ async function startBot(){
           return
         }
 
-        // Mensaje de avance (si OpenAI está en backoff, usamos fallback fijo)
+        // Mensaje de avance
         const missing=[]
         if(!data.service) missing.push("servicio")
         if(!data.startEU) missing.push(data.editBookingId?"nueva fecha y hora":"día y hora")
@@ -527,7 +529,7 @@ async function startBot(){
           if(!data.name) missing.push("nombre")
           if(!isValidEmail(data.email)) missing.push("email válido")
         }
-        let say = ""
+        let say=""
         if (Date.now() < AI_DISABLED_UNTIL) {
           say = missing.length
             ? `Necesito ${missing.join(", ")}. Ej: "uñas acrílicas, martes 15 a las 11:00, Ana Pérez, ana@correo.com".`
@@ -542,9 +544,8 @@ async function startBot(){
 Escribe un único mensaje corto y humano que avance la ${data.editBookingId?"modificación":"reserva"}, sin emojis.
 Si faltan datos (${missing.join(", ")}), pídelo con ejemplo.
 Mensaje del cliente: "${textRaw}"`
-          say = await aiSay(prompt) || (missing.length
-            ? `Necesito ${missing.join(", ")}. Ej: "uñas acrílicas, martes 15 a las 11:00, Ana Pérez, ana@correo.com".`
-            : "¿Qué día y a qué hora te viene bien?")
+          say = await aiChat([{role:"system",content:SYS_TONE},{role:"user",content:prompt}],{temperature:0.35}) ||
+                (missing.length ? `Necesito ${missing.join(", ")}. Ej: "uñas acrílicas, martes 15 a las 11:00, Ana Pérez, ana@correo.com".` : "¿Qué día y a qué hora te viene bien?")
         }
         saveSession(phone,data)
         await __SAFE_SEND__(from,{ text: say })
@@ -553,7 +554,7 @@ Mensaje del cliente: "${textRaw}"`
   }catch(e){ console.error("startBot error:", e?.message||e) }
 }
 
-// ===== Alta / Reserva
+// ===== Finalizar alta
 async function finalizeBooking({ from, phone, data, safeSend }) {
   try {
     if (data.bookingInFlight) return
@@ -566,11 +567,10 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
         await safeSend(from,{ text:`Necesito tu nombre y un email válido para crear tu ficha y cerrar la cita.\nEjemplo: "Ana Pérez, ana@correo.com". Luego responde "confirmo".` })
         return
       }
-      const { customer: created, error } = await squareCreateCustomer({ givenName: data.name, emailAddress: data.email, phoneNumber: phone })
+      const { customer:created, error } = await squareCreateCustomer({ fullName:data.name, emailAddress:data.email, phoneNumber: phone })
       if (!created) {
-        if (error === "INVALID_EMAIL_ADDRESS") {
-          data.email = null
-          data.bookingInFlight=false; data.confirmAsked = true; saveSession(phone,data)
+        if (error==="INVALID_EMAIL_ADDRESS") {
+          data.email=null; data.bookingInFlight=false; data.confirmAsked=true; saveSession(phone,data)
           await safeSend(from,{ text:`El correo que me diste no es válido. Pásame uno correcto (ej.: nombre@dominio.com) y luego responde "confirmo".` })
           return
         }
@@ -582,17 +582,11 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
     if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
 
-    // Asegurar team member válido (intento doble)
     let teamMemberId = data.selectedStaffId || TEAM_MEMBER_IDS[0]
     if (!teamMemberId || teamMemberId==="__ANY__") {
-      const found = await discoverTeamMembers()
-      TEAM_MEMBER_IDS = found
-      teamMemberId = TEAM_MEMBER_IDS[0]
+      const found = await discoverTeamMembers(); TEAM_MEMBER_IDS = found; teamMemberId = TEAM_MEMBER_IDS[0]
     }
-    if (!teamMemberId) {
-      console.error("❌ No hay teamMemberId disponible: no se puede crear la reserva en Square.")
-      data.bookingInFlight=false; saveSession(phone,data); return
-    }
+    if (!teamMemberId) { console.error("❌ No hay teamMemberId disponible"); data.bookingInFlight=false; saveSession(phone,data); return }
 
     const durationMin = SERVICES[data.service]
     const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
@@ -600,7 +594,7 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
     try {
       insertAppt.run({
-        id: aptId, customer_name: data.name || customer?.givenName || null, customer_phone: phone,
+        id: aptId, customer_name: data.name, customer_phone: phone,
         customer_square_id: customer.id, service: data.service, duration_min: durationMin,
         start_iso: startUTC.toISOString(), end_iso: endUTC.toISOString(),
         staff_id: teamMemberId, status: "pending", created_at: new Date().toISOString(), square_booking_id: null
@@ -625,7 +619,7 @@ Pago en persona.` })
   finally { data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
 
-// ===== Edición
+// ===== Reprogramación
 async function finalizeReschedule({ from, phone, data, safeSend }) {
   try{
     if (data.bookingInFlight) return
@@ -638,11 +632,7 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
     if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
 
     let teamId   = data.selectedStaffId || upc.staff_id || TEAM_MEMBER_IDS[0]
-    if (!teamId || teamId==="__ANY__") {
-      const found = await discoverTeamMembers()
-      TEAM_MEMBER_IDS = found
-      teamId = TEAM_MEMBER_IDS[0]
-    }
+    if (!teamId || teamId==="__ANY__") { const found = await discoverTeamMembers(); TEAM_MEMBER_IDS = found; teamId = TEAM_MEMBER_IDS[0] }
     if (!teamId) { console.error("❌ No hay teamMemberId para reprogramar"); data.bookingInFlight=false; saveSession(phone,data); return }
 
     let ok=false
