@@ -1,6 +1,7 @@
-// index.js — Gapink Nails WhatsApp Bot (fix separación nombre/fecha + 429 + email)
-// Silencioso ante errores (no mensajes raros al cliente).
-// Confirmación SOLO si el mensaje ACTUAL contiene “sí/confirmo/ok/vale”.
+// index.js — Gapink Nails WhatsApp Bot (flujo paso a paso: servicio → confirma → nombre → email → reserva)
+// - Primero pide servicio y fecha/hora.
+// - Al confirmar: busca cliente. Si no existe, pide nombre (1 msg), luego email (1 msg) y agenda.
+// - Parser robusto de nombre (no mete fechas/horas), validación de email, tolerancia a OpenAI 429.
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -24,7 +25,7 @@ const EURO_TZ = "Europe/Madrid"
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
 // ===== Negocio
-const WORK_DAYS = [1,2,3,4,5,6]          // L-S (domingo cerrado)
+const WORK_DAYS = [1,2,3,4,5,6]           // L-S (domingo cerrado)
 const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
@@ -102,7 +103,7 @@ function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtT
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
-// ===== Nombre: extracción robusta (NO mete fechas/horas)
+// ===== Nombre: extracción robusta
 const STOPWORDS = new Set([
   "hoy","manana","mañana","pasado","ahora","tarde","noche","mediodia","mediodía",
   "a","la","las","el","los","de","del","al","para","por","con","y","e",
@@ -114,59 +115,28 @@ function titleCaseWord(w){return w.replace(/^([a-záéíóúñü])/i,(c)=>c.toUp
 function cleanNameCandidate(cand){
   if(!cand) return null
   let s = cand.replace(/[,"“”'()]+/g," ").replace(/\s+/g," ").trim()
-  s = s.replace(/\s+(y|e)\s*$/i,"")             // quita “... García y”
+  s = s.replace(/\s+(y|e)\s*$/i,"")
   const parts = s.split(/\s+/).filter(w=>{
     const x = rmDiacritics(w.toLowerCase())
     if (STOPWORDS.has(x)) return false
-    if (/\d/.test(w)) return false              // quita 10, 10:00, etc
+    if (/\d/.test(w)) return false
     if (/^\d{1,2}(:|h)\d{0,2}$/i.test(x)) return false
     if (/^(am|pm)$/i.test(x)) return false
     return /^[a-záéíóúñü\-]+$/i.test(w)
-  }).slice(0,4) // 1–4 palabras
+  }).slice(0,4)
   if (!parts.length) return null
   return parts.map(titleCaseWord).join(" ")
 }
-// patrones explícitos
 const NAME_PATTERNS = [
   /\bme\s+llamo\s+([^.,\n\r]+)/i,
   /\bsoy\s+([^.,\n\r]+)/i,
   /\bmi\s+nombre\s+es\s+([^.,\n\r]+)/i,
   /\bnombre\s*[:\-]?\s*([^.,\n\r]+)/i
 ]
-// fallback si mensaje = "Gonzalo García" y te lo pedimos
-function guessBareName(text, wantName){
-  if(!wantName) return null
-  if (hasToken(text, YES_TOKENS) || hasToken(text, NO_TOKENS)) return null
-  const t = rmDiacritics(text.toLowerCase())
-  if (/\b(hoy|mañana|manana|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b/.test(t)) return null
-  if (/\b(\d{1,2})(:|h)\d{0,2}\b/i.test(text)) return null
-  return cleanNameCandidate(text)
+function extractName(text){
+  for(const re of NAME_PATTERNS){ const m=text.match(re); if(m&&m[1]){ const n=cleanNameCandidate(m[1]); if(n) return n } }
+  return cleanNameCandidate(text) // si el mensaje es “Gonzalo García”
 }
-function extractNameEmailSmart(textRaw="", wantName=false){
-  const text = textRaw.trim()
-  // email fácil
-  const email = (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[null])[0]?.toLowerCase() || null
-  // 1) patrones explícitos
-  for (const re of NAME_PATTERNS){
-    const m = text.match(re)
-    if (m && m[1]) {
-      const n = cleanNameCandidate(m[1])
-      if (n) return { name:n, email }
-    }
-  }
-  // 2) nombre justo ANTES del email (tomamos las 2–4 últimas palabras válidas)
-  if (email){
-    const left = text.split(email)[0]
-    const toks = left.trim().split(/\s+/).slice(-4)
-    const n = cleanNameCandidate(toks.join(" "))
-    if (n) return { name:n, email }
-  }
-  // 3) fallback “bare name” si lo estamos pidiendo
-  const bare = guessBareName(text, wantName)
-  if (bare) return { name:bare, email }
-  return { name:null, email }
-}
-// separar nombre/apellidos para Square
 function splitPersonName(full=""){
   const w = full.trim().split(/\s+/).filter(Boolean)
   const conn = new Set(["y","e","de","del","la","las","los"])
@@ -388,6 +358,49 @@ app.listen(PORT,async()=>{
   startBot().catch(console.error)
 })
 
+// ====== FUNCIÓN CLAVE: asegura cliente y agenda tras onboarding ======
+async function ensureCustomerThenBook({ from, phone, data, safeSend }) {
+  // Si está reprogramando, no pedimos datos
+  if (data.editBookingId) { await finalizeReschedule({ from, phone, data, safeSend }); return }
+
+  // 1) ¿Existe cliente?
+  const customer = await squareFindCustomerByPhone(phone)
+  if (customer) { await finalizeBooking({ from, phone, data, safeSend }); return }
+
+  // 2) Onboarding en 2 pasos: nombre -> email
+  if (!data.onboardStep || data.onboardStep==="none") {
+    data.onboardStep = "ask_name"
+    data.pendingBooking = true
+    saveSession(phone,data)
+    await safeSend(from,{ text:"Perfecto. Antes de cerrar la reserva, ¿cómo te llamas? (nombre y apellidos)" })
+    return
+  }
+
+  if (data.onboardStep === "ask_name") {
+    if (!data.name) {
+      await safeSend(from,{ text:"Dime tu nombre y apellidos, porfa." })
+      return
+    }
+    data.onboardStep = "ask_email"
+    saveSession(phone,data)
+    await safeSend(from,{ text:"Gracias. ¿Cuál es tu correo electrónico? (ej.: nombre@dominio.com)" })
+    return
+  }
+
+  if (data.onboardStep === "ask_email") {
+    if (!isValidEmail(data.email)) {
+      await safeSend(from,{ text:"Ese correo no me cuadra. Pásame uno válido (ej.: nombre@dominio.com)." })
+      return
+    }
+    // listo para reservar
+    data.onboardStep = "none"
+    data.pendingBooking = false
+    saveSession(phone,data)
+    await finalizeBooking({ from, phone, data, safeSend })
+    return
+  }
+}
+
 async function startBot(){
   console.log("🚀 Bot arrancando…")
   try{
@@ -422,21 +435,31 @@ async function startBot(){
           service:null,startEU:null,durationMin:null,name:null,email:null,
           confirmApproved:false,confirmAsked:false,bookingInFlight:false,
           lastUserDtText:null,lastService:null, selectedStaffId:null,
-          editBookingId:null
+          editBookingId:null,
+          onboardStep:"none", pendingBooking:false
         }
 
-        // IA (si está) + parsers locales
-        const extra = await extractFromText(textRaw)  // puede venir vacío si 429
+        // IA + detección básica
+        const extra = await extractFromText(textRaw)  // puede ser {} si 429
         const incomingService = extra.service || detectServiceFree(textRaw)
         const incomingDt = extra.datetime_text || null
 
-        // Nombre/Email robustos
-        const needName = !data.editBookingId && (!data.name || !isValidEmail(data.email) || /email/i.test(textRaw))
-        const ne = extractNameEmailSmart(textRaw, needName)
-        if (!data.name && ne.name) data.name = ne.name
-        if (!data.email && ne.email) data.email = ne.email
+        // Nombre/email si estamos en onboarding
+        if (data.onboardStep === "ask_name") {
+          const n = extractName(textRaw)
+          if (n) data.name = n
+        } else if (data.onboardStep === "ask_email") {
+          const em = (textRaw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[null])[0]
+          if (em) data.email = em.toLowerCase()
+        } else {
+          // fuera de onboarding: si mandan nombre/email juntos espontáneamente
+          const em = (textRaw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[null])[0]
+          if (em && !data.email) data.email = em.toLowerCase()
+          const n = extractName(textRaw)
+          if (n && !data.name) data.name = n
+        }
 
-        // Cancelar
+        // Cancelación explícita
         if (extra.intent==="cancel" || /\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
           if (upc) {
@@ -448,24 +471,25 @@ async function startBot(){
           return
         }
 
-        // Reprogramar
+        // Reprogramación
         if (extra.intent==="reschedule" || hasToken(textRaw,"cambia|modifica|mover|reprograma|reprogramar|edita")) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
           if (upc) { data.editBookingId = upc.id; data.service = upc.service; data.durationMin = upc.duration_min; data.selectedStaffId = upc.staff_id }
         }
 
-        // Reset confirm si cambió servicio/fecha
+        // Si cambia el servicio/fecha, reiniciamos confirmación y onboarding
         if ((incomingService && incomingService !== data.lastService) || (incomingDt && incomingDt !== data.lastUserDtText)) {
           data.confirmApproved = false; data.confirmAsked = false
+          data.onboardStep = "none"; data.pendingBooking=false
         }
         if (!data.service) data.service = incomingService || data.service
         data.lastService = data.service || data.lastService
 
-        // Confirmación tokenizada (no caza “no” en “nombre”)
+        // Confirmación por tokens
         const userSaysYes = hasToken(textRaw, YES_TOKENS)
         const userSaysNo  = hasToken(textRaw, NO_TOKENS)
         if (userSaysYes) data.confirmApproved = true
-        if (userSaysNo)  { data.confirmApproved=false; data.confirmAsked=false }
+        if (userSaysNo)  { data.confirmApproved=false; data.confirmAsked=false; data.onboardStep="none"; data.pendingBooking=false }
 
         // Fecha/hora
         if (incomingDt) data.lastUserDtText = incomingDt
@@ -475,10 +499,9 @@ async function startBot(){
         if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
         saveSession(phone, data)
 
-        // Cierre inmediato si el mensaje actual es afirmativo
-        if (data.confirmAsked && userSaysYes && data.service && data.startEU && data.durationMin) {
-          if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
-          else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
+        // Si estamos en onboarding y ya tenemos todo, seguimos el flujo
+        if (data.pendingBooking) {
+          await ensureCustomerThenBook({ from, phone, data, safeSend: __SAFE_SEND__ })
           return
         }
 
@@ -488,11 +511,7 @@ async function startBot(){
           const { exact, suggestion, staffId } = suggestOrExact(data.startEU, data.durationMin, preferred)
           if (exact) {
             data.startEU = exact; data.selectedStaffId = staffId
-            if (userSaysYes) { saveSession(phone,data);
-              if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
-              else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
-              return
-            }
+            if (userSaysYes) { saveSession(phone,data); await ensureCustomerThenBook({ from, phone, data, safeSend: __SAFE_SEND__ }); return }
             data.confirmAsked = true; saveSession(phone,data)
             await __SAFE_SEND__(from,{ text:`Tengo libre ${fmtES(data.startEU)} para ${data.service}. ¿Confirmo la ${data.editBookingId?"modificación":"cita"}?` })
             return
@@ -507,17 +526,9 @@ async function startBot(){
           return
         }
 
-        // Falta nombre/email tras “sí” (solo altas) o email inválido
-        if (userSaysYes && !data.editBookingId) {
-          if (!data.name || !isValidEmail(data.email)) {
-            data.confirmAsked = true; saveSession(phone, data)
-            await __SAFE_SEND__(from,{ text:`Para cerrar, necesito tu nombre y un email válido.\nEjemplo: "Ana Pérez, ana@correo.com". Luego responde "confirmo".` })
-            return
-          }
-        }
-        if (userSaysYes && data.service && data.startEU) {
-          if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
-          else if (data.name && isValidEmail(data.email)) await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
+        // Si el usuario ha dicho “sí” pero aún no hay servicio/hora, pídelo
+        if (userSaysYes && (!data.service || !data.startEU)) {
+          await __SAFE_SEND__(from,{ text:`Dime servicio y hora. Ej: "uñas acrílicas, martes 15 a las 11:00".` })
           return
         }
 
@@ -525,27 +536,19 @@ async function startBot(){
         const missing=[]
         if(!data.service) missing.push("servicio")
         if(!data.startEU) missing.push(data.editBookingId?"nueva fecha y hora":"día y hora")
-        if(!data.editBookingId){
-          if(!data.name) missing.push("nombre")
-          if(!isValidEmail(data.email)) missing.push("email válido")
-        }
         let say=""
         if (Date.now() < AI_DISABLED_UNTIL) {
-          say = missing.length
-            ? `Necesito ${missing.join(", ")}. Ej: "uñas acrílicas, martes 15 a las 11:00, Ana Pérez, ana@correo.com".`
-            : "¿Qué día y a qué hora te viene bien?"
+          say = missing.length ? `Necesito ${missing.join(", ")}. Ej: "uñas acrílicas, martes 15 a las 11:00".` : "¿Qué día y a qué hora te viene bien?"
         } else {
           const prompt=`Contexto:
 - Modo: ${data.editBookingId?"edición":"alta"}
 - Servicio: ${data.service||"?"}
 - Fecha/Hora: ${data.startEU?fmtES(data.startEU):"?"}
-- Nombre: ${data.name||"?"}
-- Email: ${data.email||"?"}
 Escribe un único mensaje corto y humano que avance la ${data.editBookingId?"modificación":"reserva"}, sin emojis.
 Si faltan datos (${missing.join(", ")}), pídelo con ejemplo.
 Mensaje del cliente: "${textRaw}"`
           say = await aiChat([{role:"system",content:SYS_TONE},{role:"user",content:prompt}],{temperature:0.35}) ||
-                (missing.length ? `Necesito ${missing.join(", ")}. Ej: "uñas acrílicas, martes 15 a las 11:00, Ana Pérez, ana@correo.com".` : "¿Qué día y a qué hora te viene bien?")
+                (missing.length ? `Necesito ${missing.join(", ")}. Ej: "uñas acrílicas, martes 15 a las 11:00".` : "¿Qué día y a qué hora te viene bien?")
         }
         saveSession(phone,data)
         await __SAFE_SEND__(from,{ text: say })
@@ -554,7 +557,7 @@ Mensaje del cliente: "${textRaw}"`
   }catch(e){ console.error("startBot error:", e?.message||e) }
 }
 
-// ===== Finalizar alta
+// ===== Finalizar alta (ya con nombre+email si era nuevo)
 async function finalizeBooking({ from, phone, data, safeSend }) {
   try {
     if (data.bookingInFlight) return
@@ -563,15 +566,19 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     let customer = await squareFindCustomerByPhone(phone)
     if (!customer) {
       if (!data.name || !isValidEmail(data.email)) {
-        data.bookingInFlight=false; data.confirmAsked = true; saveSession(phone,data)
-        await safeSend(from,{ text:`Necesito tu nombre y un email válido para crear tu ficha y cerrar la cita.\nEjemplo: "Ana Pérez, ana@correo.com". Luego responde "confirmo".` })
+        // Si llegó aquí sin datos, reencamina al onboarding (raro)
+        data.onboardStep = !data.name ? "ask_name" : "ask_email"
+        data.pendingBooking = true
+        data.bookingInFlight=false; saveSession(phone,data)
+        await ensureCustomerThenBook({ from, phone, data, safeSend })
         return
       }
       const { customer:created, error } = await squareCreateCustomer({ fullName:data.name, emailAddress:data.email, phoneNumber: phone })
       if (!created) {
         if (error==="INVALID_EMAIL_ADDRESS") {
-          data.email=null; data.bookingInFlight=false; data.confirmAsked=true; saveSession(phone,data)
-          await safeSend(from,{ text:`El correo que me diste no es válido. Pásame uno correcto (ej.: nombre@dominio.com) y luego responde "confirmo".` })
+          data.email=null; data.onboardStep="ask_email"; data.pendingBooking=true
+          data.bookingInFlight=false; saveSession(phone,data)
+          await safeSend(from,{ text:`Ese correo no me cuadra. Pásame uno válido (ej.: nombre@dominio.com).` })
           return
         }
         data.bookingInFlight=false; saveSession(phone,data); return
@@ -594,7 +601,7 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
     try {
       insertAppt.run({
-        id: aptId, customer_name: data.name, customer_phone: phone,
+        id: aptId, customer_name: data.name || "", customer_phone: phone,
         customer_square_id: customer.id, service: data.service, duration_min: durationMin,
         start_iso: startUTC.toISOString(), end_iso: endUTC.toISOString(),
         staff_id: teamMemberId, status: "pending", created_at: new Date().toISOString(), square_booking_id: null
@@ -619,7 +626,7 @@ Pago en persona.` })
   finally { data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
 
-// ===== Reprogramación
+// ===== Reprogramación (no necesita onboarding)
 async function finalizeReschedule({ from, phone, data, safeSend }) {
   try{
     if (data.bookingInFlight) return
