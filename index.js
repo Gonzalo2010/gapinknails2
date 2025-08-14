@@ -108,28 +108,8 @@ async function squareFindCustomerByPhone(phoneRaw){try{const e164=normalizePhone
 async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){try{const phone=normalizePhoneES(phoneNumber);const resp=await square.customersApi.createCustomer({idempotencyKey:`cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,givenName,emailAddress,phoneNumber:phone||undefined,note:"Creado desde bot WhatsApp Gapink Nails"});return resp?.result?.customer||null}catch(e){console.error("Square create:",e?.message||e);return null}}
 async function getServiceVariationVersion(id){try{const resp=await square.catalogApi.retrieveCatalogObject(id,true);return resp?.result?.object?.version}catch(e){console.error("getServiceVariationVersion:",e?.message||e);return undefined}}
 function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`;return createHash("sha256").update(raw).digest("hex").slice(0,48)}
-
-// === FIX: cancelar con body { idempotencyKey, bookingVersion }
-async function cancelSquareBooking(bookingId){
-  try{
-    const get = await square.bookingsApi.retrieveBooking(bookingId)
-    const version = get?.result?.booking?.version
-    if (version === undefined || version === null) return false
-    const body = {
-      idempotencyKey: `cancel_${bookingId}_${version}_${Date.now()}`,
-      bookingVersion: Number(version)
-    }
-    const r = await square.bookingsApi.cancelBooking(bookingId, body)
-    return !!r?.result?.booking?.id
-  }catch(e){ console.error("cancelSquareBooking:", e?.message||e); return false }
-}
-async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId}){try{
-  const serviceVariationId=SERVICE_VARIATIONS[serviceKey]; if(!serviceVariationId||!teamMemberId||!locationId)return null
-  const version=await getServiceVariationVersion(serviceVariationId); if(!version)return null
-  const startISO=startEU.tz("UTC").toISOString()
-  const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}}
-  const resp=await square.bookingsApi.createBooking(body); return resp?.result?.booking||null
-}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
+async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId}){try{const serviceVariationId=SERVICE_VARIATIONS[serviceKey];if(!serviceVariationId||!teamMemberId||!locationId)return null;const version=await getServiceVariationVersion(serviceVariationId);if(!version)return null;const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}};const resp=await square.bookingsApi.createBooking(body);return resp?.result?.booking||null}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
+async function cancelSquareBooking(bookingId){try{const r=await square.bookingsApi.cancelBooking(bookingId);return !!r?.result?.booking?.id}catch(e){console.error("cancelSquareBooking:",e?.message||e);return false}}
 async function updateSquareBooking(bookingId,{startEU,serviceKey,customerId,teamMemberId}){try{
   const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking;if(!booking)return null
   const serviceVariationId=SERVICE_VARIATIONS[serviceKey];const version=await getServiceVariationVersion(serviceVariationId)
@@ -151,7 +131,7 @@ CREATE TABLE IF NOT EXISTS appointments (
   start_iso TEXT,
   end_iso TEXT,
   staff_id TEXT,
-  status TEXT,            -- pending|confirmed|cancelled
+  status TEXT,
   created_at TEXT,
   square_booking_id TEXT
 );
@@ -208,46 +188,23 @@ function suggestOrExact(startEU,durationMin,preferredStaffId=null){
   const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
   const from=now.tz("UTC").toISOString(), to=now.add(14,"day").tz("UTC").toISOString()
   const intervals=getBookedIntervals(from,to)
-
-  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
-  const dayEnd  =startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
-
-  let req = startEU.clone()
-  if (req.isBefore(dayStart)) req = dayStart
-  if (req.isAfter(dayEnd))    req = dayEnd
-
-  const dow=req.day()===0?7:req.day()
-  const endEU=req.clone().add(dimension=durationMin,"minute") // <- typo guard below
-  // fix typo if someone lint-minifies this file:
-  // eslint-disable-next-line no-unused-vars
-  if(false){console.log(endEU)}
-
-  const endEU2 = req.clone().add(durationMin,"minute")
-  const insideHours=req.hour()>=OPEN_HOUR && (endEU2.hour()<CLOSE_HOUR || (endEU2.hour()===CLOSE_HOUR && endEU2.minute()===0))
-  if (dow===7 || !WORK_DAYS.includes(dow) || !insideHours) return { exact:null, suggestion:null, staffId:null }
-
+  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0), dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
+  let req=startEU.clone(); if(req.isBefore(dayStart)) req=dayStart; if(req.isAfter(dayEnd)) req=dayEnd
+  const dow=req.day()===0?7:req.day(); const endEU=req.clone().add(durationMin,"minute")
+  const insideHours=req.hour()>=OPEN_HOUR && (endEU.hour()<CLOSE_HOUR || (endEU.hour()===CLOSE_HOUR && endEU.minute()===0))
+  if (dow===7||!WORK_DAYS.includes(dow)||!insideHours) return { exact:null, suggestion:null, staffId:null }
   const scanStart = ceilToSlotEU(req.isBefore(now)? now.clone(): req.clone())
-
-  // exact
   const exactId = findFreeStaff(intervals, scanStart.tz("UTC"), scanStart.clone().add(durationMin,"minute").tz("UTC"), preferredStaffId)
   if (exactId && scanStart.valueOf()===startEU.valueOf()) return { exact: scanStart, suggestion:null, staffId: exactId }
-
-  // hacia delante
-  for (let t = scanStart.clone(); !t.isAfter(dayEnd); t = t.add(SLOT_MIN,"minute")) {
-    const e = t.clone().add(durationMin,"minute")
-    if (t.isBefore(now)) continue
+  for (let t=scanStart.clone(); !t.isAfter(dayEnd); t=t.add(SLOT_MIN,"minute")) {
+    const e=t.clone().add(durationMin,"minute"); if(t.isBefore(now)) continue
     if (t.isAfter(dayEnd) || e.isAfter(dayEnd)) break
-    const id = findFreeStaff(intervals, t.tz("UTC"), e.tz("UTC"), preferredStaffId)
-    if (id) return { exact:null, suggestion:t, staffId:id }
+    const id=findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"),preferredStaffId); if(id) return { exact:null, suggestion:t, staffId:id }
   }
-
-  // hacia atrás (si nada más tarde)
-  for (let t = ceilToSlotEU(startEU.clone()).subtract(SLOT_MIN,"minute"); !t.isBefore(dayStart); t = t.subtract(SLOT_MIN,"minute")) {
-    const e = t.clone().add(durationMin,"minute")
-    const id = findFreeStaff(intervals, t.tz("UTC"), e.tz("UTC"), preferredStaffId)
-    if (id) return { exact:null, suggestion:t, staffId:id }
+  for (let t=ceilToSlotEU(startEU.clone()).subtract(SLOT_MIN,"minute"); !t.isBefore(dayStart); t=t.subtract(SLOT_MIN,"minute")) {
+    const e=t.clone().add(durationMin,"minute"); const id=findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"),preferredStaffId)
+    if(id) return { exact:null, suggestion:t, staffId:id }
   }
-
   return { exact:null, suggestion:null, staffId:null }
 }
 
@@ -258,7 +215,7 @@ let lastQR=null,conectado=false
 app.get("/",(_req,res)=>{res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c} .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}</style><div class="card"><h1>Gapink Nails</h1><p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}<p><small>Desarrollado por Gonzalo</small></p></div>`)})
 app.get("/qr.png",async(_req,res)=>{if(!lastQR)return res.status(404).send("No hay QR");const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1});res.set("Content-Type","image/png").send(png)})
 
-// ===== Cola envío Baileys (con reintentos y backoff)
+// ===== Cola envío Baileys
 const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
 app.listen(PORT,async()=>{console.log(`🌐 Web en puerto ${PORT}`);await squareCheckCredentials();startBot().catch(console.error)})
 
@@ -310,7 +267,6 @@ async function startBot(){
           if (upc) {
             const ok = upc.square_booking_id ? await cancelSquareBooking(upc.square_booking_id) : true
             if (ok) { markCancelled.run({ id: upc.id }); clearSession.run({ phone }); await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` }) }
-            // si falla, silencioso
           } else {
             await __SAFE_SEND__(from,{ text:"No veo ninguna cita futura tuya. Si quieres, dime fecha y hora y te doy hueco." })
           }
