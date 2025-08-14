@@ -1,8 +1,9 @@
 // index.js — Gapink Nails WhatsApp Bot
 // DeepSeek + extracción JSON + TZ Europe/Madrid
-// Confirmación fina: solo auto-reserva en HUECO EXACTO; sugeridos siempre piden "¿confirmo?"
-// Anti-duplicados: idempotencia estable + lock pending + índice único (staff_id,start_iso)
-// Baileys: cola con reintentos/ backoff para "Timed Out"
+// Confirmación fina (auto-reserva solo en exactos; sugeridos piden “¿confirmo?”)
+// FIX bucle: si hay propuesta previa y dice “sí/confirmo”, reservar directo SIN recalcular
+// Anti-dobles: idempotencia estable + lock pending + índice único (staff_id,start_iso)
+// Baileys: cola con reintentos/backoff para “Timed Out”
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -185,7 +186,7 @@ async function startBot(){
     // ===== Mensajes
     sock.ev.on("messages.upsert",async({messages})=>{
       try{
-        const m=messages?.[0]; if(!m?.message||m.key.fromMe) return
+        const m=messages?.[0]; if (!m?.message || m.key.fromMe) return
         const from=m.key.remoteJid
         const phone=normalizePhoneES((from||"").split("@")[0]||"")||(from||"").split("@")[0]||""
         const body=m.message.conversation||m.message.extendedTextMessage?.text||m.message?.imageMessage?.caption||""
@@ -199,7 +200,7 @@ async function startBot(){
         const incomingService = extra.service || detectServiceFree(textRaw)
         const incomingDt = extra.datetime_text || null
 
-        // ⛳ RESET DE CONFIRMACIÓN si cambió servicio o fecha/hora respecto a lo último
+        // Reset confirm si cambió servicio o fecha/hora
         if ((incomingService && incomingService !== data.lastService) || (incomingDt && incomingDt !== data.lastUserDtText)) {
           data.confirmApproved = false
           data.confirmAsked = false
@@ -219,9 +220,15 @@ async function startBot(){
         if (parsed) data.startEU = parsed
 
         if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
-        saveSession(phone, data) // persistir flags
+        saveSession(phone, data)
 
-        // Cancelación simple
+        // === FIX BUCLE: si ya había propuesta y el usuario dice "sí"/"confirmo", reservar ya mismo ===
+        if (data.confirmAsked && data.confirmApproved && data.service && data.startEU && data.durationMin) {
+          await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
+          return
+        }
+
+        // Cancelación
         if ((extra.intent==="cancel") || /cancel(ar)? cita/i.test(textRaw)) {
           await __SAFE_SEND__(from,{ text:"Cancelación anotada. Si quieres, dime otra fecha y te busco hueco." })
           clearSession.run({ phone }); return
@@ -238,12 +245,12 @@ async function startBot(){
             return
           }
           if (suggestion) {
-            // 🚦 Siempre pedir confirmación para sugeridos, aunque confirmApproved=true
+            // Siempre pedir confirmación para sugeridos
             data.startEU = suggestion
             data.confirmAsked = true
-            data.confirmApproved = false  // fuerza confirmación explícita del sugerido
+            data.confirmApproved = false
             saveSession(phone, data)
-            await __SAFE_SEND__(from,{ text:`No tengo ese hueco exacto. Te puedo ofrecer ${fmtES(data.startEU)}. ¿Te viene bien? Si es sí, digo “confirmo”.` })
+            await __SAFE_SEND__(from,{ text:`No tengo ese hueco exacto. Te puedo ofrecer ${fmtES(data.startEU)}. ¿Te viene bien? Si es sí, responde “confirmo”.` })
             return
           }
           data.confirmAsked = false; saveSession(phone,data)
@@ -251,7 +258,7 @@ async function startBot(){
           return
         }
 
-        // Dijo “sí” pero falta nombre/email
+        // Falta nombre/email tras “sí”
         if (data.confirmApproved && (!data.name || !data.email)) {
           saveSession(phone, data)
           await __SAFE_SEND__(from,{ text:"Para cerrar, dime tu nombre y email (ej: “Ana Pérez, ana@correo.com”)." })
