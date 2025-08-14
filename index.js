@@ -1,9 +1,11 @@
 // index.js — Gapink Nails WhatsApp Bot
 // DeepSeek + extracción JSON + TZ Europe/Madrid
+// FIX hora: persistimos milisegundos locales (no ISO UTC) para evitar -2h
 // Confirmación fina (auto-reserva solo en exactos; sugeridos piden “¿confirmo?”)
 // FIX bucle: si hay propuesta previa y dice “sí/confirmo”, reservar directo SIN recalcular
 // Anti-dobles: idempotencia estable + lock pending + índice único (staff_id,start_iso)
 // Baileys: cola con reintentos/backoff para “Timed Out”
+// Asigna staff realmente libre (no "any") al confirmar
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -27,7 +29,7 @@ const EURO_TZ = "Europe/Madrid"
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
 // ===== Negocio
-const WORK_DAYS = [1,2,3,4,5,6]
+const WORK_DAYS = [1,2,3,4,5,6]          // L-S
 const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
@@ -94,7 +96,7 @@ const NO_RE  = /\b(no|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde)\
 function normalizePhoneES(raw){const d=onlyDigits(raw);if(!d)return null;if(raw.startsWith("+")&&d.length>=8&&d.length<=15)return`+${d}`;if(d.startsWith("34")&&d.length===11)return`+${d}`;if(d.length===9)return`+34${d}`;if(d.startsWith("00"))return`+${d.slice(2)}`;return`+${d}`}
 function detectServiceFree(text=""){const low=rmDiacritics(text.toLowerCase());const map={"unas acrilicas":"uñas acrílicas","uñas acrilicas":"uñas acrílicas","uñas acrílicas":"uñas acrílicas"};for(const k of Object.keys(map))if(low.includes(rmDiacritics(k)))return map[k];for(const k of Object.keys(SERVICES))if(low.includes(rmDiacritics(k)))return k;return null}
 function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
-const fmtES=(d)=>{const t=d.tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
+const fmtES=(d)=>{const t = (dayjs.isDayjs(d)? d : dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
 
 // ===== Square
 const square = new Client({ accessToken: process.env.SQUARE_ACCESS_TOKEN, environment: process.env.SQUARE_ENV==="production"?Environment.Production:Environment.Sandbox })
@@ -104,8 +106,8 @@ async function squareCheckCredentials(){try{const locs=await square.locationsApi
 async function squareFindCustomerByPhone(phoneRaw){try{const e164=normalizePhoneES(phoneRaw);if(!e164||!e164.startsWith("+")||e164.length<8||e164.length>16)return null;const resp=await square.customersApi.searchCustomers({query:{filter:{phoneNumber:{exact:e164}}}});return (resp?.result?.customers||[])[0]||null}catch(e){console.error("Square search:",e?.message||e);return null}}
 async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){try{const phone=normalizePhoneES(phoneNumber);const resp=await square.customersApi.createCustomer({idempotencyKey:`cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,givenName,emailAddress,phoneNumber:phone||undefined,note:"Creado desde bot WhatsApp Gapink Nails"});return resp?.result?.customer||null}catch(e){console.error("Square create:",e?.message||e);return null}}
 async function getServiceVariationVersion(id){try{const resp=await square.catalogApi.retrieveCatalogObject(id,true);return resp?.result?.object?.version}catch(e){console.error("getServiceVariationVersion:",e?.message||e);return undefined}}
-function stableKey({locationId,serviceVariationId,startISO,customerId}){const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}`;return createHash("sha256").update(raw).digest("hex").slice(0,48)}
-async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId}){try{const serviceVariationId=SERVICE_VARIATIONS[serviceKey];if(!serviceVariationId||!teamMemberId||!locationId)return null;const version=await getServiceVariationVersion(serviceVariationId);if(!version)return null;const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}};const resp=await square.bookingsApi.createBooking(body);return resp?.result?.booking||null}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
+function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`;return createHash("sha256").update(raw).digest("hex").slice(0,48)}
+async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId}){try{const serviceVariationId=SERVICE_VARIATIONS[serviceKey];if(!serviceVariationId||!teamMemberId||!locationId)return null;const version=await getServiceVariationVersion(serviceVariationId);if(!version)return null;const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:SERVICES[serviceKey]}]}};const resp=await square.bookingsApi.createBooking(body);return resp?.result?.booking||null}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
 
 // ===== DB & sesiones
 const db=new Database("gapink.db");db.pragma("journal_mode = WAL")
@@ -144,13 +146,66 @@ VALUES (@phone, @data_json, @updated_at)
 ON CONFLICT(phone) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at`)
 const clearSession=db.prepare(`DELETE FROM sessions WHERE phone=@phone`)
 
-function loadSession(phone){const row=getSessionRow.get({phone});if(!row?.data_json)return null;const raw=JSON.parse(row.data_json);const data={...raw};if(raw.startEUISO)data.startEU=dayjs.tz(raw.startEUISO,EURO_TZ);return data}
-function saveSession(phone,data){const s={...data};s.startEUISO=data.startEU?.toISOString?.()?data.startEU.toISOString():(data.startEUISO||null);delete s.startEU;upsertSession.run({phone,data_json:JSON.stringify(s),updated_at:new Date().toISOString()})}
+// Persistimos MILLISECONDS locales para evitar desplazamientos TZ
+function loadSession(phone){
+  const row=getSessionRow.get({phone})
+  if(!row?.data_json) return null
+  const raw=JSON.parse(row.data_json)
+  const data={...raw}
+  if (raw.startEU_ms) data.startEU = dayjs.tz(raw.startEU_ms, EURO_TZ)
+  return data
+}
+function saveSession(phone,data){
+  const s={...data}
+  s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null
+  delete s.startEU
+  upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
+}
 
 // ===== Disponibilidad (cuenta pending + confirmed)
-function getBookedIntervals(fromIso,toIso){const rows=db.prepare(`SELECT start_iso,end_iso,staff_id FROM appointments WHERE status IN ('pending','confirmed') AND start_iso < @to AND end_iso > @from`).all({from:fromIso,to:toIso});return rows.map(r=>({start:dayjs(r.start_iso),end:dayjs(r.end_iso),staff_id:r.staff_id}))}
-function staffHasFree(intervals,start,end){const ids=TEAM_MEMBER_IDS.length?TEAM_MEMBER_IDS:["any"];for(const id of ids){const busy=intervals.filter(i=>i.staff_id===id).some(i=>(start<i.end)&&(i.start<end));if(!busy)return true}return false}
-function suggestOrExact(startEU,durationMin){const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0);const from=now.tz("UTC").toISOString();const to=now.add(14,"day").tz("UTC").toISOString();const intervals=getBookedIntervals(from,to);const endEU=startEU.clone().add(durationMin,"minute");const dow=startEU.day()===0?7:startEU.day();const insideHours=startEU.hour()>=OPEN_HOUR&&(endEU.hour()<CLOSE_HOUR||(endEU.hour()===CLOSE_HOUR&&endEU.minute()===0));if(dow===7||!WORK_DAYS.includes(dow)||!insideHours||startEU.isBefore(now)){const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0);const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0);for(let t=dayStart.clone();!t.isAfter(dayEnd);t=t.add(SLOT_MIN,"minute")){const e=t.clone().add(durationMin,"minute");if(t.isBefore(now))continue;if(staffHasFree(intervals,t.tz("UTC"),e.tz("UTC")))return{exact:null,suggestion:t}}return{exact:null,suggestion:null}}if(staffHasFree(intervals,startEU.tz("UTC"),endEU.tz("UTC")))return{exact:startEU,suggestion:null};const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0);const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0);for(let t=dayStart.clone();!t.isAfter(dayEnd);t=t.add(SLOT_MIN,"minute")){const e=t.clone().add(durationMin,"minute");if(t.isBefore(now))continue;if(staffHasFree(intervals,t.tz("UTC"),e.tz("UTC")))return{exact:null,suggestion:t}}return{exact:null,suggestion:null}}
+function getBookedIntervals(fromIso,toIso){
+  const rows=db.prepare(`SELECT start_iso,end_iso,staff_id FROM appointments WHERE status IN ('pending','confirmed') AND start_iso < @to AND end_iso > @from`).all({from:fromIso,to:toIso})
+  return rows.map(r=>({start:dayjs(r.start_iso),end:dayjs(r.end_iso),staff_id:r.staff_id}))
+}
+function findFreeStaff(intervals,start,end){
+  const ids=TEAM_MEMBER_IDS.length?TEAM_MEMBER_IDS:["any"]
+  for(const id of ids){
+    const busy = intervals.filter(i=>i.staff_id===id).some(i => (start<i.end) && (i.start<end))
+    if(!busy) return id
+  }
+  return null
+}
+function suggestOrExact(startEU,durationMin){
+  const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
+  const from=now.tz("UTC").toISOString()
+  const to=now.add(14,"day").tz("UTC").toISOString()
+  const intervals=getBookedIntervals(from,to)
+  const endEU=startEU.clone().add(durationMin,"minute")
+  const dow=startEU.day()===0?7:startEU.day()
+  const insideHours=startEU.hour()>=OPEN_HOUR&&(endEU.hour()<CLOSE_HOUR||(endEU.hour()===CLOSE_HOUR&&endEU.minute()===0))
+  if(dow===7||!WORK_DAYS.includes(dow)||!insideHours||startEU.isBefore(now)){
+    const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
+    const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
+    for(let t=dayStart.clone();!t.isAfter(dayEnd);t=t.add(SLOT_MIN,"minute")){
+      const e=t.clone().add(durationMin,"minute")
+      if(t.isBefore(now)) continue
+      const freeId = findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"))
+      if(freeId) return { exact:null, suggestion:t, staffId:freeId }
+    }
+    return { exact:null, suggestion:null, staffId:null }
+  }
+  const freeExact = findFreeStaff(intervals,startEU.tz("UTC"),endEU.tz("UTC"))
+  if(freeExact) return { exact:startEU, suggestion:null, staffId:freeExact }
+  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
+  const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
+  for(let t=dayStart.clone();!t.isAfter(dayEnd);t=t.add(SLOT_MIN,"minute")){
+    const e=t.clone().add(durationMin,"minute")
+    if(t.isBefore(now)) continue
+    const freeId = findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"))
+    if(freeId) return { exact:null, suggestion:t, staffId:freeId }
+  }
+  return { exact:null, suggestion:null, staffId:null }
+}
 
 // ===== Mini web
 const app=express()
@@ -193,7 +248,11 @@ async function startBot(){
         const textRaw=(body||"").trim()
 
         // Sesión
-        let data=loadSession(phone)||{service:null,startEU:null,durationMin:null,name:null,email:null,confirmApproved:false,confirmAsked:false,bookingInFlight:false,lastUserDtText:null,lastService:null}
+        let data=loadSession(phone)||{
+          service:null,startEU:null,durationMin:null,name:null,email:null,
+          confirmApproved:false,confirmAsked:false,bookingInFlight:false,
+          lastUserDtText:null,lastService:null, selectedStaffId:null
+        }
 
         // IA: extracción
         const extra=await extractFromText(textRaw)
@@ -204,6 +263,7 @@ async function startBot(){
         if ((incomingService && incomingService !== data.lastService) || (incomingDt && incomingDt !== data.lastUserDtText)) {
           data.confirmApproved = false
           data.confirmAsked = false
+          data.selectedStaffId = null
         }
         if (!data.service) data.service = incomingService || data.service
         data.lastService = data.service || data.lastService
@@ -236,9 +296,10 @@ async function startBot(){
 
         // DISPONIBILIDAD
         if (data.service && data.startEU && data.durationMin) {
-          const { exact, suggestion } = suggestOrExact(data.startEU, data.durationMin)
+          const { exact, suggestion, staffId } = suggestOrExact(data.startEU, data.durationMin)
           if (exact) {
             data.startEU = exact
+            data.selectedStaffId = staffId
             if (data.confirmApproved) { saveSession(phone,data); await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ }); return }
             data.confirmAsked = true; saveSession(phone,data)
             await __SAFE_SEND__(from,{ text:`Tengo libre ${fmtES(data.startEU)} para ${data.service}. ¿Confirmo la cita?` })
@@ -247,6 +308,7 @@ async function startBot(){
           if (suggestion) {
             // Siempre pedir confirmación para sugeridos
             data.startEU = suggestion
+            data.selectedStaffId = staffId
             data.confirmAsked = true
             data.confirmApproved = false
             saveSession(phone, data)
@@ -303,12 +365,25 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     }
     if (!customer) { await safeSend(from,{ text:"Ahora mismo no puedo crear tu ficha. Probamos en un minuto." }); data.bookingInFlight=false; saveSession(phone,data); return }
 
-    const teamMemberId = TEAM_MEMBER_IDS[0] || "any"
+    const teamMemberId = data.selectedStaffId || TEAM_MEMBER_IDS[0] || "any"
     const durationMin = SERVICES[data.service]
     const startUTC = data.startEU.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
     const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
     try {
-      insertAppt.run({ id: aptId, customer_name: data.name || customer?.givenName || null, customer_phone: phone, customer_square_id: customer.id, service: data.service, duration_min: durationMin, start_iso: startUTC.toISOString(), end_iso: endUTC.toISOString(), staff_id: teamMemberId, status: "pending", created_at: new Date().toISOString(), square_booking_id: null })
+      insertAppt.run({
+        id: aptId,
+        customer_name: data.name || customer?.givenName || null,
+        customer_phone: phone,
+        customer_square_id: customer.id,
+        service: data.service,
+        duration_min: durationMin,
+        start_iso: startUTC.toISOString(),
+        end_iso: endUTC.toISOString(),
+        staff_id: teamMemberId,
+        status: "pending",
+        created_at: new Date().toISOString(),
+        square_booking_id: null
+      })
     } catch (e) {
       if (String(e?.message||"").includes("UNIQUE")) {
         await safeSend(from,{ text:"Ese hueco se acaba de ocupar. Dime otra hora y te digo el primero disponible." })
