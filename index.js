@@ -387,10 +387,12 @@ function searchSlot(startEU, preferredStaffId=null) {
   return { type:"none" }
 }
 
-// ───────────────── Web mínima
+// ───────────────── Estado para WhatsApp y Web
+let lastQR = null, conectado = false
+
+// ───────────────── Web mínima (DECLARADA UNA SOLA VEZ)
 const app = express()
 const PORT = process.env.PORT || 8080
-let lastQR = null, conectado = false
 
 app.get("/", (_req,res)=>{
   res.send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -682,10 +684,7 @@ async function startBot() {
   }
 }
 
-// ───────────────── Boot
-const app = express()
-const PORT = process.env.PORT || 8080
-
+// ───────────────── Boot (usa el MISMO app)
 app.listen(PORT, async()=>{
   console.log(`🌐 Web servidor iniciado en puerto ${PORT}`)
   const missing = ['DEEPSEEK_API_KEY','SQUARE_ACCESS_TOKEN','SQUARE_LOCATION_ID'].filter(k=>!process.env[k])
