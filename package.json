@@ -1,7 +1,7 @@
 {
   "name": "gapink-whatsapp-bot",
-  "version": "1.0.0",
-  "description": "Bot de WhatsApp para reservas de Gapink Nails (Square + Baileys + DeepSeek)",
+  "version": "2.0.0",
+  "description": "Bot WhatsApp Gapink Nails — Square Bookings + Baileys + DeepSeek",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
