@@ -1,12 +1,11 @@
-// index.js — Gapink Nails WhatsApp Bot (Square-only + Web QR + Botones)
-// - Sin base de datos; todo en Square
-// - OpenAI 4o-mini para entender intención y mapear servicio al más parecido del catálogo
-// - Carga de servicios desde Square (duración real)
-// - Buscar disponibilidad en Square (sin solapes) y proponer slot exacto o siguiente
-// - Confirmaciones con botones "Sí / No" (reservar / cancelar / editar)
-// - Web mínima con estado y QR (PNG) para vincular WhatsApp
-// - Español (España), TZ Europe/Madrid
-// - Errores: solo a logs, nunca al cliente
+// index.js — Gapink Nails WhatsApp Bot (Square-only + Web QR + Botones) — FIX servicios=0
+// - Sin DB; todo en Square
+// - OpenAI 4o-mini para intención + servicio más parecido
+// - Carga de servicios: detecta variaciones con appointmentServiceVariationData (más robusto)
+// - Fallback opcional desde env SQ_SERVICES_FALLBACK (JSON: [{name,variationId,durationMin}])
+// - Botones "Sí / No" para confirmar reservar / cancelar / editar
+// - Web QR para vincular Baileys
+// - TZ Europe/Madrid; sin mensajes de error técnicos al cliente
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -139,57 +138,93 @@ async function sqREST(path, method="GET", body) {
   } catch (e) { console.error("Square REST", path, e?.message||e); return null }
 }
 
-// === Catálogo de servicios (variations con duración)
+// === Catálogo de servicios robusto
 let SERVICE_BY_NAME = new Map() // name -> { itemId, variationId, durationMin }
 let SERVICES_LIST = []          // nombres visibles
+
 async function loadServicesFromSquare(){
   SERVICE_BY_NAME.clear(); SERVICES_LIST=[]
   let cursor=null
+  const all = []
   do {
     const j = await sqREST(`/catalog/list?types=ITEM,ITEM_VARIATION${cursor?`&cursor=${encodeURIComponent(cursor)}`:""}`,"GET")
-    if(!j) break
-    const items = (j.objects||[]).filter(o=>o.type==="ITEM" && o.itemData?.productType==="APPOINTMENTS_SERVICE")
-    const itemMap = new Map(items.map(i=>[i.id,i]))
-    const vars  = (j.objects||[]).filter(o=>o.type==="ITEM_VARIATION" && o.itemVariationData?.itemId && itemMap.has(o.itemVariationData.itemId))
-    for(const v of vars){
-      const item = itemMap.get(v.itemVariationData.itemId)
-      const baseName = (item?.itemData?.name||"").trim()
-      const varName  = (v?.itemVariationData?.name||"").trim()
-      const name = varName && varName.toLowerCase()!=="standard" ? `${baseName} ${varName}`.trim() : baseName
-      const durSec = v?.itemVariationData?.appointmentServiceVariationData?.serviceDuration
-                  ?? v?.appointmentServiceVariationData?.serviceDuration
-                  ?? v?.serviceDuration
-      const durationMin = durSec ? Math.round(Number(durSec)/60) : 60
-      SERVICE_BY_NAME.set(name.toLowerCase(), { itemId:item?.id, variationId:v.id, durationMin })
-      SERVICES_LIST.push(name)
-    }
+    if (!j) break
+    if (Array.isArray(j.objects)) all.push(...j.objects)
     cursor = j.cursor || null
   } while(cursor)
+
+  const items = all.filter(o=>o.type==="ITEM")
+  const itemMap = new Map(items.map(i=>[i.id,i]))
+  const vars  = all.filter(o=>o.type==="ITEM_VARIATION")
+
+  for (const v of vars){
+    const ivd = v.itemVariationData || {}
+    const asvd = ivd.appointmentServiceVariationData || v.appointmentServiceVariationData
+    if (!asvd) continue // solo las variaciones que realmente son de cita
+    const item = itemMap.get(ivd.itemId)
+    const baseName = (item?.itemData?.name || "Servicio").trim()
+    const varName  = (ivd?.name || "").trim()
+    const name = varName && varName.toLowerCase()!=="standard" ? `${baseName} ${varName}`.trim() : baseName
+    const durSec = asvd?.serviceDuration ?? v?.serviceDuration ?? null
+    const durationMin = durSec ? Math.max(15, Math.round(Number(durSec)/60)) : 60
+    SERVICE_BY_NAME.set(name.toLowerCase(), { itemId:item?.id || null, variationId:v.id, durationMin })
+    SERVICES_LIST.push(name)
+  }
+
+  // Fallback opcional por env si no hay nada en Square
+  if (SERVICES_LIST.length===0) {
+    try{
+      const raw = process.env.SQ_SERVICES_FALLBACK || ""
+      if (raw) {
+        const list = JSON.parse(raw) // [{name, variationId, durationMin}]
+        for (const s of list) {
+          if (!s?.name || !s?.variationId) continue
+          SERVICE_BY_NAME.set(String(s.name).toLowerCase(), { itemId:null, variationId:String(s.variationId), durationMin: Number(s.durationMin)||60 })
+          SERVICES_LIST.push(String(s.name))
+        }
+      }
+    }catch(e){ console.error("SQ_SERVICES_FALLBACK parse:", e?.message||e) }
+  }
+
   console.log(`🗂️ Servicios cargados: ${SERVICES_LIST.length}`)
 }
 
 async function matchServiceOrClosest(userText){
   if (!SERVICES_LIST.length) await loadServicesFromSquare()
-  const low = rmDiacritics(userText||"").toLowerCase()
-  // 1) intento directo por inclusión
+  if (!SERVICES_LIST.length) {
+    console.warn("No hay servicios en Square ni fallback; no puedo mapear servicio.")
+    return null
+  }
+  const lowText = rmDiacritics((userText||"").toLowerCase())
+
+  // 1) match directo por inclusión
   for (const name of SERVICES_LIST){
-    if (low.includes(rmDiacritics(name.toLowerCase()))) {
-      const e = SERVICE_BY_NAME.get(name.toLowerCase())
-      if (e) return { name, ...e }
+    const nm = String(name||"")
+    if (!nm) continue
+    if (lowText.includes(rmDiacritics(nm.toLowerCase()))) {
+      const e = SERVICE_BY_NAME.get(nm.toLowerCase())
+      if (e) return { name:nm, ...e }
     }
   }
-  // 2) IA elige el más parecido
+
+  // 2) IA elige el más parecido (pero protegido)
   const list = SERVICES_LIST.join(" | ")
   const pick = await aiChat([
     { role:"system", content:`${SYS}\nElige de la lista el servicio más parecido al texto del cliente. Responde SOLO con un nombre EXACTO de la lista, sin explicaciones.` },
-    { role:"user", content:`Lista de servicios:\n${list}\n\nTexto del cliente: "${userText}"` }
+    { role:"user", content:`Lista de servicios:\n${list}\n\nTexto del cliente: "${userText||""}"` }
   ], { temperature: 0.1 })
-  const chosen = (pick||"").split("\n")[0].trim()
-  const e = SERVICE_BY_NAME.get(chosen.toLowerCase())
+
+  const chosen = (pick||"").split("\n")[0]?.trim?.() || ""
+  const key = chosen ? chosen.toLowerCase() : ""
+  const e = key ? SERVICE_BY_NAME.get(key) : null
   if (e) return { name: chosen, ...e }
-  // 3) fallback: primero de la lista
+
+  // 3) fallback: primer servicio disponible (ya no rompe si no hay)
   const fallback = SERVICES_LIST[0]
-  return { name: fallback, ...SERVICE_BY_NAME.get(fallback.toLowerCase()) }
+  if (!fallback) return null
+  const ef = SERVICE_BY_NAME.get(fallback.toLowerCase())
+  if (!ef) return null
+  return { name: fallback, ...ef }
 }
 
 // === Clientes y reservas
@@ -232,10 +267,8 @@ async function searchBookings({ customerId, teamMemberIds, startAt, endAt }){
   return arr.filter(b => b.status !== "CANCELLED")
 }
 
-// --- Comprobar disponibilidad (sin solapes)
-function overlaps(aStart, aEnd, bStart, bEnd){
-  return (aStart < bEnd) && (bStart < aEnd)
-}
+// --- Disponibilidad (sin solapes)
+function overlaps(aStart, aEnd, bStart, bEnd){ return (aStart < bEnd) && (bStart < aEnd) }
 async function firstFreeSlotOrExact(startEU, durationMin){
   const dayStart = startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
   const dayEnd   = startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
@@ -246,43 +279,24 @@ async function firstFreeSlotOrExact(startEU, durationMin){
   const rangeStart = dayStart.tz("UTC").toISOString()
   const rangeEnd   = dayEnd.tz("UTC").toISOString()
 
-  // Si no hay IDs de staff, tomamos agenda única
-  if (!TEAM_MEMBER_IDS.length) {
-    const bookings = await searchBookings({ startAt: rangeStart, endAt: rangeEnd })
-    const intervals = bookings.map(b=>({
-      start: dayjs(b.startAt),
-      end: dayjs(b.startAt).add( (b?.appointmentSegments?.[0]?.durationMinutes||60), "minute" )
-    }))
-    const desiredEnd = endWanted(t)
-    const busy = intervals.some(iv => overlaps(t, desiredEnd, iv.start, iv.end))
-    if (!busy) return { exact:t, staffId:"any" }
-    for (let s=t.clone().add(SLOT_MIN,"minute"); !s.isAfter(dayEnd); s=s.add(SLOT_MIN,"minute")){
-      const e=endWanted(s); const clash=intervals.some(iv=>overlaps(s,e,iv.start,iv.end))
-      if(!clash) return { suggestion:s, staffId:"any" }
-    }
-    return { exact:null, suggestion:null, staffId:null }
-  }
-
-  // Con staff
+  const staffList = TEAM_MEMBER_IDS.length ? TEAM_MEMBER_IDS : ["any"]
   const perStaff = {}
-  for (const staffId of TEAM_MEMBER_IDS) {
-    const bookings = await searchBookings({ teamMemberIds:[staffId], startAt: rangeStart, endAt: rangeEnd })
+  for (const staffId of staffList) {
+    const bookings = await searchBookings({ teamMemberIds: staffId==="any"?undefined:[staffId], startAt: rangeStart, endAt: rangeEnd })
     perStaff[staffId] = bookings.map(b=>({
       start: dayjs(b.startAt),
       end: dayjs(b.startAt).add( (b?.appointmentSegments?.[0]?.durationMinutes||60), "minute" )
     }))
   }
 
-  // 1) exacto
   const desiredEnd = endWanted(t)
-  for (const staffId of TEAM_MEMBER_IDS) {
+  for (const staffId of staffList) {
     const busy = perStaff[staffId].some(iv => overlaps(t, desiredEnd, iv.start, iv.end))
     if (!busy) return { exact: t, staffId }
   }
-  // 2) barrido hacia delante
   for (let s = t.clone().add(SLOT_MIN,"minute"); !s.isAfter(dayEnd); s=s.add(SLOT_MIN,"minute")) {
     const e = endWanted(s)
-    for (const staffId of TEAM_MEMBER_IDS) {
+    for (const staffId of staffList) {
       const busy = perStaff[staffId].some(iv => overlaps(s, e, iv.start, iv.end))
       if (!busy) return { suggestion: s, staffId }
     }
@@ -291,11 +305,11 @@ async function firstFreeSlotOrExact(startEU, durationMin){
 }
 
 // ===== WhatsApp infra (Baileys) + botones
-const SESS = new Map() // phone -> session in-memory
+const SESS = new Map() // phone -> session
 function getSession(phone){
   if(!SESS.has(phone)) SESS.set(phone, {
     mode:null,             // "book" | "edit" | "cancel"
-    pending:null,          // objeto con {action, ...} usado por botones
+    pending:null,          // {action,...} para botones
     service:null,          // {name, variationId, durationMin}
     startEU:null,
     name:null, email:null,
@@ -374,7 +388,7 @@ async function startBot(){
         if (extra.name) session.name = extra.name
         if (extra.email) session.email = extra.email
 
-        // CANCELAR flujo
+        // CANCELAR
         if (extra.intent==="cancel" || /cancel|anul|borra/i.test(text)) {
           const customer = await squareFindCustomerByPhone(phone)
           if (!customer?.id) { await safeSend(from,{ text:"No veo ninguna cita futura tuya. Si quieres, dime fecha y hora y te doy hueco."}); return }
@@ -387,7 +401,7 @@ async function startBot(){
           return
         }
 
-        // EDITAR flujo (pedimos nueva fecha)
+        // EDITAR (pedimos nueva fecha)
         if (extra.intent==="reschedule" || /\b(cambia|cambiar|mover|modifica|reprograma)\b/i.test(text)) {
           const customer = await squareFindCustomerByPhone(phone)
           const upcoming = customer?.id ? await searchBookings({ customerId: customer.id, startAt: dayjs().utc().toISOString() }) : []
@@ -425,7 +439,7 @@ async function startBot(){
           return
         }
 
-        // RESERVAR flujo
+        // RESERVAR
         const when = parseDateTimeES(extra.datetime_text || text)
         let serviceInfo = session.service
         if (extra.service_text || /mani(cura|cure)/i.test(text) || /uñas|unias/i.test(text)) {
@@ -450,9 +464,13 @@ async function startBot(){
           return
         }
 
-        // Si falta algo, pedir datos
+        // Faltan datos
         if (!serviceInfo) {
-          await safeSend(from,{ text:"¿Qué servicio quieres? (por ejemplo, “manicura” o “uñas acrílicas”)." })
+          if (!SERVICES_LIST.length) {
+            await safeSend(from,{ text:"Ahora mismo no tengo ningún servicio configurado. En cuanto esté, te aviso para reservar." })
+          } else {
+            await safeSend(from,{ text:`¿Qué servicio quieres? Tengo: ${SERVICES_LIST.slice(0,6).join(", ")}${SERVICES_LIST.length>6?"…":""}.` })
+          }
           return
         }
         if (!when) {
@@ -510,7 +528,6 @@ async function startBot(){
         }
         if (p.action==="book") {
           try{
-            // cliente
             let customer = await squareFindCustomerByPhone(phone)
             if (!customer) customer = await squareCreateCustomer({ name: session.name, email: session.email, phone })
             if (!customer?.id) return
