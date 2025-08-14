@@ -1,8 +1,7 @@
 // index.js — Gapink Nails WhatsApp Bot
 // OpenAI gpt-4o-mini + extracción JSON + TZ Europe/Madrid
 // Silencioso ante errores (no enviar mensajes de error al cliente)
-// Confirmación SOLO si el mensaje actual contiene “sí/confirmo/ok/vale”
-// Anti-bucle de confirmación por sesión vieja
+// Confirmación SOLO si el mensaje ACTUAL contiene “sí/confirmo/ok/vale”
 // Persistencia de hora en ms (sin UTC shift) + validaciones
 // Disponibilidad forward-first + cancelar/editar reales en Square
 
@@ -97,8 +96,7 @@ function normalizePhoneES(raw){const d=onlyDigits(raw);if(!d)return null;if(raw.
 function detectServiceFree(text=""){const low=rmDiacritics(text.toLowerCase());const map={"unas acrilicas":"uñas acrílicas","uñas acrilicas":"uñas acrílicas","uñas acrílicas":"uñas acrílicas"};for(const k of Object.keys(map))if(low.includes(rmDiacritics(k)))return map[k];for(const k of Object.keys(SERVICES))if(low.includes(rmDiacritics(k)))return k;return null}
 function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
-
-// Redondeo a slot (ceil)
+// Redondeo a slot (ceil) — ¡SOLO UNA DEFINICIÓN!
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
 // ===== Square
@@ -186,7 +184,6 @@ function findFreeStaff(intervals,start,end,preferred){
   }
   return null
 }
-function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 function suggestOrExact(startEU,durationMin,preferredStaffId=null){
   const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
   const from=now.tz("UTC").toISOString(), to=now.add(14,"day").tz("UTC").toISOString()
@@ -259,7 +256,7 @@ async function startBot(){
           editBookingId:null
         }
 
-        // IA: extracción (solo para servicio/fecha/nombre/email; confirmación NO se fía de la IA)
+        // IA: extracción (confirmación NO se fía de la IA)
         const extra=await extractFromText(textRaw)
         const incomingService = extra.service || detectServiceFree(textRaw)
         const incomingDt = extra.datetime_text || null
@@ -299,8 +296,8 @@ async function startBot(){
         if (userSaysNo)  { data.confirmApproved=false; data.confirmAsked=false }
 
         // Fecha/hora
-        if (extra.datetime_text) data.lastUserDtText = extra.datetime_text
-        const parsed = parseDateTimeES(extra.datetime_text ? extra.datetime_text : textRaw)
+        if (incomingDt) data.lastUserDtText = incomingDt
+        const parsed = parseDateTimeES(incomingDt ? incomingDt : textRaw)
         if (parsed) data.startEU = parsed
 
         if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
@@ -351,7 +348,7 @@ async function startBot(){
           return
         }
 
-        // Mensaje de avance (fallback silencioso si falla OpenAI)
+        // Mensaje de avance (fallback si falla OpenAI)
         const missing=[]
         if(!data.service) missing.push("servicio")
         if(!data.startEU) missing.push(data.editBookingId?"nueva fecha y hora":"día y hora")
@@ -368,7 +365,7 @@ Mensaje del cliente: "${textRaw}"`
         let say=await aiSay(prompt)
         if (!say) say = missing.length
           ? `Necesito ${missing.join(", ")}. Ejemplo: "uñas acrílicas, martes 15 a las 11:00, Ana Pérez, ana@correo.com".`
-          : "¿Qué día y hora te viene bien?"
+          : "¿Qué día y a qué hora te viene bien?"
         saveSession(phone,data)
         await __SAFE_SEND__(from,{ text: say })
       }catch(e){ console.error("messages.upsert error:",e) }
@@ -390,7 +387,8 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     if (!customer) { data.bookingInFlight=false; saveSession(phone,data); return }
 
     const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
-    if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return } // <- evita RangeError
+    if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
+
     const teamMemberId = data.selectedStaffId || TEAM_MEMBER_IDS[0] || "any"
     const durationMin = SERVICES[data.service]
     const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
