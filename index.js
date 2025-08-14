@@ -1,16 +1,18 @@
-// index.js — Gapink Nails WhatsApp Bot (Square-only)
-// - Sin DB: estado en memoria (Map)
-// - OpenAI 4o-mini para extracción + match de servicio más parecido
-// - Catálogo de servicios desde Square (variations y duraciones)
-// - Agenda/edita/cancela SOLO en Square (create/update/cancel)
-// - Disponibilidad consultando /v2/bookings/search vía REST (no SDK)
-// - Botones “Sí / No” con Baileys para confirmar reservar / cancelar / editar
-// - Español (ES), TZ Europe/Madrid, sin mensajes de error técnicos al cliente
+// index.js — Gapink Nails WhatsApp Bot (Square-only + Web QR + Botones)
+// - Sin base de datos; todo en Square
+// - OpenAI 4o-mini para entender intención y mapear servicio al más parecido del catálogo
+// - Carga de servicios desde Square (duración real)
+// - Buscar disponibilidad en Square (sin solapes) y proponer slot exacto o siguiente
+// - Confirmaciones con botones "Sí / No" (reservar / cancelar / editar)
+// - Web mínima con estado y QR (PNG) para vincular WhatsApp
+// - Español (España), TZ Europe/Madrid
+// - Errores: solo a logs, nunca al cliente
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
 import pino from "pino"
-import qrcode from "qrcode-terminal"
+import qrcode from "qrcode"
+import qrcodeTerminal from "qrcode-terminal"
 import "dotenv/config"
 import fs from "fs"
 import { webcrypto, createHash } from "crypto"
@@ -53,7 +55,7 @@ async function aiChat(messages, { temperature=0.3 } = {}) {
 }
 
 const SYS = `Eres el asistente de WhatsApp de Gapink Nails (España).
-Escribe en español (España), natural y breve, sin emojis ni tecnicismos. 
+Escribe en español (España), natural y breve, sin emojis ni tecnicismos.
 No digas que eres IA.`
 
 async function extractFromText(userText="") {
@@ -110,7 +112,7 @@ const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=[
 
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
-// ===== Square SDK + REST (para searchBookings)
+// ===== Square SDK + REST (para /bookings/search)
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment: process.env.SQUARE_ENV==="production" ? Environment.Production : Environment.Sandbox
@@ -169,7 +171,7 @@ async function loadServicesFromSquare(){
 async function matchServiceOrClosest(userText){
   if (!SERVICES_LIST.length) await loadServicesFromSquare()
   const low = rmDiacritics(userText||"").toLowerCase()
-  // 1) intento de match directo por inclusión
+  // 1) intento directo por inclusión
   for (const name of SERVICES_LIST){
     if (low.includes(rmDiacritics(name.toLowerCase()))) {
       const e = SERVICE_BY_NAME.get(name.toLowerCase())
@@ -230,7 +232,7 @@ async function searchBookings({ customerId, teamMemberIds, startAt, endAt }){
   return arr.filter(b => b.status !== "CANCELLED")
 }
 
-// --- Comprobar disponibilidad sencilla mirando solapes en Square
+// --- Comprobar disponibilidad (sin solapes)
 function overlaps(aStart, aEnd, bStart, bEnd){
   return (aStart < bEnd) && (bStart < aEnd)
 }
@@ -244,26 +246,43 @@ async function firstFreeSlotOrExact(startEU, durationMin){
   const rangeStart = dayStart.tz("UTC").toISOString()
   const rangeEnd   = dayEnd.tz("UTC").toISOString()
 
-  // Pre-cargar reservas del día por cada profesional
+  // Si no hay IDs de staff, tomamos agenda única
+  if (!TEAM_MEMBER_IDS.length) {
+    const bookings = await searchBookings({ startAt: rangeStart, endAt: rangeEnd })
+    const intervals = bookings.map(b=>({
+      start: dayjs(b.startAt),
+      end: dayjs(b.startAt).add( (b?.appointmentSegments?.[0]?.durationMinutes||60), "minute" )
+    }))
+    const desiredEnd = endWanted(t)
+    const busy = intervals.some(iv => overlaps(t, desiredEnd, iv.start, iv.end))
+    if (!busy) return { exact:t, staffId:"any" }
+    for (let s=t.clone().add(SLOT_MIN,"minute"); !s.isAfter(dayEnd); s=s.add(SLOT_MIN,"minute")){
+      const e=endWanted(s); const clash=intervals.some(iv=>overlaps(s,e,iv.start,iv.end))
+      if(!clash) return { suggestion:s, staffId:"any" }
+    }
+    return { exact:null, suggestion:null, staffId:null }
+  }
+
+  // Con staff
   const perStaff = {}
-  for (const staffId of (TEAM_MEMBER_IDS.length?TEAM_MEMBER_IDS:["any"])) {
+  for (const staffId of TEAM_MEMBER_IDS) {
     const bookings = await searchBookings({ teamMemberIds:[staffId], startAt: rangeStart, endAt: rangeEnd })
     perStaff[staffId] = bookings.map(b=>({
       start: dayjs(b.startAt),
-      end: dayjs(b.startAt).add( (b?.appointmentSegments?.[0]?.durationMinutes|| (b?.appointmentSegments?.[0]?.serviceDurationMinutes)||60), "minute" )
+      end: dayjs(b.startAt).add( (b?.appointmentSegments?.[0]?.durationMinutes||60), "minute" )
     }))
   }
 
   // 1) exacto
   const desiredEnd = endWanted(t)
-  for (const staffId of Object.keys(perStaff)) {
+  for (const staffId of TEAM_MEMBER_IDS) {
     const busy = perStaff[staffId].some(iv => overlaps(t, desiredEnd, iv.start, iv.end))
     if (!busy) return { exact: t, staffId }
   }
-  // 2) barrer el día hacia delante
+  // 2) barrido hacia delante
   for (let s = t.clone().add(SLOT_MIN,"minute"); !s.isAfter(dayEnd); s=s.add(SLOT_MIN,"minute")) {
     const e = endWanted(s)
-    for (const staffId of Object.keys(perStaff)) {
+    for (const staffId of TEAM_MEMBER_IDS) {
       const busy = perStaff[staffId].some(iv => overlaps(s, e, iv.start, iv.end))
       if (!busy) return { suggestion: s, staffId }
     }
@@ -273,20 +292,18 @@ async function firstFreeSlotOrExact(startEU, durationMin){
 
 // ===== WhatsApp infra (Baileys) + botones
 const SESS = new Map() // phone -> session in-memory
-
 function getSession(phone){
   if(!SESS.has(phone)) SESS.set(phone, {
     mode:null,             // "book" | "edit" | "cancel"
     pending:null,          // objeto con {action, ...} usado por botones
     service:null,          // {name, variationId, durationMin}
     startEU:null,
-    name:null, email:null
+    name:null, email:null,
+    editBookingId:null
   })
   return SESS.get(phone)
 }
-
 function makeCtxId(){ return Math.random().toString(36).slice(2,10) }
-
 function asYesNo(text, ctxId){
   return {
     text,
@@ -298,16 +315,17 @@ function asYesNo(text, ctxId){
     headerType: 1
   }
 }
-
 const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
 
-// ===== App + Bot
+// ===== Mini web QR
 const app=express()
 const PORT=process.env.PORT||8080
-
-app.get("/",(_req,res)=>res.send("Gapink Nails bot en marcha."))
+let lastQR=null, conectado=false
+app.get("/",(_req,res)=>{res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c} .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}</style><div class="card"><h1>Gapink Nails</h1><p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}<p><small>Desarrollado por Gonzalo</small></p></div>`)})
+app.get("/qr.png",async(_req,res)=>{try{if(!lastQR)return res.status(404).send("No hay QR");const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1});res.set("Content-Type","image/png").send(png)}catch{res.status(500).end()}})
 app.listen(PORT, async()=>{ console.log(`🌐 Web en puerto ${PORT}`); await loadServicesFromSquare(); startBot().catch(console.error) })
 
+// ===== Bot
 async function startBot(){
   console.log("🚀 Bot arrancando…")
   try{
@@ -315,17 +333,17 @@ async function startBot(){
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion()
     let isOpen=false,reconnect=false
-    const sock=makeWASocket({logger:pino({level:"silent"}),auth:state,version,browser:Browsers.macOS("Desktop"),printQRInTerminal:true})
+    const sock=makeWASocket({logger:pino({level:"silent"}),auth:state,version,browser:Browsers.macOS("Desktop"),printQRInTerminal:false})
 
     // Cola segura
     const outbox=[]; let sending=false
     const safeSend=(jid,content)=>new Promise((resolve)=>{ outbox.push({jid,content,resolve}); processOutbox().catch(console.error) })
     async function processOutbox(){ if(sending) return; sending=true; while(outbox.length){const {jid,content,resolve}=outbox.shift(); let guard=0; while(!isOpen && guard<60){await wait(1000);guard++} try{ await sock.sendMessage(jid,content) }catch(e){ console.error("sendMessage:",e?.message||e) } resolve(true) } sending=false }
 
-    sock.ev.on("connection.update",({connection,qr})=>{
-      if(qr) qrcode.generate(qr,{small:true})
-      if(connection==="open"){ isOpen=true; console.log("✅ Conectado a WhatsApp") }
-      if(connection==="close"){ isOpen=false; if(!reconnect){ reconnect=true; setTimeout(()=>startBot().catch(console.error),2000) } }
+    sock.ev.on("connection.update",({connection,lastDisconnect,qr})=>{
+      if(qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
+      if(connection==="open"){ lastQR=null; conectado=true; isOpen=true; console.log("✅ Conectado a WhatsApp"); processOutbox().catch(console.error) }
+      if(connection==="close"){ conectado=false; isOpen=false; const reason=lastDisconnect?.error?.message||String(lastDisconnect?.error||""); console.log("❌ Conexión cerrada:",reason); if(!reconnect){ reconnect=true; setTimeout(()=>startBot().catch(console.error),2000) } }
     })
     sock.ev.on("creds.update",saveCreds)
 
@@ -345,8 +363,8 @@ async function startBot(){
         if (btnId && session?.pending) {
           const [ans, ctx] = String(btnId).split("|")
           if (ctx === session.pending.ctxId) {
-            if (ans === "YES") await onConfirmYes({ sock, from, phone, session, safeSend })
-            else await onConfirmNo({ sock, from, phone, session, safeSend })
+            if (ans === "YES") await onConfirmYes({ from, phone, session, safeSend })
+            else await onConfirmNo({ from, phone, session, safeSend })
             return
           }
         }
@@ -386,30 +404,31 @@ async function startBot(){
         if (session.mode==="edit" && (extra.datetime_text || parseDateTimeES(text))) {
           const startEU = parseDateTimeES(extra.datetime_text || text)
           if (!startEU) { await safeSend(from,{ text:"No he pillado la hora. Dímela así: “15/08 10:00”." }); return }
-          // Para editar mantenemos el servicio y asignamos duración por catálogo si podemos
-          const get = await sqREST(`/bookings/${session.editBookingId}`,"GET")
-          const booking = get?.booking
-          const staffId = booking?.appointmentSegments?.[0]?.teamMemberId || TEAM_MEMBER_IDS[0]
-          const durMin = booking?.appointmentSegments?.[0]?.durationMinutes || 60
-          const { exact, suggestion, staffId: okStaff } = await firstFreeSlotOrExact(startEU, durMin)
-          if (exact) {
-            session.pending={ action:"edit", ctxId: makeCtxId(), bookingId: session.editBookingId, startEU: exact, staffId: okStaff, durationMin: durMin }
-            await safeSend(from, asYesNo(`Tengo libre ${fmtES(exact)}. ¿Confirmo el cambio de cita?`, session.pending.ctxId))
-            return
-          }
-          if (suggestion) {
-            session.pending={ action:"edit", ctxId: makeCtxId(), bookingId: session.editBookingId, startEU: suggestion, staffId: okStaff, durationMin: durMin }
-            await safeSend(from, asYesNo(`No tengo ese hueco exacto. Te propongo ${fmtES(suggestion)}. ¿Te viene bien?`, session.pending.ctxId))
-            return
-          }
-          await safeSend(from,{ text:"Ese día lo tengo completo. Dime otra hora o día y te digo." })
+          try{
+            const get = await sqREST(`/bookings/${session.editBookingId}`,"GET")
+            const booking = get?.booking
+            const staffId = booking?.appointmentSegments?.[0]?.teamMemberId || TEAM_MEMBER_IDS[0] || "any"
+            const durMin = booking?.appointmentSegments?.[0]?.durationMinutes || 60
+            const { exact, suggestion, staffId: okStaff } = await firstFreeSlotOrExact(startEU, durMin)
+            if (exact) {
+              session.pending={ action:"edit", ctxId: makeCtxId(), bookingId: session.editBookingId, startEU: exact, staffId: okStaff, durationMin: durMin }
+              await safeSend(from, asYesNo(`Tengo libre ${fmtES(exact)}. ¿Confirmo el cambio de cita?`, session.pending.ctxId))
+              return
+            }
+            if (suggestion) {
+              session.pending={ action:"edit", ctxId: makeCtxId(), bookingId: session.editBookingId, startEU: suggestion, staffId: okStaff, durationMin: durMin }
+              await safeSend(from, asYesNo(`No tengo ese hueco exacto. Te propongo ${fmtES(suggestion)}. ¿Te viene bien?`, session.pending.ctxId))
+              return
+            }
+            await safeSend(from,{ text:"Ese día lo tengo completo. Dime otra hora o día y te digo." })
+          }catch(e){ console.error("prepare edit:", e?.message||e) }
           return
         }
 
         // RESERVAR flujo
         const when = parseDateTimeES(extra.datetime_text || text)
         let serviceInfo = session.service
-        if (extra.service_text || /mani(cura|cure)/i.test(text) || /uñas/i.test(text)) {
+        if (extra.service_text || /mani(cura|cure)/i.test(text) || /uñas|unias/i.test(text)) {
           serviceInfo = await matchServiceOrClosest(extra.service_text || text)
           session.service = serviceInfo
         }
@@ -444,13 +463,11 @@ async function startBot(){
     })
 
     // === Handlers botones
-    async function onConfirmYes({ sock, from, phone, session, safeSend }){
+    async function onConfirmYes({ from, phone, session, safeSend }){
       try{
         const p = session.pending; if(!p) return
         if (p.action==="cancel") {
-          // cancelar de verdad
           try{
-            // get version y cancel
             const get = await square.bookingsApi.retrieveBooking(p.bookingId)
             const version = get?.result?.booking?.version
             if (version!==undefined) {
@@ -462,17 +479,18 @@ async function startBot(){
         if (p.action==="edit") {
           try{
             const get = await square.bookingsApi.retrieveBooking(p.bookingId)
-            const version = get?.result?.booking?.version
-            const seg = get?.result?.booking?.appointmentSegments?.[0]
+            const booking = get?.result?.booking
+            const version = booking?.version
+            const seg = booking?.appointmentSegments?.[0]
             const serviceVarId = seg?.serviceVariationId
             const servVersion = await getServiceVariationVersion(serviceVarId)
             const body = {
-              idempotencyKey: stableKey({loc:LOCATION_ID, sv:serviceVarId, st:p.startEU.tz("UTC").toISOString(), cust:get?.result?.booking?.customerId||"c", tm:p.staffId||"any"}),
+              idempotencyKey: stableKey({loc:LOCATION_ID, sv:serviceVarId, st:p.startEU.tz("UTC").toISOString(), cust:booking?.customerId||"c", tm:p.staffId||seg?.teamMemberId||"any"}),
               booking:{
                 id:p.bookingId,
                 version,
                 locationId: LOCATION_ID,
-                customerId: get?.result?.booking?.customerId,
+                customerId: booking?.customerId,
                 startAt: p.startEU.tz("UTC").toISOString(),
                 appointmentSegments:[
                   {
@@ -524,7 +542,7 @@ async function startBot(){
         }
       } finally { session.pending=null; session.mode=null }
     }
-    async function onConfirmNo({ sock, from, phone, session, safeSend }){
+    async function onConfirmNo({ from, session, safeSend }){
       try{
         const p=session.pending; if(!p) return
         if (p.action==="cancel") await safeSend(from,{ text:"Vale, no cancelo. Si quieres, dime otra cosa." })
