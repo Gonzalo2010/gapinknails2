@@ -1,21 +1,44 @@
 {
-  "name": "gapink-bot",
+  "name": "gapink-nails-bot",
   "version": "1.0.0",
+  "description": "Bot de WhatsApp para reservas de Gapink Nails con IA",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "reservas",
+    "nails",
+    "deepseek",
+    "square"
+  ],
+  "author": "Gonzalo",
+  "license": "MIT",
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.8",
+    "@whiskeysockets/baileys": "^6.7.5",
     "better-sqlite3": "^9.4.3",
-    "dayjs": "^1.11.13",
-    "dotenv": "^16.3.1",
-    "express": "^4.19.2",
-    "openai": "^4.0.0",
-    "pino": "^8.14.1",
+    "dayjs": "^1.11.10",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "pino": "^8.19.0",
     "qrcode": "^1.5.3",
     "qrcode-terminal": "^0.12.0",
-    "square": "^38.1.0"
-  }
+    "square": "^35.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tu-usuario/gapink-nails-bot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tu-usuario/gapink-nails-bot/issues"
+  },
+  "homepage": "https://github.com/tu-usuario/gapink-nails-bot#readme"
 }
