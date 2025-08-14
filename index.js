@@ -7,8 +7,9 @@
 // FIXES:
 //  - Acepta SQ_FORCE_SERVICE_ID como fallback de servicio
 //  - Autodescubre team_member_id si no se define SQ_TEAM_IDS
-//  - Logs detallados de errores Square (para depurar por qué no “entra”)
-//  - Aviso: en SANDBOX no hay SMS reales; en producción activa Communications
+//  - Maneja INVALID_EMAIL_ADDRESS: pide nombre/email válidos y vuelve a intentar
+//  - Validador local de email para evitar 400 de Square
+//  - Logs detallados de errores Square
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -37,7 +38,7 @@ const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 const SERVICES = { "uñas acrílicas": 90 }
-// Acepta dos nombres de variable para el mismo servicio (evita “no entra a Square” por ID vacío)
+// Fallback ID de servicio
 const SERVICE_VARIATIONS = {
   "uñas acrílicas": process.env.SQ_SV_UNAS_ACRILICAS || process.env.SQ_FORCE_SERVICE_ID || ""
 }
@@ -102,6 +103,9 @@ const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const YES_RE = /\b(si|sí|ok|vale|confirmo|confirmar|de acuerdo|perfecto)\b/i
 const NO_RE  = /\b(no|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde|anula|cancela)\b/i
 const RESCH_RE = /\b(cambia|cambiar|modifica|mover|reprograma|reprogramar|edita|mejor)\b/i
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i
+const isValidEmail = (e) => !!(e && EMAIL_RE.test(String(e).trim()))
+
 function normalizePhoneES(raw){const d=onlyDigits(raw);if(!d)return null;if(raw.startsWith("+")&&d.length>=8&&d.length<=15)return`+${d}`;if(d.startsWith("34")&&d.length===11)return`+${d}`;if(d.length===9)return`+34${d}`;if(d.startsWith("00"))return`+${d.slice(2)}`;return`+${d}`}
 function detectServiceFree(text=""){const low=rmDiacritics(text.toLowerCase());const map={"unas acrilicas":"uñas acrílicas","uñas acrilicas":"uñas acrílicas","uñas acrílicas":"uñas acrílicas"};for(const k of Object.keys(map))if(low.includes(rmDiacritics(k)))return map[k];for(const k of Object.keys(SERVICES))if(low.includes(rmDiacritics(k)))return k;return null}
 function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
@@ -110,7 +114,7 @@ const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=[
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
 // ===== Square
-const square = new Client({ accessToken: process.env.SQUARE_ACCESS_TOKEN, environment: process.env.SQUARE_ENV==="production"?Environment.Production:Environment.Sandbox })
+const square = new Client({ accessToken: process.env.SQUARE_ACCESS_TOKEN, environment: (process.env.SQUARE_ENV||"sandbox").toLowerCase()==="production"?Environment.Production:Environment.Sandbox })
 const locationId = process.env.SQUARE_LOCATION_ID
 let LOCATION_TZ = EURO_TZ
 
@@ -147,11 +151,7 @@ async function squareCheckCredentials(){
 
 async function discoverTeamMembers() {
   try{
-    // bookable_only + location para asegurarnos que sirven para reservas
-    const r = await square.bookingsApi.listTeamMemberBookingProfiles({
-      bookableOnly: true,
-      locationId: locationId
-    })
+    const r = await square.bookingsApi.listTeamMemberBookingProfiles(undefined, undefined, undefined, locationId)
     const list = r?.result?.teamMemberBookingProfiles || []
     const ids = list.filter(x=>x?.isBookable!==false && x?.teamMemberId).map(x=>x.teamMemberId)
     if (!ids.length) console.error("⚠️ No hay team members bookables en esta location.")
@@ -170,6 +170,7 @@ async function squareFindCustomerByPhone(phoneRaw){
     return (resp?.result?.customers||[])[0]||null
   }catch(e){ console.error("Square search:", prettyApiError(e)); return null }
 }
+// >>> Cambiado: devolvemos {customer, error} para saber si fue INVALID_EMAIL_ADDRESS
 async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){
   try{
     const phone=normalizePhoneES(phoneNumber)
@@ -178,8 +179,17 @@ async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){
       givenName,emailAddress,phoneNumber:phone||undefined,
       note:"Creado desde bot WhatsApp Gapink Nails"
     })
-    return resp?.result?.customer||null
-  }catch(e){ console.error("Square create:", prettyApiError(e)); return null }
+    return { customer: resp?.result?.customer || null, error: null }
+  }catch(e){
+    let code = null
+    if (e instanceof ApiError) {
+      const errs = e.result?.errors || []
+      const invalidEmail = errs.find(x => (x.code||"").toUpperCase()==="INVALID_EMAIL_ADDRESS")
+      if (invalidEmail) code = "INVALID_EMAIL_ADDRESS"
+    }
+    console.error("Square create:", prettyApiError(e))
+    return { customer: null, error: code || "OTHER" }
+  }
 }
 async function getServiceVariationVersion(id){
   try{
@@ -208,13 +218,11 @@ async function createSquareBooking({startEU,serviceKey,customerId,teamMemberId})
         locationId,
         startAt:startISO,
         customerId,
-        // Si quieres mostrar una nota en Square:
-        // customerNote: "Reserva creada por WhatsApp Bot",
         appointmentSegments:[{
           teamMemberId,
           serviceVariationId,
           serviceVariationVersion:Number(version),
-          durationMinutes:SERVICES[serviceKey] // seller-level: RW
+          durationMinutes:SERVICES[serviceKey]
         }]
       }
     }
@@ -308,7 +316,7 @@ function saveSession(phone,data){
   upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
 }
 
-// ===== Disponibilidad (usa solo DB local; Square puede rechazar por solape si hay citas externas)
+// ===== Disponibilidad
 function getBookedIntervals(fromIso,toIso){
   const rows=db.prepare(`SELECT start_iso,end_iso,staff_id FROM appointments WHERE status IN ('pending','confirmed') AND start_iso < @to AND end_iso > @from`).all({from:fromIso,to:toIso})
   return rows.map(r=>({start:dayjs(r.start_iso),end:dayjs(r.end_iso),staff_id:r.staff_id}))
@@ -398,7 +406,7 @@ async function startBot(){
           editBookingId:null
         }
 
-        // IA: extracción (confirmación NO se fía de la IA)
+        // IA: extracción
         const extra=await extractFromText(textRaw)
         const incomingService = extra.service || detectServiceFree(textRaw)
         const incomingDt = extra.datetime_text || null
@@ -429,7 +437,7 @@ async function startBot(){
         data.lastService = data.service || data.lastService
 
         if (!data.name && extra.name) data.name = extra.name
-        if (!data.email && extra.email) data.email = extra.email
+        if (extra.email) data.email = extra.email  // siempre actualiza si viene email nuevo
 
         // Confirmación basada SOLO en el mensaje actual
         const userSaysYes = YES_RE.test(textRaw)
@@ -478,15 +486,17 @@ async function startBot(){
           return
         }
 
-        // Falta nombre/email tras “sí” (solo altas)
-        if (userSaysYes && (!data.name || !data.email) && !data.editBookingId) {
-          saveSession(phone, data)
-          await __SAFE_SEND__(from,{ text:"Para cerrar, dime tu nombre y email (ej: “Ana Pérez, ana@correo.com”)." })
-          return
+        // Falta nombre/email tras “sí” (solo altas) o email inválido
+        if (userSaysYes && !data.editBookingId) {
+          if (!data.name || !isValidEmail(data.email)) {
+            data.confirmAsked = true; saveSession(phone, data)
+            await __SAFE_SEND__(from,{ text:`Para cerrar, necesito tu nombre y un email válido.\nEjemplo: "Ana Pérez, ana@correo.com". Luego responde "confirmo".` })
+            return
+          }
         }
         if (userSaysYes && data.service && data.startEU) {
           if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
-          else if (data.name && data.email) await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
+          else if (data.name && isValidEmail(data.email)) await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
           return
         }
 
@@ -494,7 +504,10 @@ async function startBot(){
         const missing=[]
         if(!data.service) missing.push("servicio")
         if(!data.startEU) missing.push(data.editBookingId?"nueva fecha y hora":"día y hora")
-        if(!data.editBookingId && (!data.name||!data.email)) missing.push("nombre y email (si eres nuevo)")
+        if(!data.editBookingId){
+          if(!data.name) missing.push("nombre")
+          if(!isValidEmail(data.email)) missing.push("email válido")
+        }
         const prompt=`Contexto:
 - Modo: ${data.editBookingId?"edición":"alta"}
 - Servicio: ${data.service||"?"}
@@ -515,7 +528,7 @@ Mensaje del cliente: "${textRaw}"`
   }catch(e){ console.error("startBot error:", e?.message||e) }
 }
 
-// ===== Alta (silenciosa ante errores)
+// ===== Alta (maneja email inválido)
 async function finalizeBooking({ from, phone, data, safeSend }) {
   try {
     if (data.bookingInFlight) return
@@ -523,10 +536,28 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
 
     let customer = await squareFindCustomerByPhone(phone)
     if (!customer) {
-      if (!data.name || !data.email) { data.bookingInFlight=false; saveSession(phone,data); return }
-      customer = await squareCreateCustomer({ givenName: data.name, emailAddress: data.email, phoneNumber: phone })
+      // No existe en Square -> necesitamos nombre + email válido
+      if (!data.name || !isValidEmail(data.email)) {
+        data.bookingInFlight=false; data.confirmAsked = true; saveSession(phone,data)
+        await safeSend(from,{ text:`Necesito tu nombre y un email válido para crear tu ficha y cerrar la cita.\nEjemplo: "Ana Pérez, ana@correo.com". Luego responde "confirmo".` })
+        return
+      }
+      const { customer: created, error } = await squareCreateCustomer({
+        givenName: data.name, emailAddress: data.email, phoneNumber: phone
+      })
+      if (!created) {
+        if (error === "INVALID_EMAIL_ADDRESS") {
+          // Square detectó email inválido aunque pasara nuestro regex
+          data.email = null
+          data.bookingInFlight=false; data.confirmAsked = true; saveSession(phone,data)
+          await safeSend(from,{ text:`El correo que me diste no es válido. Pásame uno correcto (ej.: nombre@dominio.com) y luego responde "confirmo".` })
+          return
+        }
+        // Otro error: no molestamos al cliente
+        data.bookingInFlight=false; saveSession(phone,data); return
+      }
+      customer = created
     }
-    if (!customer) { data.bookingInFlight=false; saveSession(phone,data); return }
 
     const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
     if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
@@ -571,7 +602,7 @@ Pago en persona.` })
   finally { data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
 
-// ===== Edición (silenciosa ante errores)
+// ===== Edición
 async function finalizeReschedule({ from, phone, data, safeSend }) {
   try{
     if (data.bookingInFlight) return
