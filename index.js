@@ -4,6 +4,7 @@
 // Confirmación SOLO si el mensaje ACTUAL contiene “sí/confirmo/ok/vale”
 // Persistencia de hora en ms (sin UTC shift) + validaciones
 // Disponibilidad forward-first + cancelar/editar reales en Square
+// Cancel/busca citas con teléfono flexible (solo dígitos) y/o fecha objetivo
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -96,7 +97,7 @@ function normalizePhoneES(raw){const d=onlyDigits(raw);if(!d)return null;if(raw.
 function detectServiceFree(text=""){const low=rmDiacritics(text.toLowerCase());const map={"unas acrilicas":"uñas acrílicas","uñas acrilicas":"uñas acrílicas","uñas acrílicas":"uñas acrílicas"};for(const k of Object.keys(map))if(low.includes(rmDiacritics(k)))return map[k];for(const k of Object.keys(SERVICES))if(low.includes(rmDiacritics(k)))return k;return null}
 function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
-// Redondeo a slot (ceil) — ¡SOLO UNA DEFINICIÓN!
+// Redondeo a slot (ceil) — definición única
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
 // ===== Square
@@ -109,16 +110,13 @@ async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){try{co
 async function getServiceVariationVersion(id){try{const resp=await square.catalogApi.retrieveCatalogObject(id,true);return resp?.result?.object?.version}catch(e){console.error("getServiceVariationVersion:",e?.message||e);return undefined}}
 function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`;return createHash("sha256").update(raw).digest("hex").slice(0,48)}
 
-// === FIX: cancelar con body { idempotencyKey, bookingVersion }
+// Cancel con body { idempotencyKey, bookingVersion }
 async function cancelSquareBooking(bookingId){
   try{
     const get = await square.bookingsApi.retrieveBooking(bookingId)
     const version = get?.result?.booking?.version
     if (version === undefined || version === null) return false
-    const body = {
-      idempotencyKey: `cancel_${bookingId}_${version}_${Date.now()}`,
-      bookingVersion: Number(version)
-    }
+    const body = { idempotencyKey: `cancel_${bookingId}_${version}_${Date.now()}`, bookingVersion: Number(version) }
     const r = await square.bookingsApi.cancelBooking(bookingId, body)
     return !!r?.result?.booking?.id
   }catch(e){ console.error("cancelSquareBooking:", e?.message||e); return false }
@@ -176,9 +174,9 @@ const upsertSession=db.prepare(`INSERT INTO sessions (phone, data_json, updated_
 VALUES (@phone, @data_json, @updated_at)
 ON CONFLICT(phone) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at`)
 const clearSession=db.prepare(`DELETE FROM sessions WHERE phone=@phone`)
-const getUpcomingByPhone=db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso ASC LIMIT 1`)
+const listUpcomingStmt=db.prepare(`SELECT * FROM appointments WHERE status='confirmed' AND start_iso > @now ORDER BY start_iso ASC`)
 
-// Persistimos MILLISECONDS locales para evitar desplazamientos TZ
+// Persistimos MILLISECONDS locales
 function loadSession(phone){
   const row=getSessionRow.get({phone}); if(!row?.data_json) return null
   const raw=JSON.parse(row.data_json); const data={...raw}
@@ -188,6 +186,31 @@ function loadSession(phone){
 function saveSession(phone,data){
   const s={...data}; s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null; delete s.startEU
   upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
+}
+
+// ===== Finder flexible (tel y/o fecha objetivo)
+function findUpcomingForPhone(phone, targetEU=null){
+  try{
+    const nowIso = dayjs().utc().toISOString()
+    const rows = listUpcomingStmt.all({ now: nowIso })
+    const d = onlyDigits(phone||"")
+    const last9 = d.slice(-9)
+    const cands = rows.filter(r=>{
+      const rd = onlyDigits(r.customer_phone||"")
+      return rd===d || rd.slice(-9)===last9 || last9===rd || rd.endsWith(last9)
+    })
+    if (!cands.length) return null
+    if (targetEU){
+      const dayStart = targetEU.clone().startOf("day").tz("UTC").toISOString()
+      const dayEnd   = targetEU.clone().endOf("day").tz("UTC").toISOString()
+      const sameDay = cands.filter(r => r.start_iso >= dayStart && r.start_iso <= dayEnd)
+      if (sameDay.length){
+        sameDay.sort((a,b)=>Math.abs(dayjs(a.start_iso).diff(targetEU)) - Math.abs(dayjs(b.start_iso).diff(targetEU)))
+        return sameDay[0]
+      }
+    }
+    return cands[0] // la más próxima
+  }catch(e){ console.error("findUpcomingForPhone:", e?.message||e); return null }
 }
 
 // ===== Disponibilidad
@@ -208,46 +231,23 @@ function suggestOrExact(startEU,durationMin,preferredStaffId=null){
   const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
   const from=now.tz("UTC").toISOString(), to=now.add(14,"day").tz("UTC").toISOString()
   const intervals=getBookedIntervals(from,to)
-
-  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
-  const dayEnd  =startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
-
-  let req = startEU.clone()
-  if (req.isBefore(dayStart)) req = dayStart
-  if (req.isAfter(dayEnd))    req = dayEnd
-
-  const dow=req.day()===0?7:req.day()
-  const endEU=req.clone().add(dimension=durationMin,"minute") // <- typo guard below
-  // fix typo if someone lint-minifies this file:
-  // eslint-disable-next-line no-unused-vars
-  if(false){console.log(endEU)}
-
-  const endEU2 = req.clone().add(durationMin,"minute")
-  const insideHours=req.hour()>=OPEN_HOUR && (endEU2.hour()<CLOSE_HOUR || (endEU2.hour()===CLOSE_HOUR && endEU2.minute()===0))
-  if (dow===7 || !WORK_DAYS.includes(dow) || !insideHours) return { exact:null, suggestion:null, staffId:null }
-
+  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0), dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
+  let req=startEU.clone(); if(req.isBefore(dayStart)) req=dayStart; if(req.isAfter(dayEnd)) req=dayEnd
+  const dow=req.day()===0?7:req.day(); const endEU=req.clone().add(durationMin,"minute")
+  const insideHours=req.hour()>=OPEN_HOUR && (endEU.hour()<CLOSE_HOUR || (endEU.hour()===CLOSE_HOUR && endEU.minute()===0))
+  if (dow===7||!WORK_DAYS.includes(dow)||!insideHours) return { exact:null, suggestion:null, staffId:null }
   const scanStart = ceilToSlotEU(req.isBefore(now)? now.clone(): req.clone())
-
-  // exact
   const exactId = findFreeStaff(intervals, scanStart.tz("UTC"), scanStart.clone().add(durationMin,"minute").tz("UTC"), preferredStaffId)
   if (exactId && scanStart.valueOf()===startEU.valueOf()) return { exact: scanStart, suggestion:null, staffId: exactId }
-
-  // hacia delante
-  for (let t = scanStart.clone(); !t.isAfter(dayEnd); t = t.add(SLOT_MIN,"minute")) {
-    const e = t.clone().add(durationMin,"minute")
-    if (t.isBefore(now)) continue
+  for (let t=scanStart.clone(); !t.isAfter(dayEnd); t=t.add(SLOT_MIN,"minute")) {
+    const e=t.clone().add(durationMin,"minute"); if(t.isBefore(now)) continue
     if (t.isAfter(dayEnd) || e.isAfter(dayEnd)) break
-    const id = findFreeStaff(intervals, t.tz("UTC"), e.tz("UTC"), preferredStaffId)
-    if (id) return { exact:null, suggestion:t, staffId:id }
+    const id=findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"),preferredStaffId); if(id) return { exact:null, suggestion:t, staffId:id }
   }
-
-  // hacia atrás (si nada más tarde)
-  for (let t = ceilToSlotEU(startEU.clone()).subtract(SLOT_MIN,"minute"); !t.isBefore(dayStart); t = t.subtract(SLOT_MIN,"minute")) {
-    const e = t.clone().add(durationMin,"minute")
-    const id = findFreeStaff(intervals, t.tz("UTC"), e.tz("UTC"), preferredStaffId)
-    if (id) return { exact:null, suggestion:t, staffId:id }
+  for (let t=ceilToSlotEU(startEU.clone()).subtract(SLOT_MIN,"minute"); !t.isBefore(dayStart); t=t.subtract(SLOT_MIN,"minute")) {
+    const e=t.clone().add(durationMin,"minute"); const id=findFreeStaff(intervals,t.tz("UTC"),e.tz("UTC"),preferredStaffId)
+    if(id) return { exact:null, suggestion:t, staffId:id }
   }
-
   return { exact:null, suggestion:null, staffId:null }
 }
 
@@ -258,7 +258,7 @@ let lastQR=null,conectado=false
 app.get("/",(_req,res)=>{res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c} .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}</style><div class="card"><h1>Gapink Nails</h1><p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}<p><small>Desarrollado por Gonzalo</small></p></div>`)})
 app.get("/qr.png",async(_req,res)=>{if(!lastQR)return res.status(404).send("No hay QR");const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1});res.set("Content-Type","image/png").send(png)})
 
-// ===== Cola envío Baileys (con reintentos y backoff)
+// ===== Cola envío Baileys
 const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
 app.listen(PORT,async()=>{console.log(`🌐 Web en puerto ${PORT}`);await squareCheckCredentials();startBot().catch(console.error)})
 
@@ -303,14 +303,15 @@ async function startBot(){
         const extra=await extractFromText(textRaw)
         const incomingService = extra.service || detectServiceFree(textRaw)
         const incomingDt = extra.datetime_text || null
+        const parsedInMessage = parseDateTimeES(incomingDt ? incomingDt : textRaw)
 
         // Cancelación explícita
         if (extra.intent==="cancel" || /\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
-          const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
+          const upc = findUpcomingForPhone(phone, parsedInMessage || null)
           if (upc) {
             const ok = upc.square_booking_id ? await cancelSquareBooking(upc.square_booking_id) : true
             if (ok) { markCancelled.run({ id: upc.id }); clearSession.run({ phone }); await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` }) }
-            // si falla, silencioso
+            // si falla, silencioso (no enviamos error al cliente)
           } else {
             await __SAFE_SEND__(from,{ text:"No veo ninguna cita futura tuya. Si quieres, dime fecha y hora y te doy hueco." })
           }
@@ -319,7 +320,7 @@ async function startBot(){
 
         // ¿Pide reprogramar?
         if (extra.intent==="reschedule" || RESCH_RE.test(textRaw)) {
-          const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
+          const upc = findUpcomingForPhone(phone, parsedInMessage || null)
           if (upc) { data.editBookingId = upc.id; data.service = upc.service; data.durationMin = upc.duration_min; data.selectedStaffId = upc.staff_id }
         }
 
@@ -341,8 +342,7 @@ async function startBot(){
 
         // Fecha/hora
         if (incomingDt) data.lastUserDtText = incomingDt
-        const parsed = parseDateTimeES(incomingDt ? incomingDt : textRaw)
-        if (parsed) data.startEU = parsed
+        if (parsedInMessage) data.startEU = parsedInMessage
 
         if (data.service && !data.durationMin) data.durationMin = SERVICES[data.service] || 60
         saveSession(phone, data)
@@ -471,7 +471,7 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
     if (data.bookingInFlight) return
     data.bookingInFlight = true; saveSession(phone, data)
 
-    const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
+    const upc = findUpcomingForPhone(phone, null)
     if (!upc || upc.id !== data.editBookingId) { data.bookingInFlight=false; saveSession(phone,data); return }
 
     const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
