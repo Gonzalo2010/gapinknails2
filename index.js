@@ -1,17 +1,13 @@
-// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.2.3 “Torremolinos + La Luz”)
-// Requisitos: Node 20+, npm i express @whiskeysockets/baileys pino qrcode qrcode-terminal better-sqlite3 dayjs dotenv @square/square
+// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.3 “blindado Baileys”)
+// Requisitos: Node 20+, npm i express pino qrcode qrcode-terminal better-sqlite3 dayjs dotenv @square/square @whiskeysockets/baileys
 
 import express from "express"
-// --- Baileys: usar import global para cubrir distintas builds (ESM/CJS)
-import * as baileys from "@whiskeysockets/baileys"
-const makeWASocket = (baileys.default || baileys.makeWASocket)
-const { useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
-
 import pino from "pino"
 import qrcode from "qrcode"
 import qrcodeTerminal from "qrcode-terminal"
 import "dotenv/config"
 import fs from "fs"
+import { createRequire } from "module"
 import Database from "better-sqlite3"
 import dayjs from "dayjs"
 import utc from "dayjs/plugin/utc.js"
@@ -55,7 +51,7 @@ const LOCATION_NAMES = {
   [LOCATION_IDS.LA_LUZ]: "Málaga – La Luz"
 }
 
-// ============= Mensaje bienvenida (SIEMPRE primero)
+// ============= Mensaje bienvenida
 const WELCOME_TEXT =
 `Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.
 
@@ -70,7 +66,7 @@ Y si quieres modificarla puedes hacerlo a través del link del sms que llega con
 Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.
 Gracias 😘`
 
-// ============= OpenAI (para redacción amable y aclaraciones, sin inventar)
+// ============= OpenAI (redacción, nunca inventa precios/horarios)
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY
 const OPENAI_API_URL  = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
 const OPENAI_MODEL    = process.env.OPENAI_MODEL || "gpt-4o-mini"
@@ -88,8 +84,7 @@ async function aiChat(messages, temperature=0.25){
     return (j?.choices?.[0]?.message?.content||"").trim()
   }catch(e){ console.error("OpenAI:", e?.message||e); return "" }
 }
-
-const SYS_TONE = `Eres recepcionista WhatsApp de Gapink Nails (España). Responde breve, cálida y clara, sin emojis. No inventes jamás horarios ni precios. Si falta un dato clave (local o servicio), pregunta solo eso. Español.`
+const SYS_TONE = `Eres recepcionista WhatsApp de Gapink Nails (España). Responde breve, cálida y clara, sin emojis. No inventes horarios ni precios. Si falta local o servicio, pregunta SOLO eso. Español.`
 
 // ============= Helpers
 const rm = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
@@ -117,7 +112,7 @@ const insideBusinessHours=(d)=>{
 const ceilToSlot=(t)=>{
   const r=t.minute()%SLOT_MIN; return r? t.add(SLOT_MIN-r,"minute").second(0).millisecond(0) : t.second(0).millisecond(0)
 }
-const clampFuture=(t)=>ceilToSlot(EURO(t.isValid?t:dayjs(t)).add(NOW_MIN_OFFSET_MIN,"minute"))
+const clampFuture=(t)=>ceilToSlot(EURO(t?.isValid?t:dayjs(t)).add(NOW_MIN_OFFSET_MIN,"minute"))
 const normalizePhoneES=(raw)=>{
   const d=onlyDigits(raw||""); if(!d) return null
   if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
@@ -138,7 +133,7 @@ function detectLocationFromText(text){
   return null
 }
 
-// Catálogo (duraciones por defecto si no aparece aquí: 60)
+// Catálogo (duración por defecto si no listado: 60)
 const SERVICE = {
   MANICURA_CON_ESMALTE_NORMAL:{ name:"Manicura con esmalte normal", dur:30 },
   MANICURA_SEMIPERMANENTE:{ name:"Manicura semipermanente", dur:30 },
@@ -167,7 +162,6 @@ const SERVICE = {
 }
 const SVC_KEYS = Object.keys(SERVICE)
 const SERVICE_SYNONYMS = [
-  // uñas manos
   ["manicura semipermanente","MANICURA_SEMIPERMANENTE",["semi","esmaltado gel","gel color","permanente"]],
   ["manicura semipermanente quitar","MANICURA_SEMIPERMANENTE_QUITAR",["retirar semi","quitar gel","retirar gel"]],
   ["manicura rusa","MANICURA_RUSA_CON_NIVELACION",["russian","rusa nivelacion","rusa nivelación"]],
@@ -175,11 +169,9 @@ const SERVICE_SYNONYMS = [
   ["manicura nivelacion","MANICURA_SEMIPERMANETE_CON_NIVELACION",["nivelación","nivelacion"]],
   ["uñas nuevas","UNAS_NUEVAS_ESCULPIDAS",["acrílicas nuevas","acrilicas nuevas","esculpidas nuevas"]],
   ["relleno uñas","RELLENO_UNAS_ESCULPIDAS",["relleno acrílicas","relleno acrilicas","relleno esculpidas"]],
-  // pies
   ["pedicura semi","PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE",["semi pies","gel pies"]],
   ["pedicura normal","PEDICURA_SPA_CON_ESMALTE_NORMAL",["pedicura básica","pedicura basica"]],
   ["esmaltado semi pies","ESMALTADO_SEMIPERMANETE_PIES",["semi pies"]],
-  // cejas/pestañas
   ["hilo cejas","DEPILACION_CEJAS_CON_HILO",["threading","depilacion cejas hilo"]],
   ["diseño cejas henna","DISENO_DE_CEJAS_CON_HENNA_Y_DEPILACION",["diseño cejas","cejas henna"]],
   ["lifting pestañas tinte","LIFITNG_DE_PESTANAS_Y_TINTE",["lash lift","lifting pestañas"]],
@@ -189,7 +181,6 @@ const SERVICE_SYNONYMS = [
   ["relleno pelo a pelo","RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO",["relleno clásicas","relleno clasicas"]],
   ["relleno 2d","RELLENO_PESTANAS_2D",[]],
   ["relleno 3d","RELLENO_PESTANAS_3D",[]],
-  // facial
   ["hydra","LIMPIEZA_HYDRA_FACIAL",["hydrafacial","hydra facial"]],
   ["punta diamante","LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE",["diamond tip"]],
   ["microblading","MICROBLADING",[]],
@@ -199,10 +190,8 @@ const SERVICE_SYNONYMS = [
 function detectServiceKey(text){
   const low = rm(String(text||"").toLowerCase())
   for(const [label,key,extra] of SERVICE_SYNONYMS){
-    const tag=rm(label)
-    if(low.includes(tag) || (extra||[]).some(x=>low.includes(rm(x)))) return key
+    if(low.includes(rm(label)) || (extra||[]).some(x=>low.includes(rm(x)))) return key
   }
-  // Fuzzy tokens
   const toks = norm(low).split(/\s+/).filter(Boolean)
   let best=null,score=0
   for(const k of SVC_KEYS){
@@ -210,7 +199,6 @@ function detectServiceKey(text){
     const s = toks.filter(t=>words.includes(t)).length
     if(s>score){score=s; best=k}
   }
-  // Caso "manicura" genérica → default a semi
   if(!best && /\bmanicura\b/.test(low)) return "MANICURA_SEMIPERMANENTE"
   if(!best && /\bpedicura\b/.test(low)) return "PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE"
   return score>=1?best:null
@@ -221,7 +209,6 @@ const DOW = {lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,monday
 function parseDateTimeMulti(text){
   if(!text) return null
   const t=rm(String(text||"").toLowerCase())
-  // dd/mm(/yy)
   const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/)
   let base=null
   if(m){
@@ -248,7 +235,7 @@ function parseDateTimeMulti(text){
   return clampFuture(base.hour(h).minute(m2))
 }
 
-// ============= ENV servicios por local
+// ============= ENV: servicios por local
 function pickServiceEnvPair(serviceKey, locationId){
   const envName = (locationId===LOCATION_IDS.LA_LUZ) ? `SQ_SVC_luz_${serviceKey}` : `SQ_SVC_${serviceKey}`
   const raw = process.env[envName]
@@ -280,7 +267,6 @@ async function getServiceVariationVersion(id){
     return r?.result?.object?.version
   }catch(e){ console.error("catalog version:", e?.message||e); return undefined }
 }
-
 async function findOrCreateCustomer({ name, email, phone }){
   try{
     const phoneE164 = normalizePhoneES(phone)
@@ -288,7 +274,7 @@ async function findOrCreateCustomer({ name, email, phone }){
       const s = await square.customersApi.searchCustomers({ query:{ filter:{ phoneNumber:{ exact: phoneE164 } } } })
       const found=(s?.result?.customers||[])[0]; if(found) return found
     }
-  }catch(e){ /* ignore */ }
+  }catch(e){}
   try{
     const resp = await square.customersApi.createCustomer({
       idempotencyKey:`cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
@@ -300,7 +286,6 @@ async function findOrCreateCustomer({ name, email, phone }){
     return resp?.result?.customer||null
   }catch(e){ console.error("createCustomer:", e?.message||e); return null }
 }
-
 async function searchNextAvailability({ locationId, serviceKey, afterEU, preferredTeamId=null }){
   const pair = pickServiceEnvPair(serviceKey, locationId)
   if(!pair?.id) return null
@@ -333,7 +318,6 @@ async function searchNextAvailability({ locationId, serviceKey, afterEU, preferr
     return list[0] || null
   }catch(e){ console.error("searchAvailability:", e?.message||e); return null }
 }
-
 async function createBookingSquare({ locationId, customerId, serviceKey, startEU, teamMemberId }){
   const pair = pickServiceEnvPair(serviceKey, locationId)
   if(!pair?.id) return null
@@ -358,7 +342,6 @@ async function createBookingSquare({ locationId, customerId, serviceKey, startEU
     return r?.result?.booking || null
   }catch(e){ console.error("createBooking:", e?.message||e); return null }
 }
-
 async function cancelBookingSquare(bookingId){
   try{
     const g = await square.bookingsApi.retrieveBooking(bookingId)
@@ -411,22 +394,59 @@ function saveSession(phone,data){
 const app=express()
 const PORT=process.env.PORT||8080
 let lastQR=null, conectado=false
-app.get("/",(_req,res)=>res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#fff0f6} .c{background:#fff;padding:24px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.08);border-radius:16px}</style><div class="c"><h1>Gapink Nails</h1><p>${conectado?"✅ WhatsApp conectado":"❌ No conectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320"/>`:""}</div>`))
+app.get("/",(_req,res)=>res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#fff0f6} .c{background:#fff;padding:24px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.08)}</style><div class="c"><h1>Gapink Nails</h1><p>${conectado?"✅ WhatsApp conectado":"❌ No conectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320"/>`:""}</div>`))
 app.get("/qr.png",async(_req,res)=>{ if(!lastQR) return res.status(404).end(); const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1}); res.set("Content-Type","image/png").send(png) })
 app.listen(PORT,()=>startBot().catch(console.error))
+
+// ============= Cargador BAILEYS “blindado”
+async function loadBaileysModule(){
+  const require = createRequire(import.meta.url)
+  let mod = null
+  try { mod = require("@whiskeysockets/baileys") } catch {}
+  if(!mod){
+    try { mod = await import("@whiskeysockets/baileys") } catch {}
+  }
+  if(!mod) throw new Error("No se pudo cargar @whiskeysockets/baileys. Instálalo: npm i @whiskeysockets/baileys")
+  // Unificar formas de export
+  const pick = (...cands)=>cands.find(x=>typeof x==="function"||typeof x==="object")||null
+  const _default = (mod.default && (typeof mod.default==="function"||typeof mod.default==="object")) ? mod.default : null
+  const makeWASocket =
+    (typeof mod.makeWASocket==="function" && mod.makeWASocket) ||
+    (_default && typeof _default==="function" ? _default : null) ||
+    (_default && typeof _default.makeWASocket==="function" ? _default.makeWASocket : null)
+  const useMultiFileAuthState =
+    (typeof mod.useMultiFileAuthState==="function" && mod.useMultiFileAuthState) ||
+    (_default && typeof _default.useMultiFileAuthState==="function" ? _default.useMultiFileAuthState : null)
+  const fetchLatestBaileysVersion =
+    (typeof mod.fetchLatestBaileysVersion==="function" && mod.fetchLatestBaileysVersion) ||
+    (_default && typeof _default.fetchLatestBaileysVersion==="function" ? _default.fetchLatestBaileysVersion : null)
+  const Browsers =
+    (mod.Browsers) || (_default && _default.Browsers) || { macOS: (name="Desktop")=>["MacOS", name, "121.0.0"] }
+
+  if(typeof makeWASocket!=="function" || typeof useMultiFileAuthState!=="function"){
+    throw new Error("Baileys incompatible: no vienen makeWASocket/useMultiFileAuthState en los exports")
+  }
+  return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
+}
 
 // ============= WhatsApp bot
 const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
 async function startBot(){
   try{
-    if(typeof makeWASocket !== "function"){
-      console.error("Baileys: makeWASocket no es función. Revisa versión @whiskeysockets/baileys.");
-      return
-    }
+    const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileysModule()
+
     if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
-    const { version } = await fetchLatestBaileysVersion()
-    const sock = makeWASocket({ logger:pino({level:"silent"}), auth:state, version, browser:Browsers.macOS("Desktop"), printQRInTerminal:false })
+    const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]})) // fallback
+
+    const sock = makeWASocket({
+      logger:pino({level:"silent"}),
+      auth:state,
+      version,
+      browser: Browsers.macOS ? Browsers.macOS("Chrome") : ["MacOS","Chrome","121.0.0"],
+      printQRInTerminal:false,
+      syncFullHistory:false
+    })
 
     sock.ev.on("connection.update",({connection,qr})=>{
       if(qr){ lastQR=qr; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
@@ -446,14 +466,13 @@ async function startBot(){
       let s = loadSession(phone) || { welcomeSent:false, locationKey:null, serviceKey:null, startEU:null, durationMin:null, staffId:null, name:null, email:null, confirmPending:false }
       const low = rm(txt.toLowerCase())
 
-      // Bienvenida (siempre primero una única vez)
+      // Bienvenida (una sola vez)
       if(!s.welcomeSent){
         await sock.sendMessage(from,{ text: WELCOME_TEXT })
         s.welcomeSent = true; saveSession(phone,s)
-        // seguimos para procesar el propio mensaje del cliente
       }
 
-      // Horario de atención por WhatsApp (si está fuera, no seguimos para no “atender”)
+      // Fuera de horario de atención por WhatsApp => silencio (solo respondemos si preguntan “horario/abiertos”)
       const now=EURO(dayjs())
       const openNow = insideBusinessHours(now)
       if(!openNow){
@@ -463,7 +482,7 @@ async function startBot(){
         return
       }
 
-      // Rápido: cancelar
+      // Cancelar
       if(/\b(cancela(r|me|la)?|anula(r|me|la)?|borra(r|me|la)?|delete|cancel)\b/.test(low)){
         const upc = db.prepare(`SELECT * FROM appointments WHERE phone=@phone AND status='confirmed' AND start_iso>@now ORDER BY start_iso ASC LIMIT 1`).get({ phone, now: dayjs().utc().toISOString() })
         if(upc?.square_booking_id){
@@ -479,7 +498,7 @@ async function startBot(){
       const svcK = detectServiceKey(txt); if(svcK){ s.serviceKey=svcK; s.durationMin = SERVICE[svcK]?.dur ?? 60; saveSession(phone,s) }
       const dtPref = parseDateTimeMulti(txt)
 
-      // Si piden precios → IA sin inventar números
+      // Precios → IA sin inventar cantidades
       if(/\b(precio|cu[aá]nto|tarifa|vale|coste|costos?)\b/.test(low)){
         const svcName = s.serviceKey ? SERVICE[s.serviceKey].name : "el servicio que te interese"
         const msg = await aiChat([
@@ -490,13 +509,13 @@ async function startBot(){
         return
       }
 
-      // Si hay servicio pero falta local → pedirlo (no pedimos hora)
+      // Falta local
       if(s.serviceKey && !s.locationKey){
         await sock.sendMessage(from,{ text:`¿En qué salón te viene mejor, *Málaga – La Luz* o *Torremolinos*?` })
         return
       }
 
-      // Si hay dudas y hablan de uñas/pies genérico sin servicio → menú corto
+      // Genérico uñas/pies sin servicio
       if(!s.serviceKey && /\b(u[nñ]as|manicura|pedicura|pies|manos)\b/.test(low)){
         await sock.sendMessage(from,{ text:
 `¿Qué necesitas exactamente?
@@ -509,11 +528,11 @@ Dime una opción y te cojo la cita sin pedirte hora.` })
         return
       }
 
-      // Si ya hay servicio + local → buscar hueco y PROPONER (no pedir hora)
+      // Ya hay servicio + local → proponemos primer hueco
       if(s.serviceKey && s.locationKey){
         const locationId = LOCATION_IDS[s.locationKey]
         const pair = pickServiceEnvPair(s.serviceKey, locationId)
-        if(!pair?.id){ return } // si falta mapeo en .env, no respondemos “inventando”
+        if(!pair?.id){ return } // no inventar
 
         const seed = (dtPref && insideBusinessHours(dtPref)) ? dtPref : now
         const slot = await searchNextAvailability({ locationId, serviceKey: s.serviceKey, afterEU: seed, preferredTeamId: s.staffId||null })
@@ -530,7 +549,7 @@ Dime una opción y te cojo la cita sin pedirte hora.` })
         }
       }
 
-      // Confirmaciones
+      // Confirmación
       if(s.confirmPending && /\b(si|sí|vale|ok|okay|confirmo|dale|de acuerdo|perfecto)\b/.test(low)){
         if(!s.name){ await sock.sendMessage(from,{ text:`Para cerrar, dime tu *nombre y apellidos*.` }); return }
         if(!s.email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s.email)){ 
@@ -543,7 +562,6 @@ Dime una opción y te cojo la cita sin pedirte hora.` })
         const booking = await createBookingSquare({ locationId, customerId:cust.id, serviceKey:s.serviceKey, startEU:s.startEU, teamMemberId:s.staffId||undefined })
         if(!booking){ await sock.sendMessage(from,{ text:`Uy, justo han cogido ese hueco. Te busco el siguiente disponible y te lo propongo ahora.` }); s.confirmPending=false; saveSession(phone,s); return }
 
-        // Guardar
         apptInsert.run({
           id:`apt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,7)}`,
           phone, name:s.name, email:s.email,
@@ -566,7 +584,7 @@ Pago en persona.` })
         return
       }
 
-      // Captura pasiva de nombre/email si lo mandan sueltos
+      // Captura pasiva nombre/email
       if(!s.name && /^[a-zA-ZÁÉÍÓÚÜÑáéíóúüñ]+/.test(txt.trim()) && txt.trim().split(" ").length>=2){
         s.name = txt.trim(); saveSession(phone,s)
         await sock.sendMessage(from,{ text:`Gracias, ${s.name}. Dime el *local* (Málaga – La Luz o Torremolinos) y el *servicio* y te cojo la cita al primer hueco libre.` })
@@ -578,7 +596,7 @@ Pago en persona.` })
         return
       }
 
-      // Fallback ultraseguro (si la IA no está 100% segura, no inventa nada)
+      // Fallback IA (no inventa)
       const fb = await aiChat([
         { role:"system", content: SYS_TONE },
         { role:"user", content:`Mensaje del cliente: "${txt}". Si falta local o servicio, pide SOLO eso en una frase. No des horarios ni precios.` }
