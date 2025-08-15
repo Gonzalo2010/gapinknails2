@@ -1,11 +1,10 @@
-// index.js — Gapink Nails · Playamar (PROD, v cancel+earlier)
-// - Prioriza hora exacta + profesional pedido
-// - Si no hay exacto: misma fecha, priorizando ANTES que DESPUÉS
-// - Intento “mismo horario con otra” solo si no insististe ≥2 veces en la profesional
-// - Rellenar L-M-X solo si NO diste hora exacta
-// - Cancelación robusta (cancela/cancelarla/cancélame/anular/etc.)
-// - No re-ofrecer slots ya rechazados
-// - Alta de cliente paso a paso (nombre -> email válido) y pago en persona
+// index.js — Gapink Nails · PROD (v “hora exacta”, desviación limitada, web QR personalizada)
+// - Mini-web QR: muestra “Gonzalo García Aranda” con enlace a gonzalog.co
+// - Hora exacta: si pides 10:00, no salta a 18:00
+// - Si no hay con esa persona, intenta misma hora con otra (salvo insistencia >=2)
+// - Si no hay, busca misma fecha ±MAX_SAME_DAY_DEVIATION_MIN (por defecto 90) priorizando ANTES
+// - Si sigue sin haber, propone “misma hora otro día” (no insiste con horas lejanas)
+// - Cancelación robusta; alta cliente por pasos; pago en persona
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -34,10 +33,12 @@ const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
-// Steering (rellenar pronto) — solo cuando NO hay hora concreta en el mensaje
+// Steering (rellenar pronto solo si NO hay hora exacta en el mensaje)
 const STEER_ON = (process.env.BOT_STEER_BALANCE || "on").toLowerCase() === "on"
 const STEER_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
+// Desviación máxima el mismo día cuando el cliente ha pedido una hora exacta:
+const MAX_SAME_DAY_DEVIATION_MIN = Number(process.env.BOT_MAX_SAME_DAY_DEVIATION_MIN || 90)
 
 // ===== Utils texto
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
@@ -62,7 +63,7 @@ function normalizePhoneES(raw){
 }
 const isValidEmail=(e)=>/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim())
 
-// ===== Empleadas Playamar (.env)
+// ===== Empleadas (usar SOLO Playamar configuradas en .env)
 const EMPLOYEES = {
   rocio:     process.env.SQ_EMP_ROCIO     || "",
   cristina:  process.env.SQ_EMP_CRISTINA  || "",
@@ -339,6 +340,7 @@ function findExactSlot(startEU, durationMin, staffId=null){
   }
   return null
 }
+
 // Generador MISMO día (preferEarlier: alterna, empezando por antes)
 function* sameDayRing(startEU, preferEarlier=false){
   const base = ceilToSlotEU(startEU.clone())
@@ -348,13 +350,17 @@ function* sameDayRing(startEU, preferEarlier=false){
     else { yield base.clone().add(k*SLOT_MIN,"minute"); yield base.clone().subtract(k*SLOT_MIN,"minute") }
   }
 }
-function findNearestSameDay(startEU, durationMin, staffId=null, declined=[], preferEarlier=false) {
+// Busca misma fecha pero limitando desviación en minutos
+function findNearestSameDay(startEU, durationMin, staffId=null, declined=[], preferEarlier=false, maxDeviationMin=MAX_SAME_DAY_DEVIATION_MIN) {
   const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
   const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
   const from = dayStart.tz("UTC").toISOString()
   const to   = dayEnd.tz("UTC").toISOString()
   const intervals=getBookedIntervals(from,to)
+  const base = ceilToSlotEU(startEU.clone())
   for (const t of sameDayRing(startEU, preferEarlier)){
+    const diff = Math.abs(t.diff(base, "minute"))
+    if (diff > maxDeviationMin) break
     const e=t.clone().add(durationMin,"minute")
     if (t.isBefore(dayStart) || e.isAfter(dayEnd)) continue
     if (declined.includes(t.valueOf())) continue
@@ -405,7 +411,18 @@ function findEarliestAny(startEU, durationMin, daysWindow){
 const app=express()
 const PORT=process.env.PORT||8080
 let lastQR=null,conectado=false
-app.get("/",(_req,res)=>{res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c} .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}</style><div class="card"><h1>Gapink Nails</h1><p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}<p><small>Gonzalo García Aranda</small></p></div>`)})
+app.get("/",(_req,res)=>{res.send(`<!doctype html><meta charset="utf-8"><style>
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c}
+  .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}
+  a{color:#4a148c;text-decoration:underline;font-weight:600}
+</style>
+<div class="card">
+  <h1>Gapink Nails</h1>
+  <p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>
+  ${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}
+  <p><small><a href="https://gonzalog.co" target="_blank" rel="noopener noreferrer">Gonzalo García Aranda</a></small></p>
+</div>`)})
+
 app.get("/qr.png",async(_req,res)=>{if(!lastQR)return res.status(404).send("No hay QR");const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1});res.set("Content-Type","image/png").send(png)})
 
 const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
@@ -462,7 +479,7 @@ async function startBot(){
         const explicitTimeInMsg = TIME_RE.test(textRaw.toLowerCase())
         const preferEarlier = explicitTimeInMsg || /\b(antes|temprano|primera hora)\b/i.test(textNorm)
 
-        // ===== CANCELAR (ahora sí entiende todas las variantes)
+        // ===== CANCELAR
         if (CANCEL_RE.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
           if (upc) {
@@ -485,7 +502,7 @@ async function startBot(){
           }
         }
 
-        // ===== Pidiendo datos
+        // ===== Pedir datos
         if (data.mode==="await_name") {
           if (textRaw.length<3 || /\d/.test(textRaw)) { await __SAFE_SEND__(from,{text:"Dime tu nombre y apellidos tal cual quieres que aparezca."}); return }
           data.name = textRaw.trim(); data.mode="await_email"; saveSession(phone,data)
@@ -524,7 +541,7 @@ async function startBot(){
           data.startEU = parsed; data.confirmAsked=false; data.pendingOfferEU=null
         }
 
-        // ===== NO ⇒ marcar oferta rechazada y limpiar
+        // ===== NO ⇒ marcar oferta rechazada
         if (userSaysNo && data.pendingOfferEU) {
           data.declinedSlots.push(data.pendingOfferEU.valueOf())
           data.pendingOfferEU=null; data.confirmAsked=false
@@ -533,7 +550,7 @@ async function startBot(){
           return
         }
 
-        // ===== YES ⇒ si hay oferta pendiente, cerramos
+        // ===== YES ⇒ cerrar si hay oferta pendiente
         if (userSaysYes && data.pendingOfferEU && data.serviceEnvKey) {
           const existing = await squareFindCustomerByPhone(phone)
           if (!existing && (!data.name || !data.email)) {
@@ -556,45 +573,38 @@ async function startBot(){
         const declined = data.declinedSlots || []
         const isDeclined = (t)=> declined.includes(t.valueOf())
         const forceStaff = wantsStaff && data.staffInsistCount>=2
-        const hardTime   = explicitTimeInMsg || data.timeInsistCount>=1 // si diste hora, ya bloquea (evita saltos a 18:00)
+        const hardTime   = explicitTimeInMsg || data.timeInsistCount>=1
 
-        // 1) exacto con staff si lo pidió
+        // 1) Exacto con staff si lo pidió
         if (wantsStaff) offer = findExactSlot(data.startEU, duration, data.requestedStaffId)
-        // 2) exacto con cualquiera
-        if (!offer) offer = findExactSlot(data.startEU, duration, null)
+        // 2) Exacto con cualquiera (si no insistió >=2)
+        if (!offer && (!wantsStaff || !forceStaff)) {
+          const sameAny = findExactSlot(data.startEU, duration, null)
+          if (sameAny) offer = sameAny
+        }
 
-        // 3) si no hay exacto:
-        if (!offer) {
-          if (hardTime) {
-            // Hora bloqueada: primero MISMA HORA con otra (solo si no insistió 2 veces en la persona)
-            if (wantsStaff && !forceStaff) {
-              const sameTimeAny = findExactSlot(data.startEU, duration, null)
-              if (sameTimeAny && !isDeclined(sameTimeAny.time)) offer = sameTimeAny
-            }
-            // Si sigue sin haber, buscamos LA MÁS CERCANA MISMO DÍA (prioriza ANTES)
-            if (!offer) {
-              const nearSameDay = findNearestSameDay(
-                data.startEU, duration,
-                forceStaff ? data.requestedStaffId : (wantsStaff ? data.requestedStaffId : null),
-                declined, true /* preferEarlier */
-              )
-              if (nearSameDay) offer = nearSameDay
-            }
-          } else {
-            // Hora no bloqueada: 1 alternativa priorizando L-M-X si no hay hora concreta
-            const any = (STEER_ON ? findEarliestAny(data.startEU, duration, STEER_WINDOW_DAYS) : null)
-                      || findNearestSameDay(data.startEU, duration, wantsStaff?data.requestedStaffId:null, declined, preferEarlier)
-                      || findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
-            if (any) offer = any
-          }
+        // 3) Si no hay exacto y pidió hora exacta => buscar solo ±MAX_SAME_DAY_DEVIATION_MIN
+        if (!offer && hardTime) {
+          const near = findNearestSameDay(
+            data.startEU, duration,
+            forceStaff ? data.requestedStaffId : (wantsStaff ? data.requestedStaffId : null),
+            declined, true /* preferEarlier */,
+            MAX_SAME_DAY_DEVIATION_MIN
+          )
+          if (near && !isDeclined(near.time)) offer = near
+        }
+
+        // 4) Si no hay hora exacta en el mensaje, se permite “rellenar” temprano L-M-X
+        if (!offer && !hardTime) {
+          offer = (STEER_ON ? findEarliestAny(data.startEU, duration, STEER_WINDOW_DAYS) : null)
+               || findNearestSameDay(data.startEU, duration, wantsStaff?data.requestedStaffId:null, declined, preferEarlier)
+               || findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
         }
 
         if (!offer) {
           data.confirmAsked=false; saveSession(phone,data)
-          if (hardTime && wantsStaff) {
-            await __SAFE_SEND__(from,{ text:`Con ${displayStaff(data.requestedStaffId)} a esa hora no veo hueco. Dime otra hora ese mismo día o, si quieres, te miro la misma hora con otra compañera.` })
-          } else if (hardTime) {
-            await __SAFE_SEND__(from,{ text:`A esa hora exacta no veo hueco. Dime otra hora ese mismo día y te ofrezco la más cercana (intento primero antes que después).` })
+          if (hardTime) {
+            await __SAFE_SEND__(from,{ text:`A esa hora el ${fmtES(data.startEU).split(" ")[0]} no veo hueco. ¿Te miro **esa misma hora** otro día?` })
           } else {
             await __SAFE_SEND__(from,{ text:"Ahora mismo no veo huecos en esa franja. Dime otra hora o día y te digo." })
           }
