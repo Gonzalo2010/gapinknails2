@@ -1,9 +1,14 @@
-// index.js — Gapink Nails · PROD (v2 “hora exacta blindada”)
-// - Ancla hora pedida: mismo día ± BOT_MAX_SAME_DAY_DEVIATION_MIN (prioriza antes)
-// - Respeta “con {empleada}” si insistes (>=2 veces)
-// - Reoferta sin ser pesado (misma hora otro día / otra compañera)
-// - Alta cliente por pasos; cancelación robusta; pago en persona
-// - Mini-web QR: muestra “Gonzalo García Aranda” con enlace a gonzalog.co
+// index.js — Gapink Nails · PROD (v3 “ancla de fecha + hora exacta sí o sí”)
+// Cambios clave vs v2:
+// - ANCLA DE FECHA: si dices “18/08 a las 10 con Cristina” y luego “no, a las 10”,
+//   mantiene el 18/08 como fecha. No salta a hoy ni a otros días salvo que lo pidas.
+// - MISMO DÍA ESTRICTO: con fecha explícita, sólo busca ese día (±desviación configurable).
+//   Si no hay, te pregunta “¿miro otro día u otra compañera?” sin ser pesado.
+// - RESPETO DE PROFESIONAL: si pides con Cristina y lo repites, se “bloquea” Cristina.
+// - CANCELACIÓN real (palabras tipo “cancela”, “anular”, etc.):
+//   cancela y NO ofrece nada más en ese turno salvo que tú lo pidas.
+// - Reofertas sensatas y confirmación humana. Pago SIEMPRE en persona.
+// - Mini-web QR pone “Gonzalo García Aranda” enlazado a gonzalog.co
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -32,27 +37,25 @@ const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
-// Steering para rellenar antes la semana (solo si el cliente NO pidió hora exacta)
+// “Rellenar semana” solo cuando NO hay hora exacta pedida
 const STEER_ON = (process.env.BOT_STEER_BALANCE || "on").toLowerCase() === "on"
 const STEER_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
-// Desviación máxima el mismo día cuando el cliente ha pedido hora exacta:
+// Desviación máxima el mismo día si el cliente pide hora concreta:
 const MAX_SAME_DAY_DEVIATION_MIN = Number(process.env.BOT_MAX_SAME_DAY_DEVIATION_MIN || 90)
-// Umbral de “sí” seguro (si la oferta difiere mucho de lo insistido, pedir confirmación explícita):
+// Umbral de “sí” seguro si el cliente insiste en una hora:
 const STRICT_YES_DEVIATION_MIN = Number(process.env.BOT_STRICT_YES_DEVIATION_MIN || 60)
 
-// ===== Utils texto
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
 const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = (s="") => rmDiacritics(String(s).toLowerCase()).replace(/[^a-z0-9]+/g," ").trim()
-const STOP = new Set("de del la el los las un una unos unas y o u a al con por para en me mi su sus quiero quisiera querria hazme hacerme ponme dame porfa por favor hola buenas tardes buenos dias noches necesito reservar cita hora con que tal am pm por la manana por la mañana temprano antes primero".split(" "))
+const STOP = new Set("de del la el los las un una unos unas y o u a al con por para en me mi su sus quiero quisiera querria hazme hacerme ponme dame porfa por favor hola buenas tardes buenos dias noches necesito reservar cita hora con que tal am pm por la manana por la mañana temprano antes primero siguiente otro otra cualquier cuando sea".split(" "))
 function tokenize(s){ return norm(s).split(/\s+/).filter(w=>w && w.length>1 && !STOP.has(w)) }
-const TIME_RE=/\b(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/i
 
 const YES_RE = /\b(s[ií]|ok|okay|okey+|vale+|va|venga|dale|confirmo|confirmar|de acuerdo|perfecto|genial|si porfa|sí porfa)\b/i
-const NO_RE  = /\b(no+|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde|anula|cancela|cancelemos)\b/i
+const NO_RE  = /\b(no+|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde|anula|cancela|cancelemos|quitar cita)\b/i
 const RESCH_RE = /\b(cambia|cambiar|modifica|mover|reprograma|reprogramar|edita)\b/i
-const CANCEL_RE = /\b(cancela(?:r|me|la)?|anula(?:r|me|la)?|elimina(?:r|me|la)?|borra(?:r|me|la)?|quitar(?:la)?|anulaci[oó]n)\b/i
+const CANCEL_RE = /\b(cancela(?:r|me|la)?|anula(?:r|me|la)?|elimina(?:r|me|la)?|borra(?:r|me|la)?|quitar(?: la)? cita|anulaci[oó]n)\b/i
 
 function normalizePhoneES(raw){
   const d=onlyDigits(raw); if(!d) return null
@@ -65,7 +68,7 @@ function normalizePhoneES(raw){
 const isValidEmail=(e)=>/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim())
 const minutesApart=(a,b)=>Math.abs(a.diff(b,"minute"))
 
-// ===== Empleadas (solo Playamar desde .env)
+// ===== Empleadas — SOLO Playamar (desde .env)
 const EMPLOYEES = {
   rocio:     process.env.SQ_EMP_ROCIO     || "",
   cristina:  process.env.SQ_EMP_CRISTINA  || "",
@@ -131,7 +134,7 @@ function loadServiceCatalogFromEnv(){
 }
 const SERVICE_CATALOG = loadServiceCatalogFromEnv()
 
-// Alias libres útiles
+// Alias frecuentes
 const SERVICE_ALIASES = {
   "depilacion de cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilacion cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
@@ -139,7 +142,6 @@ const SERVICE_ALIASES = {
   "depilacion con hilo cejas":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilacion cejas":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
-
   "depilacion labio con hilo":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
   "manicura semipermanente":"SQ_SVC_MANICURA_SEMIPERMANENTE",
   "manicura rusa":"SQ_SVC_MANICURA_RUSA_CON_NIVELACION",
@@ -153,7 +155,6 @@ const SERVICE_ALIASES = {
   "fotodepilacion axilas":"SQ_SVC_FOTODEPILACION_AXILAS",
   "fotodepilacion facial":"SQ_SVC_FOTODEPILACION_FACIAL_COMPLETO",
 }
-
 function resolveServiceFromText(userText){
   const n = norm(userText)
   for (const [k, envKey] of Object.entries(SERVICE_ALIASES)){
@@ -194,42 +195,44 @@ const DURATION_MIN = {
 }
 const getDuration=(envKey)=>DURATION_MIN[envKey] ?? 60
 
-// ===== Fecha/hora ES
-function parseDateTimeES(dtText){
-  if(!dtText) return null
-  const t=rmDiacritics(dtText.toLowerCase())
-  let base=null
+// ===== Fecha/hora: ANCLA DE FECHA + det. hora
+const M_MAP={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12}
+const WD_MAP={domingo:0,lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,sabado:6,sábado:6}
+const TIME_RE=/\b(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/i
 
-  const wdMap = {domingo:0,lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,sabado:6,sábado:6}
-  const wd = Object.keys(wdMap).find(k => t.includes(k))
-  const hm = t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/)
-  let hour=null,minute=0
-  if(hm){ hour=+hm[1]; minute=hm[2]?+hm[2]:0; const ap=hm[3]; if(ap==="pm"&&hour<12)hour+=12; if(ap==="am"&&hour===12)hour=0 }
-
-  if (/\bhoy\b/.test(t)) base=dayjs().tz(EURO_TZ)
-  else if (/\bmanana\b/.test(t)) base=dayjs().tz(EURO_TZ).add(1,"day")
-  if (!base && wd){
-    const target = wdMap[wd]
-    const now = dayjs().tz(EURO_TZ)
-    let d = now.day()
-    let add = (target - d + 7) % 7
-    if (add===0 && hour!==null && (now.hour()>hour || (now.hour()===hour && now.minute()>minute))) add=7
-    base = now.add(add,"day").hour(0).minute(0).second(0).millisecond(0)
+function detectExplicitDateEU(s){
+  const t=rmDiacritics((s||"").toLowerCase())
+  // dd de mes
+  const m1=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/)
+  if(m1){const dd=+m1[1],mm=M_MAP[m1[2]],yy=m1[3]?+m1[3]:dayjs().tz(EURO_TZ).year();return dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}
+  // dd/mm(/yy)
+  const m2=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/)
+  if(m2){let yy=m2[3]?+m2[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;return dayjs.tz(`${yy}-${String(+m2[2]).padStart(2,"0")}-${String(+m2[1]).padStart(2,"0")} 00:00`,EURO_TZ)}
+  // día de la semana próximo
+  for(const k of Object.keys(WD_MAP)){
+    if(t.includes(k)){
+      const target=WD_MAP[k]; const now=dayjs().tz(EURO_TZ); let add=(target-now.day()+7)%7
+      if(add===0) add=7
+      return now.add(add,"day").startOf("day")
+    }
   }
-
-  if(!base){
-    const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12}
-    const m1=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/)
-    if(m1){const dd=+m1[1],mm=M[m1[2]],yy=m1[3]?+m1[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}
-  }
-  if(!base){
-    const m2=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/)
-    if(m2){let yy=m2[3]?+m2[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m2[2]).padStart(2,"0")}-${String(+m2[1]).padStart(2,"0")} 00:00`,EURO_TZ)}
-  }
-  if(!base) base=dayjs().tz(EURO_TZ)
-  if(hour===null) return null
-  return base.hour(hour).minute(minute).second(0).millisecond(0)
+  // hoy / mañana
+  if(/\bhoy\b/.test(t)) return dayjs().tz(EURO_TZ).startOf("day")
+  if(/\bmanana\b/.test(t)) return dayjs().tz(EURO_TZ).add(1,"day").startOf("day")
+  return null
 }
+function detectTime(s){
+  const m = (s||"").toLowerCase().match(TIME_RE)
+  if(!m) return null
+  let h=+m[1], min=m[2]?+m[2]:0
+  const ap=m[3]
+  if(ap==="pm"&&h<12)h+=12
+  if(ap==="am"&&h===12)h=0
+  return {h, min}
+}
+// Combina fecha (EU) + hora -> dayjs EU
+function mergeDateTimeEU(dateEU,{h,min}){ return dateEU.clone().hour(h).minute(min).second(0).millisecond(0) }
+
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
 function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
@@ -306,6 +309,7 @@ function loadSession(phone){
   if (raw.startEU_ms) data.startEU = dayjs.tz(raw.startEU_ms, EURO_TZ)
   if (raw.pendingOfferEU_ms) data.pendingOfferEU = dayjs.tz(raw.pendingOfferEU_ms, EURO_TZ)
   if (raw.lastRequestedEU_ms) data.lastRequestedEU = dayjs.tz(raw.lastRequestedEU_ms, EURO_TZ)
+  if (raw.anchorDateEU_ms) data.anchorDateEU = dayjs.tz(raw.anchorDateEU_ms, EURO_TZ)
   return data
 }
 function saveSession(phone,data){
@@ -313,6 +317,7 @@ function saveSession(phone,data){
   s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null; delete s.startEU
   s.pendingOfferEU_ms = data.pendingOfferEU?.valueOf?.() ?? data.pendingOfferEU_ms ?? null; delete s.pendingOfferEU
   s.lastRequestedEU_ms = data.lastRequestedEU?.valueOf?.() ?? data.lastRequestedEU_ms ?? null; delete s.lastRequestedEU
+  s.anchorDateEU_ms = data.anchorDateEU?.valueOf?.() ?? data.anchorDateEU_ms ?? null; delete s.anchorDateEU
   upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
 }
 
@@ -342,7 +347,6 @@ function findExactSlot(startEU, durationMin, staffId=null){
   }
   return null
 }
-
 function* sameDayRing(startEU, preferEarlier=false){
   const base = ceilToSlotEU(startEU.clone())
   yield base
@@ -374,8 +378,6 @@ function findNearestSameDay(startEU, durationMin, staffId=null, declined=[], pre
   }
   return null
 }
-
-// Orden de días preferente: primero L-M-X
 function preferredDayList(startBase, daysWindow){
   const days=[]
   for(let d=0; d<=daysWindow; d++){
@@ -466,7 +468,8 @@ async function startBot(){
         // ===== Session
         let data=loadSession(phone)||{
           serviceEnvKey:null, service:null, durationMin:null,
-          startEU:null, lastRequestedEU:null, timeInsistCount:0,
+          startEU:null, lastRequestedEU:null, anchorDateEU:null,
+          timeInsistCount:0,
           requestedStaffId:null, staffInsistCount:0,
           declinedSlots:[], pendingOfferEU:null, selectedStaffId:null,
           mode:"idle", // idle|await_name|await_email
@@ -477,10 +480,8 @@ async function startBot(){
 
         const userSaysYes = YES_RE.test(textRaw)
         const userSaysNo  = NO_RE.test(textRaw)
-        const explicitTimeInMsg = TIME_RE.test(textRaw.toLowerCase())
-        const preferEarlier = explicitTimeInMsg || /\b(antes|temprano|primera hora)\b/i.test(textNorm)
 
-        // ===== CANCELAR
+        // ===== CANCELAR (duro y al grano)
         if (CANCEL_RE.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
           if (upc) {
@@ -503,7 +504,7 @@ async function startBot(){
           }
         }
 
-        // ===== Pedir datos
+        // ===== Pedir datos (alta)
         if (data.mode==="await_name") {
           if (textRaw.length<3 || /\d/.test(textRaw)) { await __SAFE_SEND__(from,{text:"Dime tu nombre y apellidos tal cual quieres que aparezca."}); return }
           data.name = textRaw.trim(); data.mode="await_email"; saveSession(phone,data)
@@ -535,15 +536,23 @@ async function startBot(){
           data.durationMin = getDuration(svcDetected.envKey)
         }
 
-        // ===== Fecha/hora
-        const parsed = parseDateTimeES(textRaw)
-        if (parsed) {
-          if (data.lastRequestedEU && data.lastRequestedEU.valueOf()===parsed.valueOf()) data.timeInsistCount = (data.timeInsistCount||0)+1
-          else { data.timeInsistCount = 1; data.lastRequestedEU = parsed.clone() }
-          data.startEU = parsed; data.confirmAsked=false; data.pendingOfferEU=null
+        // ===== Fecha/hora con ANCLA
+        const dateEU = detectExplicitDateEU(textRaw)
+        const time = detectTime(textRaw)
+        // Actualiza ancla si hay fecha explícita
+        if (dateEU) data.anchorDateEU = dateEU
+        // Actualiza hora solicitada
+        if (time) {
+          // Usa fecha anclada si existe; si no, si el propio mensaje trae fecha; si tampoco, hoy.
+          const baseDate = data.anchorDateEU || dateEU || dayjs().tz(EURO_TZ).startOf("day")
+          const dt = mergeDateTimeEU(baseDate, time)
+          if (data.lastRequestedEU && data.lastRequestedEU.valueOf()===dt.valueOf()) data.timeInsistCount = (data.timeInsistCount||0)+1
+          else { data.timeInsistCount = 1; data.lastRequestedEU = dt.clone() }
+          data.startEU = dt
+          data.confirmAsked=false; data.pendingOfferEU=null
         }
 
-        // ===== NO ⇒ marcar oferta rechazada
+        // ===== NO ⇒ marca oferta rechazada
         if (userSaysNo && data.pendingOfferEU) {
           data.declinedSlots.push(data.pendingOfferEU.valueOf())
           data.pendingOfferEU=null; data.confirmAsked=false
@@ -574,35 +583,32 @@ async function startBot(){
         if (!data.serviceEnvKey) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:"¿Qué te hago? (Ej: “Manicura semipermanente”, “Depilación cejas con hilo”…)" }); return }
         if (!data.startEU) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:`Genial, ${data.service}. Dime día y hora (ej: “lunes 10:00” o “15/09 18:00”).` }); return }
 
-        // ===== Buscar slots (respeta hora exacta y profesional)
         const duration = data.durationMin || 60
         let offer = null
         const declined = data.declinedSlots || []
-        const isDeclined = (t)=> declined.includes(t.valueOf())
-        const hardTime   = TIME_RE.test(textRaw) || (data.timeInsistCount>=1)
+        const hardTime   = !!time || (data.timeInsistCount>=1)
+        const dayLock    = !!data.anchorDateEU // con fecha explícita, no mover de día
 
-        // 1) Exacto con staff si lo pidió (y lo insistió)
-        if (wantsStaff) offer = findExactSlot(data.startEU, duration, data.requestedStaffId)
+        // 1) Exacto con staff si lo pidió
+        if (!offer && wantsStaff) offer = findExactSlot(data.startEU, duration, data.requestedStaffId)
         // 2) Exacto con cualquiera (si no está “forzado” el staff)
         if (!offer && (!wantsStaff || !forceStaff)) {
           const sameAny = findExactSlot(data.startEU, duration, null)
           if (sameAny) offer = sameAny
         }
-        // 3) Si no hay exacto y pidió hora exacta => buscar solo ±MAX_SAME_DAY_DEVIATION_MIN (antes->después)
-        if (!offer && hardTime) {
+        // 3) Misma fecha ±desviación (antes→después)
+        if (!offer) {
           const near = findNearestSameDay(
             data.startEU, duration,
             forceStaff ? data.requestedStaffId : (wantsStaff ? data.requestedStaffId : null),
             declined, true /* preferEarlier */,
             MAX_SAME_DAY_DEVIATION_MIN
           )
-          if (near && !isDeclined(near.time)) offer = near
+          if (near) offer = near
         }
-
-        // 4) Si no hay hora exacta en el mensaje, se permite “rellenar” temprano L-M-X
-        if (!offer && !hardTime) {
+        // 4) Buscar otros días SOLO si NO hay fecha anclada ni hora dura
+        if (!offer && !dayLock && !hardTime) {
           offer = (STEER_ON ? findEarliestAny(data.startEU, duration, STEER_WINDOW_DAYS) : null)
-               || findNearestSameDay(data.startEU, duration, wantsStaff?data.requestedStaffId:null, declined, preferEarlier)
                || findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
         }
 
@@ -610,14 +616,18 @@ async function startBot(){
         if (offer && hardTime && data.startEU && minutesApart(data.startEU, offer.time) > MAX_SAME_DAY_DEVIATION_MIN) {
           offer = null
         }
+        // Guardia: si hay fecha anclada, NO proponer otro día
+        if (offer && data.anchorDateEU && !offer.time.isSame(data.anchorDateEU, "day")){
+          offer = null
+        }
 
         if (!offer) {
           data.confirmAsked=false; saveSession(phone,data)
-          if (hardTime) {
+          if (dayLock || hardTime) {
             if (forceStaff) {
-              await __SAFE_SEND__(from,{ text:`Con ${displayStaff(data.requestedStaffId)} a esa hora no veo hueco ese día. ¿Miro esa MISMA hora otro día o te vale con otra compañera?` })
+              await __SAFE_SEND__(from,{ text:`Ese día a esa hora con ${displayStaff(data.requestedStaffId)} no tengo hueco. ¿Miro esa MISMA hora otro día o te vale con otra compañera?` })
             } else {
-              await __SAFE_SEND__(from,{ text:`A esa hora ese día no veo hueco. ¿Te miro esa MISMA hora otro día?` })
+              await __SAFE_SEND__(from,{ text:`Ese día a esa hora no tengo hueco. ¿Miro esa MISMA hora otro día u otra franja ese día?` })
             }
           } else {
             await __SAFE_SEND__(from,{ text:"Ahora mismo no veo huecos en esa franja. Dime otra hora o día y te digo." })
