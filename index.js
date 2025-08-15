@@ -1,12 +1,12 @@
-// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.2.2 “Torremolinos + La Luz”)
+// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.2.3 “Torremolinos + La Luz”)
 // Requisitos: Node 20+, npm i express @whiskeysockets/baileys pino qrcode qrcode-terminal better-sqlite3 dayjs dotenv @square/square
 
 import express from "express"
-import makeWASocket, {
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  Browsers
-} from "@whiskeysockets/baileys"
+// --- Baileys: usar import global para cubrir distintas builds (ESM/CJS)
+import * as baileys from "@whiskeysockets/baileys"
+const makeWASocket = (baileys.default || baileys.makeWASocket)
+const { useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
+
 import pino from "pino"
 import qrcode from "qrcode"
 import qrcodeTerminal from "qrcode-terminal"
@@ -164,7 +164,6 @@ const SERVICE = {
   MICROBLADING:{ name:"Microblading", dur:120 },
   DERMAPEN:{ name:"Dermapen", dur:60 },
   MASAJE_RELAJANTE:{ name:"Masaje relajante", dur:60 },
-  // (más servicios existen en .env; si se detectan por texto y no están aquí, dur=60 por defecto)
 }
 const SVC_KEYS = Object.keys(SERVICE)
 const SERVICE_SYNONYMS = [
@@ -323,10 +322,7 @@ async function searchNextAvailability({ locationId, serviceKey, afterEU, preferr
     }
     const resp = await square.bookingsApi.searchAvailability(body)
     const list = (resp?.result?.availabilities||[])
-      .filter(a => {
-        const t = EURO(a.startAt)
-        return insideBusinessHours(t)
-      })
+      .filter(a => insideBusinessHours(EURO(a.startAt)))
       .map(a => ({
         startEU: EURO(a.startAt),
         teamId: a.appointmentSegments?.[0]?.teamMemberId || null,
@@ -423,6 +419,10 @@ app.listen(PORT,()=>startBot().catch(console.error))
 const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
 async function startBot(){
   try{
+    if(typeof makeWASocket !== "function"){
+      console.error("Baileys: makeWASocket no es función. Revisa versión @whiskeysockets/baileys.");
+      return
+    }
     if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion()
