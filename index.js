@@ -1,12 +1,13 @@
 // index.js — Gapink Nails · Playamar (PROD)
-// - Sin IA: reconocimiento de servicios con alias + fuzzy robusto
-// - Hora exacta primero; alternativas solo si no existe
-// - Respeta “con <empleada>”; balanceo (steering) opcional
-// - No re-ofrece slots rechazados; confirma exactamente lo ofertado
-// - Alta cliente paso a paso: nombre -> email (validado) -> reserva
+// - Sin IA: detección de servicio por alias + fuzzy robusto
+// - Hora exacta y profesional solicitados tienen prioridad real
+// - Si hora exacta no existe: 1 alternativa (misma fecha y cercana). Nada de marear.
+// - Si pediste “con X” y no hay exacto: primero 10:00 con otra (solo si no insististe 2 veces);
+//   si insististe >=2, entonces 10:30 (o la más cercana) con X, misma fecha.
+// - Rellenar semana (L-M-X) SOLO si no hay hora concreta en el mensaje.
+// - No re-ofrecer slots rechazados. Confirmar exactamente lo ofertado.
+// - Alta de cliente paso a paso: nombre -> email (validado) -> reserva
 // - Pago siempre en persona
-// - Prioriza rellenar lunes-martes-miércoles en sugerencias (sin ser pesado)
-// - Un único listener Baileys (evita duplicados)
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -29,13 +30,13 @@ const EURO_TZ = "Europe/Madrid"
 
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
-// ===== Config tienda
+// ===== Config negocio
 const WORK_DAYS = [1,2,3,4,5,6]  // L-S (domingo cerrado)
 const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
-// Balanceo de carga/steering y ventanas de búsqueda
+// Steering (rellenar pronto) — solo cuando NO hay hora concreta en el mensaje
 const STEER_ON = (process.env.BOT_STEER_BALANCE || "on").toLowerCase() === "on"
 const STEER_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)   // “rellenar pronto”
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14) // búsqueda general
@@ -44,10 +45,11 @@ const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14) // b
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
 const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = (s="") => rmDiacritics(String(s).toLowerCase()).replace(/[^a-z0-9]+/g," ").trim()
-const STOP = new Set("de del la el los las un una unos unas y o u a al con por para en me mi su sus quiero quisiera hazme hacerme ponme dame porfa por favor hola buenas tardes buenos dias noches necesito querria reservar cita hora con que tal am pm".split(" "))
+const STOP = new Set("de del la el los las un una unos unas y o u a al con por para en me mi su sus quiero quisiera querria hazme hacerme ponme dame porfa por favor hola buenas tardes buenos dias noches necesito reservar cita hora con que tal am pm".split(" "))
 function tokenize(s){ return norm(s).split(/\s+/).filter(w=>w && w.length>1 && !STOP.has(w)) }
+const TIME_RE=/\b(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/i
 
-const YES_RE = /\b(s[ií]|ok|okay|okey+|vale+|va|venga|dale|confirmo|confirmar|de acuerdo|perfecto|genial)\b/i
+const YES_RE = /\b(s[ií]|ok|okay|okey+|vale+|va|venga|dale|confirmo|confirmar|de acuerdo|perfecto|genial|si porfa|sí porfa)\b/i
 const NO_RE  = /\b(no+|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde|anula|cancela)\b/i
 const RESCH_RE = /\b(cambia|cambiar|modifica|mover|reprograma|reprogramar|edita)\b/i
 
@@ -61,7 +63,7 @@ function normalizePhoneES(raw){
 }
 const isValidEmail=(e)=>/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim())
 
-// ===== Empleadas (SOLO Playamar; configura en .env)
+// ===== Empleadas Playamar (.env)
 const EMPLOYEES = {
   rocio:     process.env.SQ_EMP_ROCIO     || "",
   cristina:  process.env.SQ_EMP_CRISTINA  || "",
@@ -78,7 +80,7 @@ const EMPLOYEES = {
 }
 const EMP_ALIASES = {
   "rocio":"rocio","rocío":"rocio","rosi":"rocio","rocio chica":"rocio","rocío chica":"rocio",
-  "cristina":"cristina","cristi":"cristina","cristina jaime":"cristina",
+  "cristina":"cristina","cristi":"cristina","cristina jaime":"cristina","cristina castro":"cristina",
   "sami":"sami",
   "elisabeth":"elisabeth","elisabet":"elisabeth","eli":"elisabeth",
   "tania":"tania",
@@ -92,6 +94,17 @@ const EMP_ALIASES = {
 }
 const TEAM_MEMBER_IDS = Object.values(EMPLOYEES).filter(Boolean)
 if (!TEAM_MEMBER_IDS.length) { console.error("⛔ Falta configurar empleadas SQ_EMP_* en .env"); process.exit(1) }
+
+const STAFF_NAME_BY_ID = (()=> {
+  const m={}
+  for (const [k,id] of Object.entries(EMPLOYEES)) if (id) m[id]=k
+  return m
+})()
+const displayStaff = (id) => {
+  const k = STAFF_NAME_BY_ID[id] || ""
+  if (!k) return ""
+  return k.charAt(0).toUpperCase()+k.slice(1)
+}
 
 // ===== Servicios desde .env (variationId|version)
 function titleCase(s){return s.replace(/\b[a-záéíóúñ0-9]+\b/gi, w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase())}
@@ -118,6 +131,7 @@ const SERVICE_CATALOG = loadServiceCatalogFromEnv()
 
 // Alias explícitos comunes (expandibles)
 const SERVICE_ALIASES = {
+  // Depilación cejas con hilo
   "depilacion de cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilacion cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilar cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
@@ -125,45 +139,21 @@ const SERVICE_ALIASES = {
   "depilacion cejas":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
 
+  // Otras (muestra; añade las que uses mucho)
   "depilacion labio con hilo":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
-  "labio con hilo":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
-
   "manicura semipermanente":"SQ_SVC_MANICURA_SEMIPERMANENTE",
-  "manicura semi":"SQ_SVC_MANICURA_SEMIPERMANENTE",
-  "semi manos":"SQ_SVC_MANICURA_SEMIPERMANENTE",
-  "manicura semipermanente quitar":"SQ_SVC_MANICURA_SEMIPERMANENTE_QUITAR",
-  "quitar semi":"SQ_SVC_MANICURA_SEMIPERMANENTE_QUITAR",
-  "manicura rusa con nivelacion":"SQ_SVC_MANICURA_RUSA_CON_NIVELACION",
   "manicura rusa":"SQ_SVC_MANICURA_RUSA_CON_NIVELACION",
-  "manicura normal":"SQ_SVC_MANICURA_CON_ESMALTE_NORMAL",
-
   "semipermanente pies":"SQ_SVC_ESMALTADO_SEMIPERMANETE_PIES",
-  "semi pies":"SQ_SVC_ESMALTADO_SEMIPERMANETE_PIES",
-
-  "lifting de pestanas y tinte":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
   "lifting pestañas":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
-  "lifting y tinte":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
-
-  "limpieza facial con punta de diamante":"SQ_SVC_LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE",
   "punta de diamante":"SQ_SVC_LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE",
-  "limpieza hidra facial":"SQ_SVC_LIMPIEZA_HYDRA_FACIAL",
   "hydra facial":"SQ_SVC_LIMPIEZA_HYDRA_FACIAL",
-  "limpieza basica":"SQ_SVC_LIMPIEZA_FACIAL_BASICA",
-
   "laser cejas":"SQ_SVC_LASER_CEJAS",
-  "cejas laser":"SQ_SVC_LASER_CEJAS",
-
   "microblading":"SQ_SVC_MICROBLADING",
-  "cejas polvo":"SQ_SVC_CEJAS_EFECTO_POLVO_MICROSHADING",
-  "hairstroke":"SQ_SVC_CEJAS_HAIRSTROKE",
-
   "fotodepilacion ingles":"SQ_SVC_FOTODEPILACION_INGLES",
   "fotodepilacion axilas":"SQ_SVC_FOTODEPILACION_AXILAS",
-  "fotodepilacion piernas completas":"SQ_SVC_FOTODEPILACION_PIERNAS_COMPLETAS",
   "fotodepilacion facial":"SQ_SVC_FOTODEPILACION_FACIAL_COMPLETO",
 }
 
-function intersectCount(a,b){let c=0; for(const x of a) if(b.has(x)) c++; return c}
 function resolveServiceFromText(userText){
   const n = norm(userText)
 
@@ -196,7 +186,7 @@ function resolveServiceFromText(userText){
   return null
 }
 
-// Duraciones (mins). Ajusta según tus tiempos reales:
+// Duraciones (mins). Ajusta si quieres.
 const DURATION_MIN = {
   "SQ_SVC_DEPILACION_CEJAS_CON_HILO":15,
   "SQ_SVC_DEPILACION_LABIO_CON_HILO":10,
@@ -205,11 +195,10 @@ const DURATION_MIN = {
   "SQ_SVC_LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE":90,
   "SQ_SVC_LIMPIEZA_HYDRA_FACIAL":90,
   "SQ_SVC_FOTODEPILACION_INGLES":30,
-  // ... (si falta alguno: 60)
 }
 const getDuration=(envKey)=>DURATION_MIN[envKey] ?? 60
 
-// ===== Fecha/hora ES (lunes/martes/… + 10:30/10h30/10 am)
+// ===== Fecha/hora ES
 function parseDateTimeES(dtText){
   if(!dtText) return null
   const t=rmDiacritics(dtText.toLowerCase())
@@ -320,12 +309,14 @@ function loadSession(phone){
   const raw=JSON.parse(row.data_json); const data={...raw}
   if (raw.startEU_ms) data.startEU = dayjs.tz(raw.startEU_ms, EURO_TZ)
   if (raw.pendingOfferEU_ms) data.pendingOfferEU = dayjs.tz(raw.pendingOfferEU_ms, EURO_TZ)
+  if (raw.lastRequestedEU_ms) data.lastRequestedEU = dayjs.tz(raw.lastRequestedEU_ms, EURO_TZ)
   return data
 }
 function saveSession(phone,data){
   const s={...data}
   s.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null; delete s.startEU
   s.pendingOfferEU_ms = data.pendingOfferEU?.valueOf?.() ?? data.pendingOfferEU_ms ?? null; delete s.pendingOfferEU
+  s.lastRequestedEU_ms = data.lastRequestedEU?.valueOf?.() ?? data.lastRequestedEU_ms ?? null; delete s.lastRequestedEU
   upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
 }
 
@@ -343,8 +334,8 @@ function findExactSlot(startEU, durationMin, staffId=null){
   if (startEU.isBefore(dayStart) || startEU.add(durationMin,"minute").isAfter(dayEnd)) return null
   const start = ceilToSlotEU(startEU.clone())
   const end = start.clone().add(durationMin,"minute")
-  const from = start.clone().subtract(1,"day").tz("UTC").toISOString()
-  const to   = start.clone().add(1,"day").tz("UTC").toISOString()
+  const from = dayStart.tz("UTC").toISOString()
+  const to   = dayEnd.tz("UTC").toISOString()
   const intervals=getBookedIntervals(from,to)
   if (staffId) {
     if (isFree(intervals,staffId,start.tz("UTC"),end.tz("UTC"))) return { time:start, staffId }
@@ -356,27 +347,52 @@ function findExactSlot(startEU, durationMin, staffId=null){
   return null
 }
 
+// Generador de candidatos cercanos el MISMO día (± n slots, alternando +/−, luego +2/−2…)
+function* sameDayRing(startEU){
+  const base = ceilToSlotEU(startEU.clone())
+  yield base
+  for (let k=1;k<=16;k++){ // hasta +-8 slots (4 horas) — ajustable
+    yield base.clone().add(k*SLOT_MIN,"minute")
+    yield base.clone().subtract(k*SLOT_MIN,"minute")
+  }
+}
+function findNearestSameDay(startEU, durationMin, staffId=null, declined=[]) {
+  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
+  const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
+  const from = dayStart.tz("UTC").toISOString()
+  const to   = dayEnd.tz("UTC").toISOString()
+  const intervals=getBookedIntervals(from,to)
+  for (const t of sameDayRing(startEU)){
+    const e=t.clone().add(durationMin,"minute")
+    if (t.isBefore(dayStart) || e.isAfter(dayEnd)) continue
+    if (declined.includes(t.valueOf())) continue
+    if (staffId) {
+      if (isFree(intervals,staffId,t.tz("UTC"),e.tz("UTC"))) return { time:t, staffId }
+    } else {
+      for (const id of TEAM_MEMBER_IDS){
+        if (isFree(intervals,id,t.tz("UTC"),e.tz("UTC"))) return { time:t, staffId:id }
+      }
+    }
+  }
+  return null
+}
+
 // Orden de días preferente: primero L-M-X dentro de la ventana, luego resto cronológico
 function preferredDayList(startBase, daysWindow){
   const days=[]
   for(let d=0; d<=daysWindow; d++){
-    const day=startBase.clone().add(d,"day")
-    days.push(day.startOf("day"))
+    days.push(startBase.clone().add(d,"day").startOf("day"))
   }
-  const early = days.filter(d => [1,2,3].includes(d.day())) // L, M, X
+  const early = days.filter(d => [1,2,3].includes(d.day()))
   const others= days.filter(d => ![1,2,3].includes(d.day()))
-  // Mantiene orden natural dentro de cada grupo
   return [...early, ...others]
 }
-
-function findEarliestAny(startEU, durationMin, daysWindow, { preferEarlyWeek=true } = {}){
+function findEarliestAny(startEU, durationMin, daysWindow){
   const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
   const startBase = startEU && startEU.isAfter(now) ? ceilToSlotEU(startEU.clone()) : ceilToSlotEU(now.clone())
   const toEU = startBase.clone().add(daysWindow,"day").hour(CLOSE_HOUR).minute(0).second(0)
   const intervals=getBookedIntervals(startBase.tz("UTC").toISOString(), toEU.tz("UTC").toISOString())
-
-  const dayOrder = preferEarlyWeek ? preferredDayList(startBase, daysWindow) : (()=>{const a=[];for(let d=0;d<=daysWindow;d++)a.push(startBase.clone().add(d,"day").startOf("day"));return a})()
-
+  const dayOrder = preferredDayList(startBase, daysWindow)
   for(const day of dayOrder){
     const dow=day.day()===0?7:day.day()
     if(!WORK_DAYS.includes(dow)) continue
@@ -389,28 +405,6 @@ function findEarliestAny(startEU, durationMin, daysWindow, { preferEarlyWeek=tru
       for(const staffId of TEAM_MEMBER_IDS){
         if(isFree(intervals,staffId,tUTC,eUTC)) return { time:t, staffId }
       }
-    }
-  }
-  return null
-}
-function findEarliestForStaff(startEU, durationMin, daysWindow, staffId, { preferEarlyWeek=true } = {}){
-  if(!staffId) return null
-  const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
-  const startBase = startEU && startEU.isAfter(now) ? ceilToSlotEU(startEU.clone()) : ceilToSlotEU(now.clone())
-  const toEU = startBase.clone().add(daysWindow,"day").hour(CLOSE_HOUR).minute(0).second(0)
-  const intervals=getBookedIntervals(startBase.tz("UTC").toISOString(), toEU.tz("UTC").toISOString())
-
-  const dayOrder = preferEarlyWeek ? preferredDayList(startBase, daysWindow) : (()=>{const a=[];for(let d=0;d<=daysWindow;d++)a.push(startBase.clone().add(d,"day").startOf("day"));return a})()
-
-  for(const day of dayOrder){
-    const dow=day.day()===0?7:day.day()
-    if(!WORK_DAYS.includes(dow)) continue
-    const dayStart=day.clone().hour(OPEN_HOUR).minute(0).second(0)
-    const dayEnd  =day.clone().hour(CLOSE_HOUR).minute(0).second(0)
-    const firstSlot = day.isSame(startBase,"day") ? (startBase.isAfter(dayStart) ? startBase.clone() : dayStart) : dayStart
-    for(let t=ceilToSlotEU(firstSlot.clone()); !t.isAfter(dayEnd); t=t.add(SLOT_MIN,"minute")){
-      const e=t.clone().add(durationMin,"minute"); if(e.isAfter(dayEnd)) break
-      if(isFree(intervals,staffId,t.tz("UTC"),e.tz("UTC"))) return { time:t, staffId }
     }
   }
   return null
@@ -430,7 +424,7 @@ app.listen(PORT,async()=>{
   startBot().catch(console.error)
 })
 
-// ===== Bot (un solo listener)
+// ===== Bot
 async function startBot(){
   console.log("🚀 Bot arrancando…")
   try{
@@ -463,7 +457,8 @@ async function startBot(){
         // ===== Session
         let data=loadSession(phone)||{
           serviceEnvKey:null, service:null, durationMin:null,
-          startEU:null, requestedStaffId:null, staffInsistCount:0,
+          startEU:null, lastRequestedEU:null, timeInsistCount:0,
+          requestedStaffId:null, staffInsistCount:0,
           declinedSlots:[], pendingOfferEU:null, selectedStaffId:null,
           mode:"idle", // idle|await_name|await_email
           name:null, email:null,
@@ -473,6 +468,7 @@ async function startBot(){
 
         const userSaysYes = YES_RE.test(textRaw)
         const userSaysNo  = NO_RE.test(textRaw)
+        const explicitTimeInMsg = TIME_RE.test(textRaw.toLowerCase())
 
         // ===== Cancelar
         if (/\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
@@ -489,10 +485,14 @@ async function startBot(){
         // ===== Reprogramar
         if (RESCH_RE.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
-          if (upc) { data.editBookingId = upc.id; data.serviceEnvKey = upc.service_env_key; data.service = upc.service_display; data.durationMin = upc.duration_min; data.requestedStaffId = upc.staff_id }
+          if (upc) {
+            data.editBookingId = upc.id; data.serviceEnvKey = upc.service_env_key
+            data.service = upc.service_display; data.durationMin = upc.duration_min
+            data.requestedStaffId = upc.staff_id
+          }
         }
 
-        // ===== Pidiendo datos => no proponemos slots
+        // ===== Pidiendo datos
         if (data.mode==="await_name") {
           if (textRaw.length<3 || /\d/.test(textRaw)) { await __SAFE_SEND__(from,{text:"Dime tu nombre y apellidos tal cual quieres que aparezca."}); return }
           data.name = textRaw.trim(); data.mode="await_email"; saveSession(phone,data)
@@ -502,17 +502,17 @@ async function startBot(){
         if (data.mode==="await_email") {
           if (!isValidEmail(textRaw)) { await __SAFE_SEND__(from,{text:"Ese correo no me vale. Ponme uno válido (tipo nombre@dominio.com)."}); return }
           data.email = textRaw.trim(); data.mode="idle"; saveSession(phone,data)
-          // Si había oferta pendiente, cerramos
           if (data.pendingOfferEU && data.serviceEnvKey) { await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ }); return }
         }
 
-        // ===== Detectar empleada por texto (alias)
+        // ===== Empleada por alias
         for (const w of textNorm.split(/\s+/)) {
           const key=EMP_ALIASES[w]; if (key && EMPLOYEES[key]) {
             if (data.requestedStaffId===EMPLOYEES[key]) data.staffInsistCount++
             else { data.requestedStaffId=EMPLOYEES[key]; data.staffInsistCount=1 }
           }
         }
+        const wantsStaff = !!data.requestedStaffId
 
         // ===== Servicio
         const svcDetected = resolveServiceFromText(textRaw)
@@ -525,7 +525,12 @@ async function startBot(){
 
         // ===== Fecha/hora
         const parsed = parseDateTimeES(textRaw)
-        if (parsed) { data.startEU = parsed; data.confirmAsked=false; data.pendingOfferEU=null }
+        if (parsed) {
+          // Contador de insistencia de la MISMA hora
+          if (data.lastRequestedEU && data.lastRequestedEU.valueOf()===parsed.valueOf()) data.timeInsistCount = (data.timeInsistCount||0)+1
+          else { data.timeInsistCount = 1; data.lastRequestedEU = parsed.clone() }
+          data.startEU = parsed; data.confirmAsked=false; data.pendingOfferEU=null
+        }
 
         // ===== NO ⇒ marcar oferta rechazada y limpiar
         if (userSaysNo && data.pendingOfferEU) {
@@ -536,7 +541,7 @@ async function startBot(){
           return
         }
 
-        // ===== YES ⇒ si hay oferta pendiente, cerramos flujo
+        // ===== YES ⇒ si hay oferta pendiente, cerramos
         if (userSaysYes && data.pendingOfferEU && data.serviceEnvKey) {
           const existing = await squareFindCustomerByPhone(phone)
           if (!existing && (!data.name || !data.email)) {
@@ -550,45 +555,52 @@ async function startBot(){
         }
 
         // ===== GUIADO
-        if (!data.serviceEnvKey) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:"¿Qué te hago? (Ej: “Manicura semipermanente”, “Limpieza facial con punta de diamante”…)" }); return }
+        if (!data.serviceEnvKey) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:"¿Qué te hago? (Ej: “Manicura semipermanente”, “Depilación cejas con hilo”…)" }); return }
         if (!data.startEU) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:`Genial, ${data.service}. Dime día y hora (ej: “lunes 10:00” o “15/09 18:00”).` }); return }
 
-        // ===== Buscar EXACTO primero
+        // ===== Buscar slots (respeta hora exacta y profesional)
         const duration = data.durationMin || 60
         let offer = null
-
-        // evita re-ofrecer lo mismo
-        const isDeclined = (t)=> data.declinedSlots.includes(t.valueOf())
-
-        // si pide persona concreta y no insiste 2 veces, aplicamos steering
-        const wantsStaff = !!data.requestedStaffId
+        const declined = data.declinedSlots || []
+        const isDeclined = (t)=> declined.includes(t.valueOf())
         const forceStaff = wantsStaff && data.staffInsistCount>=2
+        const hardTime   = explicitTimeInMsg || data.timeInsistCount>=2
 
-        // 1) exacto con staff forzado
-        if (forceStaff) offer = findExactSlot(data.startEU, duration, data.requestedStaffId)
-
-        // 2) exacto con cualquiera
+        // 1) exacto con staff si lo pidió
+        if (wantsStaff) offer = findExactSlot(data.startEU, duration, data.requestedStaffId)
+        // 2) exacto con cualquiera (si no hay exacto con staff)
         if (!offer) offer = findExactSlot(data.startEU, duration, null)
 
-        // 3) alternativas (preferir lunes-martes-miércoles, una sola propuesta)
+        // 3) si no hay exacto:
         if (!offer) {
-          if (wantsStaff && STEER_ON && !forceStaff) {
-            const steer = findEarliestAny(data.startEU, duration, STEER_WINDOW_DAYS, { preferEarlyWeek:true })
-            if (steer && !isDeclined(steer.time)) offer = steer
-          }
-          if (!offer && wantsStaff) {
-            const s = findEarliestForStaff(data.startEU, duration, SEARCH_WINDOW_DAYS, data.requestedStaffId, { preferEarlyWeek:true })
-            if (s && !isDeclined(s.time)) offer = s
-          }
-          if (!offer) {
-            const any = findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS, { preferEarlyWeek:true })
-            if (any && !isDeclined(any.time)) offer = any
+          if (hardTime) {
+            // Hora bloqueada: primero MISMA HORA con otra (solo si no insistió 2 veces en la persona)
+            if (wantsStaff && !forceStaff) {
+              const sameTimeAny = findExactSlot(data.startEU, duration, null)
+              if (sameTimeAny && !isDeclined(sameTimeAny.time)) offer = sameTimeAny
+            }
+            // Si sigue sin haber, o insistió en la persona, buscamos LA MÁS CERCANA MISMO DÍA
+            if (!offer) {
+              const nearSameDay = findNearestSameDay(data.startEU, duration, forceStaff ? data.requestedStaffId : (wantsStaff ? data.requestedStaffId : null), declined)
+              if (nearSameDay) offer = nearSameDay
+            }
+          } else {
+            // Hora no bloqueada (p.ej. “por la tarde”): 1 alternativa priorizando L-M-X si no hay hora concreta
+            const any = (STEER_ON ? findEarliestAny(data.startEU, duration, STEER_WINDOW_DAYS) : null) || findNearestSameDay(data.startEU, duration, wantsStaff?data.requestedStaffId:null, declined) || findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
+            if (any) offer = any
           }
         }
 
         if (!offer) {
           data.confirmAsked=false; saveSession(phone,data)
-          await __SAFE_SEND__(from,{ text:"Ahora mismo no veo huecos en esa franja. Dime otra hora o día y te digo." })
+          // Mensaje claro según bloqueo
+          if (hardTime && wantsStaff) {
+            await __SAFE_SEND__(from,{ text:`Con ${displayStaff(data.requestedStaffId)} a esa hora no veo hueco. Dime otra hora ese mismo día o, si quieres, te miro la misma hora con otra compañera.` })
+          } else if (hardTime) {
+            await __SAFE_SEND__(from,{ text:`A esa hora exacta no veo hueco. Dime otra hora ese mismo día y te ofrezco la más cercana.` })
+          } else {
+            await __SAFE_SEND__(from,{ text:"Ahora mismo no veo huecos en esa franja. Dime otra hora o día y te digo." })
+          }
           return
         }
 
@@ -597,7 +609,8 @@ async function startBot(){
         data.confirmAsked = true
         saveSession(phone,data)
 
-        await __SAFE_SEND__(from,{ text:`Tengo ${fmtES(offer.time)}. ¿Confirmo la ${data.editBookingId?"modificación":"cita"}? (Pago en persona)` })
+        const staffTxt = displayStaff(offer.staffId) ? ` con ${displayStaff(offer.staffId)}` : ""
+        await __SAFE_SEND__(from,{ text:`Tengo ${fmtES(offer.time)}${staffTxt}. ¿Confirmo la ${data.editBookingId?"modificación":"cita"}? (Pago en persona)` })
         return
 
       }catch(e){ console.error("messages.upsert error:",e) }
@@ -652,10 +665,11 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
 
     updateAppt.run({ id: aptId, status: "confirmed", square_booking_id: sq.id || null })
     clearSession.run({ phone })
+    const staffTxt = displayStaff(teamMemberId) ? ` con ${displayStaff(teamMemberId)}` : ""
     await safeSend(from,{ text:
 `Reserva confirmada 🎉
 Servicio: ${svc.displayName}
-Fecha: ${fmtES(startEU)}
+Fecha: ${fmtES(startEU)}${staffTxt}
 Duración: ${durationMin} min
 Pago en persona. ¡Te esperamos!` })
   } catch (e) { console.error("finalizeBooking:", e) }
