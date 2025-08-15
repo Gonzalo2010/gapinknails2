@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · IA + Square + Baileys (v10)
+// index.js — Gapink Nails · IA + Square + Baileys (v11)
 // Node 20+. Paquetes: express pino qrcode qrcode-terminal better-sqlite3 dayjs dotenv @square/square @whiskeysockets/baileys
 
 import express from "express"
@@ -19,13 +19,12 @@ import "dayjs/locale/es.js"
 import { Client, Environment } from "square"
 import crypto from "crypto"
 
-// ====== Fecha/hora
 dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isoWeek); dayjs.extend(isSameOrAfter); dayjs.extend(isSameOrBefore)
 dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
 
 // ====== Ajustes
-const WORK_DAYS = [1,2,3,4,5]               // L–V
+const WORK_DAYS = [1,2,3,4,5]
 const SHIFT_A_START=10, SHIFT_A_END=14
 const SHIFT_B_START=16, SHIFT_B_END=20
 const SLOT_MIN=30
@@ -33,7 +32,6 @@ const SEARCH_WINDOW_DAYS = +process.env.BOT_SEARCH_WINDOW_DAYS || 14
 const NOW_OFFSET_MIN = +process.env.BOT_NOW_OFFSET_MIN || 30
 const WELCOME_MUTE_MS = 90_000
 
-// Festivos (nacionales + extra .env)
 const HOLI = new Set(["01/01","06/01","28/02","01/05","15/08","12/10","01/11","06/12","08/12","25/12"])
 ;(String(process.env.HOLIDAYS_EXTRA||"").split(",").map(s=>s.trim()).filter(Boolean)).forEach(x=>HOLI.add(x))
 
@@ -69,19 +67,22 @@ Gracias 😘`
 // ====== OpenAI (IA)
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"
 const OPENAI_URL   = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
-async function aiReply(userText){
+async function aiReply(userText, ctx={}){
   if(!process.env.OPENAI_API_KEY) return ""
-  const sys = `Eres recepcionista de Gapink Nails (España). Español. Responde breve, cálida y CLARA. No inventes horarios ni precios. Si falta local o servicio, pide SOLO eso.`
+  const sys = `Eres recepcionista de Gapink Nails (España). Español. Breve, cálida, clara.
+No inventes horarios/precios ni huecos. Si no tienes 100% la info, pide el dato.
+ESTADO: local=${ctx.haveLoc?"sí":"no"}, servicio=${ctx.haveSvc?"sí":"no"}, pestañas=${ctx.lash?"sí":"no"}.
+REGLAS:
+- Si el cliente pide "pestañas" sin especificar, pregunta el tipo: "Lifting + tinte", "Extensiones NUEVAS (pelo a pelo/2D/3D)" o "Relleno (pelo a pelo/2D/3D)" o "Quitar extensiones". 
+- Si ya hay local, NO lo vuelvas a pedir; solo pide la variante de pestañas.
+- Si ya hay variante, confirma día/hora preferidos.`
   try{
     const r = await fetch(OPENAI_URL, {
       method:"POST",
-      headers:{
-        "Content-Type":"application/json",
-        "Authorization":`Bearer ${process.env.OPENAI_API_KEY}`
-      },
+      headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${process.env.OPENAI_API_KEY}` },
       body: JSON.stringify({
         model: OPENAI_MODEL,
-        temperature: 0.25,
+        temperature: 0.2,
         messages:[
           { role:"system", content: sys },
           { role:"user", content: userText }
@@ -93,7 +94,7 @@ async function aiReply(userText){
   }catch{ return "" }
 }
 
-// ====== Utilidades
+// ====== Utils
 const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = s => rm(s).toLowerCase()
 const EURO = d => dayjs(d).tz(EURO_TZ)
@@ -133,6 +134,7 @@ function detectLocation(text){
   for(const [k,arr] of Object.entries(LOC_SYNON)) if(arr.some(w=>t.includes(norm(w)))) return k
   return null
 }
+
 const SERVICE = {
   MANICURA_SEMIPERMANENTE:{ name:"Manicura semipermanente", dur:30 },
   MANICURA_SEMIPERMANENTE_QUITAR:{ name:"Manicura semipermanente + quitar", dur:40 },
@@ -153,13 +155,10 @@ const SERVICE = {
   RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO:{ name:"Relleno pestañas pelo a pelo", dur:90 },
   RELLENO_PESTANAS_2D:{ name:"Relleno pestañas 2D", dur:90 },
   RELLENO_PESTANAS_3D:{ name:"Relleno pestañas 3D", dur:90 },
-  LIMPIEZA_HYDRA_FACIAL:{ name:"Limpieza hydra facial", dur:90 },
-  LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE:{ name:"Limpieza con punta de diamante", dur:90 },
   MICROBLADING:{ name:"Microblading", dur:120 },
   DERMAPEN:{ name:"Dermapen", dur:60 },
   MASAJE_RELAJANTE:{ name:"Masaje relajante", dur:60 }
 }
-const SVC_KEYS=Object.keys(SERVICE)
 const SVC_SYNON=[
   ["manicura semipermanente","MANICURA_SEMIPERMANENTE",["semi","gel color","permanente"]],
   ["quitar semi","MANICURA_SEMIPERMANENTE_QUITAR",["retirar semi","quitar gel"]],
@@ -172,15 +171,13 @@ const SVC_SYNON=[
   ["pedicura normal","PEDICURA_SPA_CON_ESMALTE_NORMAL",[]],
   ["hilo cejas","DEPILACION_CEJAS_CON_HILO",["threading"]],
   ["diseño cejas henna","DISENO_DE_CEJAS_CON_HENNA_Y_DEPILACION",[]],
-  ["lifting pestañas","LIFITNG_DE_PESTANAS_Y_TINTE",["lash lift"]],
+  ["lifting pestañas","LIFITNG_DE_PESTANAS_Y_TINTE",["lash lift","lifting de pestañas","lifting y tinte"]],
   ["pelo a pelo","EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO",["clásicas","clasicas","classic"]],
-  ["2d","EXTENSIONES_PESTANAS_NUEVAS_2D",[]],
-  ["3d","EXTENSIONES_PESTANAS_NUEVAS_3D",[]],
+  ["extensiones 2d","EXTENSIONES_PESTANAS_NUEVAS_2D",["2d nuevas","2 d"]],
+  ["extensiones 3d","EXTENSIONES_PESTANAS_NUEVAS_3D",["3d nuevas","3 d"]],
   ["relleno pelo a pelo","RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO",[]],
   ["relleno 2d","RELLENO_PESTANAS_2D",[]],
   ["relleno 3d","RELLENO_PESTANAS_3D",[]],
-  ["hydra","LIMPIEZA_HYDRA_FACIAL",["hydrafacial"]],
-  ["punta diamante","LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE",[]],
   ["microblading","MICROBLADING",[]],
   ["dermapen","DERMAPEN",[]],
   ["masaje","MASAJE_RELAJANTE",[]]
@@ -189,6 +186,7 @@ function detectService(text){
   const t=norm(text)
   for(const [label,key,extra] of SVC_SYNON)
     if(t.includes(norm(label)) || (extra||[]).some(x=>t.includes(norm(x)))) return key
+  // extensiones genéricas => aún falta variante
   return null
 }
 const DOW = {lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5}
@@ -225,7 +223,7 @@ function svcEnvPair(serviceKey, locationId){
   return { id, version: verStr?Number(verStr):undefined, duration, name: SERVICE[serviceKey]?.name||serviceKey }
 }
 
-// ====== Square helpers robustos
+// ====== Square helpers
 function explainSquareError(e){
   try{
     const err = e?.errors || e?.result?.errors || e?.response?.body || e
@@ -267,7 +265,6 @@ async function searchNextAvailability({ locationId, serviceKey, afterEU, preferr
     locationId,
     segmentFilters:[{ serviceVariationId: pair.id }]
   }
-  // 1) SIN filtro de empleada (evita 400 por ID no asociado al local)
   try{
     const r = await square.bookingsApi.searchAvailability({ query:{ filter: baseFilter } })
     const list = (r?.result?.availabilities||[])
@@ -281,9 +278,8 @@ async function searchNextAvailability({ locationId, serviceKey, afterEU, preferr
       }))
     if(list.length) return list[0]
   }catch(e){
-    console.error("searchAvailability(ANY) 400/err"); explainSquareError(e)
+    console.error("searchAvailability(ANY) error"); explainSquareError(e)
   }
-  // 2) Si hay preferencia de empleada, reintentar SOLO con esa empleada
   if(preferredTeamId){
     try{
       const r2 = await square.bookingsApi.searchAvailability({
@@ -297,7 +293,7 @@ async function searchNextAvailability({ locationId, serviceKey, afterEU, preferr
         svId: pair.id,
         svVersion: li[0].appointmentSegments?.[0]?.serviceVariationVersion||pair.version
       }
-    }catch(e){ console.error("searchAvailability(PREFERRED) 400/err"); explainSquareError(e) }
+    }catch(e){ console.error("searchAvailability(PREFERRED) error"); explainSquareError(e) }
   }
   return null
 }
@@ -355,16 +351,6 @@ const sessDel=db.prepare(`DELETE FROM sessions WHERE phone=?`)
 const apptInsert=db.prepare(`INSERT INTO appointments(id,phone,name,email,location_id,service_key,service_name,duration_min,staff_id,start_iso,square_booking_id,status,created_at)
 VALUES(@id,@phone,@name,@email,@location_id,@service_key,@service_name,@duration_min,@staff_id,@start_iso,@square_booking_id,@status,@created_at)`)
 
-function loadSession(phone){
-  const r=sessGet.get(phone); if(!r?.json) return null
-  const d=JSON.parse(r.json); if(d.startEU_ms) d.startEU=EURO(Number(d.startEU_ms))
-  return d
-}
-function saveSession(phone,data){
-  const d={...data}; d.startEU_ms = data.startEU?.valueOf?.() ?? null; delete d.startEU
-  sessSet.run(phone, JSON.stringify(d), new Date().toISOString())
-}
-
 // ====== Mini web (QR)
 const app=express(); const PORT=process.env.PORT||8080
 let lastQR=null, conectado=false
@@ -372,7 +358,7 @@ app.get("/",(_req,res)=>res.send(`<!doctype html><meta charset="utf-8"><style>bo
 app.get("/qr.png",async(_req,res)=>{ if(!lastQR) return res.status(404).end(); const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1}); res.set("Content-Type","image/png").send(png) })
 app.listen(PORT,()=>startBot().catch(console.error))
 
-// ====== Baileys loader (compatible)
+// ====== Baileys loader
 async function loadBaileys(){
   const require = createRequire(import.meta.url)
   let mod=null; try{ mod=require("@whiskeysockets/baileys") }catch{}
@@ -387,8 +373,17 @@ async function loadBaileys(){
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
 
-// ====== Bot
-const BOOKING_INTENT = /\b(cita|reserv|hora|pesta(?:n|ñ)as|u(?:n|ñ)as|manicura|pedicura|cejas|microblading|facial|limpieza|masaje|depilaci(?:o|ó)n|laser|l[aá]ser|lash|lifting)\b/i
+// ====== Bot helpers (pestañas)
+const ASK_LASH_TEXT = (haveLoc)=>
+`${haveLoc?"" : "¿En qué salón te viene mejor, *Málaga – La Luz* o *Torremolinos*?\n\n"}¿Qué servicio de *pestañas* necesitas?
+• *Lifting + tinte*
+• *Extensiones nuevas*: pelo a pelo (clásicas) / 2D / 3D
+• *Relleno*: pelo a pelo / 2D / 3D
+• *Quitar* extensiones
+
+Escribe por ejemplo: "Extensiones 2D", "Relleno pelo a pelo" o "Lifting + tinte".`
+
+const BOOKING_INTENT = /\b(cita|reserv|hora|pesta(?:n|ñ)as|extensi|lifting|lash|u(?:n|ñ)as|manicura|pedicura|cejas|microblading|facial|limpieza|masaje|depilaci(?:o|ó)n|laser|l[aá]ser)\b/i
 
 async function startBot(){
   try{
@@ -404,6 +399,15 @@ async function startBot(){
     })
     sock.ev.on("creds.update", saveCreds)
 
+    // ====== Sesiones
+    const sessGet=db.prepare(`SELECT json FROM sessions WHERE phone=?`)
+    const loadSession=(phone)=>{ const r=sessGet.get(phone); if(!r?.json) return null; const d=JSON.parse(r.json); if(d.startEU_ms) d.startEU=EURO(Number(d.startEU_ms)); return d }
+    const sessSet=db.prepare(`INSERT INTO sessions(phone,json,updated_at) VALUES(?,?,?)
+    ON CONFLICT(phone) DO UPDATE SET json=excluded.json, updated_at=excluded.updated_at`)
+    const saveSession=(phone,data)=>{ const d={...data}; d.startEU_ms=data.startEU?.valueOf?.()??null; delete d.startEU; sessSet.run(phone, JSON.stringify(d), new Date().toISOString()) }
+    const sessDel=db.prepare(`DELETE FROM sessions WHERE phone=?`)
+
+    // ====== Mensajes
     sock.ev.on("messages.upsert", async ({ messages })=>{
       const m = messages?.[0]; if(!m?.message || m.key.fromMe) return
       const from = m.key.remoteJid
@@ -411,7 +415,6 @@ async function startBot(){
       const text = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
       if(!text) return
 
-      // session
       let s = loadSession(phone) || { welcomeSent:false, welcomeAtMs:0, locationKey:null, serviceKey:null, startEU:null, durationMin:null, staffId:null, name:null, email:null, confirm:false }
       const tlow = norm(text)
 
@@ -426,8 +429,12 @@ async function startBot(){
       const locTxt = detectLocation(text); if(locTxt){ s.locationKey=locTxt; saveSession(phone,s) }
       const svcTxt = detectService(text); if(svcTxt){ s.serviceKey=svcTxt; s.durationMin = SERVICE[svcTxt]?.dur||60; saveSession(phone,s) }
 
-      // flujo de reserva activo (para no bloquear fuera de horario)
-      const inFlow = !!(s.locationKey || s.serviceKey || dtPref || s.confirm || /\b(la luz|torremolinos)\b/.test(tlow))
+      const mentionsLash = /\bpesta(?:n|ñ)as\b|lash|lifting/.test(tlow)
+      const mentionsExt  = /extensi(?:o|ó)nes/.test(tlow)
+      const mentionsRell = /\brelleno\b/.test(tlow)
+      const hasVariant   = /(pelo a pelo|2d|3d|lifting)/.test(tlow)
+
+      const inFlow = !!(s.locationKey || s.serviceKey || dtPref || s.confirm || mentionsLash)
       const intent = BOOKING_INTENT.test(text) || inFlow
 
       // fuera de horario si no hay intención
@@ -450,21 +457,44 @@ async function startBot(){
         return
       }
 
-      // pedir datos que falten
-      if(!s.serviceKey && /\b(uñas|manicura|pedicura|pesta|cejas|facial|masaje)\b/i.test(tlow)){
+      // ——— PREGUNTA ESPECÍFICA DE PESTAÑAS ———
+      // 1) Dice pestañas sin variante
+      if(mentionsLash && !s.serviceKey && !hasVariant){
+        await sock.sendMessage(from,{ text: ASK_LASH_TEXT(!!s.locationKey) })
+        return
+      }
+      // 2) Dice extensiones o relleno sin 1D/2D/3D
+      if((mentionsExt || mentionsRell) && !hasVariant && !s.serviceKey){
+        await sock.sendMessage(from,{ text: ASK_LASH_TEXT(!!s.locationKey) })
+        return
+      }
+      // 3) Dice "naturales" sin variante
+      if(mentionsLash && /naturales?/.test(tlow) && !s.serviceKey){
+        await sock.sendMessage(from,{ text:`Para un acabado natural solemos recomendar *pelo a pelo* o *3D con pelo muy fino*. ¿Cuál prefieres?` })
+        return
+      }
+
+      // pedir datos que falten (no insistir en local si ya lo dijo)
+      if(!s.serviceKey && /\b(uñas|manicura|pedicura|pesta|cejas|facial|masaje)\b/i.test(tlow) && !mentionsLash){
+        const prefix = s.locationKey ? "" : "¿En qué salón te viene mejor, *Málaga – La Luz* o *Torremolinos*?\n\n"
         await sock.sendMessage(from,{ text:
-`¿Qué necesitas exactamente?
+`${prefix}¿Qué necesitas exactamente?
 • Manicura semipermanente (con o sin nivelación / rusa)
 • Uñas esculpidas (nuevas) o Relleno
 • Pedicura (normal o semipermanente)
 • Lifting de pestañas o Extensiones (pelo a pelo / 2D / 3D)
 • Cejas (diseño con henna / hilo)
 
-Dime una opción y el local (*Málaga – La Luz* o *Torremolinos*).` })
+Dime una opción.` })
         return
       }
       if(s.serviceKey && !s.locationKey){
         await sock.sendMessage(from,{ text:`¿En qué salón te viene mejor, *Málaga – La Luz* o *Torremolinos*?` })
+        return
+      }
+      // Si tiene local pero pidió pestañas genérico, volver a menú de pestañas
+      if(s.locationKey && !s.serviceKey && mentionsLash){
+        await sock.sendMessage(from,{ text: ASK_LASH_TEXT(true) })
         return
       }
 
@@ -480,7 +510,6 @@ Dime una opción y el local (*Málaga – La Luz* o *Torremolinos*).` })
           await sock.sendMessage(from,{ text:`Te puedo ofrecer *${fmtES(slot.startEU)}* en *${LOCATION_NAMES[locId]}* para *${SERVICE[s.serviceKey].name}*. ¿Confirmo? (Pago en persona)` })
           return
         }else{
-          // Fallback si Square retorna 400/422 o sin huecos
           await sock.sendMessage(from,{ text:`No puedo ver huecos seguros ahora mismo. Dime un *día y hora exactos* que te vengan bien y te lo intento coger manualmente.` })
           return
         }
@@ -530,9 +559,12 @@ Pago en persona.` })
         return
       }
 
-      // fallback IA (sin inventar)
-      const ai = await aiReply(`Mensaje del cliente: "${text}". Si falta local o servicio, pide SOLO eso en una frase.`)
-      await sock.sendMessage(from,{ text: ai || "¿Te viene mejor *Málaga – La Luz* o *Torremolinos*? Y dime el servicio (ej.: “manicura semipermanente”)." })
+      // fallback IA con contexto (pregunta pestañas si toca)
+      const ai = await aiReply(
+        `Mensaje del cliente: "${text}". Ya tengo local=${!!s.locationKey}, servicio=${!!s.serviceKey}.`,
+        { haveLoc:!!s.locationKey, haveSvc:!!s.serviceKey, lash:mentionsLash }
+      )
+      await sock.sendMessage(from,{ text: ai || (mentionsLash? ASK_LASH_TEXT(!!s.locationKey) : "¿Te viene mejor *Málaga – La Luz* o *Torremolinos*? Y dime el servicio (ej.: “manicura semipermanente”).") })
     })
   }catch(e){ console.error("startBot:", e?.message||e) }
 }
