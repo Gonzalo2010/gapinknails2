@@ -1,4 +1,10 @@
-// index.js — Gapink Nails · v13 “IA robusta • 2 locales • elección de técnica • Square-safe”
+// index.js — Gapink Nails · v13.2
+// “IA robusta • 2 locales • elección de técnica • Square-safe • sesión estable”
+//
+// Cambios clave v13.2:
+//  - lastOptions se persiste como lastOptions_ms y se rehidrata a dayjs (adiós .format/.clone undefined)
+//  - selectedStartEU se rehace a dayjs si llega como string/number
+//  - coerción defensiva de arrays de opciones antes de usarlas
 
 import express from "express"
 import pino from "pino"
@@ -128,6 +134,19 @@ function nextOpeningFrom(d){
   return t
 }
 
+// Coerciones robustas a dayjs
+function toDayjsEU(x){
+  if (!x) return null
+  if (dayjs.isDayjs(x)) return x.tz(EURO_TZ)
+  if (typeof x === "number") return dayjs.tz(x, EURO_TZ)
+  if (typeof x === "string") return dayjs.tz(x, EURO_TZ)
+  return null
+}
+function coerceOffers(arr){
+  if (!Array.isArray(arr) || !arr.length) return []
+  return arr.map(o => toDayjsEU(o)).filter(d => d && d.isValid())
+}
+
 // ====== DB mínima
 const db=new Database("gapink.db");db.pragma("journal_mode = WAL")
 db.exec(`
@@ -163,15 +182,28 @@ function loadSession(phone){
   const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
   if (!row?.data_json) return null
   const json = JSON.parse(row.data_json)
+
+  // Rehidratación robusta
   if (json.startEU_ms) json.startEU = dayjs.tz(json.startEU_ms, EURO_TZ)
   if (json.selectedStartEU_ms) json.selectedStartEU = dayjs.tz(json.selectedStartEU_ms, EURO_TZ)
+  // lastOptions: si vienen como ms -> dayjs; si vienen como strings ISO (versiones previas), también
+  if (Array.isArray(json.lastOptions_ms) && json.lastOptions_ms.length){
+    json.lastOptions = json.lastOptions_ms.map(ms => dayjs.tz(ms, EURO_TZ))
+  } else if (Array.isArray(json.lastOptions) && json.lastOptions.length){
+    json.lastOptions = coerceOffers(json.lastOptions)
+  } else {
+    json.lastOptions = []
+  }
   return json
 }
 function saveSession(phone, data){
   const d={...data}
+  // Persistimos en milisegundos y NO guardamos objetos dayjs crudos
   d.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null
   d.selectedStartEU_ms = data.selectedStartEU?.valueOf?.() ?? data.selectedStartEU_ms ?? null
-  delete d.startEU; delete d.selectedStartEU
+  d.lastOptions_ms = Array.isArray(data.lastOptions) ? data.lastOptions.map(o => toDayjsEU(o)?.valueOf?.() ?? null).filter(Boolean) : []
+  delete d.startEU; delete d.selectedStartEU; delete d.lastOptions
+
   const j = JSON.stringify(d)
   const upd = db.prepare(`UPDATE sessions SET data_json=@data_json, updated_at=@updated_at WHERE phone=@phone`)
   const res = upd.run({ phone, data_json:j, updated_at:new Date().toISOString() })
@@ -184,12 +216,9 @@ function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phon
 
 // ====== Empleadas (dinámico por .env “ID|BOOKABLE|LOCS”), con etiquetas de nombre
 function deriveLabelsFromEnvKey(envKey){
-  // SQ_EMP_DESI_DESI -> ["desi"]
-  // SQ_EMP_ROCIO_CHICA_ROCIO -> ["rocio","chica"]
   const raw = envKey.replace(/^SQ_EMP_/, "")
   const toks = raw.split("_").map(t=>norm(t)).filter(t=>t && t!=="sq" && t!=="emp")
   const uniq = Array.from(new Set(toks))
-  // elige etiquetas útiles (1 y 2 tokens)
   const labels = [...uniq]
   if (uniq.length>1) labels.push(uniq.join(" "))
   return labels
@@ -211,8 +240,7 @@ const EMPLOYEES = parseEmployees()
 
 function detectPreferredStaff(text, locKey){
   const t = norm(text)
-  const locId = locationToId(locKey)
-  // match por cualquier etiqueta
+  const locId = locationToId(locKey||"torre")
   let cand = null
   for (const e of EMPLOYEES){
     if (e.labels.some(lbl => t.includes(lbl))){
@@ -220,7 +248,6 @@ function detectPreferredStaff(text, locKey){
     }
   }
   if (!cand) return null
-  // si no es bookable o no trabaja en ese local, lo marcamos “preferido” pero no forzamos
   if (!cand.bookable || !(cand.allow.includes("ALL") || cand.allow.includes(locId))) {
     return { id: null, preferId: cand.id, preferLabel: (cand.labels[0]||"") }
   }
@@ -229,12 +256,10 @@ function detectPreferredStaff(text, locKey){
 
 function pickStaffForLocation(locKey, preferId=null){
   const locId = locationToId(locKey)
-  // primero, si preferId es válido-bookable
   if (preferId){
     const e = EMPLOYEES.find(x=>x.id===preferId)
     if (e && e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId))) return e.id
   }
-  // si no, cualquiera bookable del local
   const found = EMPLOYEES.find(e=>e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
   return found?.id || null
 }
@@ -439,22 +464,21 @@ function parseDateTimeEU(text){
 // ====== Selección por “el primero / el segundo / 10:00 / 1”
 function parseChoiceIndex(text){
   const t = norm(text)
-  // ordinales
   if (/\b(primero|primera|1ro|1ª|1a|1º)\b/.test(t)) return 0
   if (/\b(segundo|segunda|2do|2ª|2a|2º)\b/.test(t)) return 1
   if (/\b(tercero|tercera|3ro|3ª|3a|3º)\b/.test(t)) return 2
-  // número suelto 1/2/3
   const n = t.match(/\b([123])\b/); if (n) return Number(n[1])-1
   return null
 }
 function parseTimeAgainstOffers(text, offers){
-  if (!offers?.length) return null
+  const list = coerceOffers(offers)
+  if (!list.length) return null
   const t = norm(text)
   const hm = t.match(/\b(\d{1,2})(?::(\d{2}))?\b/)
   if (!hm) return null
   const hh = +hm[1], mi = hm[2]?+hm[2]:0
   const target = `${String(hh).padStart(2,"0")}:${String(mi).padStart(2,"0")}`
-  const hit = offers.find(o => o.format("HH:mm")===target)
+  const hit = list.find(o => o.format("HH:mm")===target)
   return hit || null
 }
 
@@ -616,7 +640,7 @@ async function startBot(){
         }
       }
 
-      // ===== Captura LOCAL + SERVICIO + PREFERENCIA DE STAFF (en cualquier momento)
+      // ===== Captura LOCAL + SERVICIO + PREFERENCIA DE STAFF
       const locTxt = detectLocation(text); if (locTxt) s.locationKey = locTxt
       const svcTxt = detectService(text);  if (svcTxt) { s.serviceKey = svcTxt; s.durationMin = SVC[svcTxt]?.dur || 60 }
       const staffPref = detectPreferredStaff(text, s.locationKey || "torre")
@@ -647,6 +671,12 @@ async function startBot(){
         saveSession(phone,s); return
       }
 
+      // ===== Rehidratar opciones/selección por si tocaron disco
+      s.lastOptions = coerceOffers(s.lastOptions)
+      if (s.selectedStartEU && !dayjs.isDayjs(s.selectedStartEU)) {
+        s.selectedStartEU = toDayjsEU(s.selectedStartEU)
+      }
+
       // ===== Si ya dimos opciones: entiende “el primero / a las 10 / 1 / con desi”
       let picked = null
       if (s.lastOptions?.length){
@@ -657,14 +687,12 @@ async function startBot(){
         if (!picked && saysYes) picked = s.lastOptions[0]
         if (picked){
           s.selectedStartEU = picked
-          // si vuelve a decir “con X” ahora, ya lo capturamos arriba
           saveSession(phone,s)
         }
       }
 
-      // ===== Si no hemos propuesto aún o no hay selección, proponemos
+      // ===== Intento de parsing directo (ej. “lunes 10:00”)
       if (!s.selectedStartEU){
-        // ¿parsing directo de “a las 10:00” sin día? -> intenta casar con ofertas
         const parsed = parseDateTimeEU(text)
         if (parsed){
           s.selectedStartEU = ceilToSlotEU(parsed)
@@ -672,8 +700,8 @@ async function startBot(){
         }
       }
 
+      // ===== Proponer si aún no hay selección
       if (!s.selectedStartEU){
-        // Proponer huecos a partir de ahora
         const base = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
         const fromEU = nextOpeningFrom(base)
         const opts = proposeSlots({ fromEU, durationMin: s.durationMin, n: 3 })
@@ -688,8 +716,7 @@ ${list}
         saveSession(phone,s); return
       }
 
-      // ===== En este punto hay selección (p. ej. “el primero” o “a las 10, con desi”)
-      // Comprobamos nombre/email o cliente existente
+      // ===== Cierre: nombre/email/cliente/booking
       let customer = await squareFindCustomerByPhone(phone)
       if (!customer){
         if (!s.name){
@@ -698,7 +725,6 @@ ${list}
           return
         }
         if (!s.email){
-          // Intento IA ultra-cauta (no responde si duda)
           const guess = await aiChat([
             { role:"system", content:"Extrae de forma ultra-cauta nombre y email si aparecen. Responde SOLO JSON con {\"name\":\"\",\"email\":\"\"}. Si dudas, deja vacío." },
             { role:"user", content:text }
@@ -713,7 +739,6 @@ ${list}
           await sock.sendMessage(from,{ text:"Genial. Ahora tu email (tipo: nombre@correo.com)." })
           return
         }
-        // crear cliente
         customer = await squareCreateCustomer({ givenName: s.name, emailAddress: s.email, phoneNumber: phone })
         if (!customer){
           await sock.sendMessage(from,{ text:"Ese email no me funciona 🤕. Mándame uno válido y sigo." })
@@ -721,21 +746,20 @@ ${list}
         }
       }
 
-      // Staff final (respeta preferencia si es válida en ese local)
+      // Staff final
       const teamId = pickStaffForLocation(s.locationKey, s.preferredStaffId)
       if (!teamId){
         await sock.sendMessage(from,{ text:"Ahora mismo no puedo asignar profesional para ese salón. ¿Te da igual con quién?" })
         return
       }
 
-      const startEU = ceilToSlotEU(s.selectedStartEU.clone())
+      const startEU = ceilToSlotEU(toDayjsEU(s.selectedStartEU).clone())
       if (!insideBusinessHours(startEU, s.durationMin)){
         s.selectedStartEU = null
         await sock.sendMessage(from,{ text:"Esa hora cae fuera de horario. Dime otra dentro de L–V 10–14 o 16–20." })
         saveSession(phone,s); return
       }
 
-      // Guardamos y creamos en Square
       const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(s.durationMin,"minute")
       const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
       insertAppt.run({
