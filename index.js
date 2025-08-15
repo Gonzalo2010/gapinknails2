@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v12.1 “Baileys robusto + IA pestañas + 2 locales + Square-safe”
+// index.js — Gapink Nails · v13 “IA robusta • 2 locales • elección de técnica • Square-safe”
 
 import express from "express"
 import pino from "pino"
@@ -10,15 +10,13 @@ import Database from "better-sqlite3"
 import dayjs from "dayjs"
 import utc from "dayjs/plugin/utc.js"
 import tz from "dayjs/plugin/timezone.js"
-import isSameOrAfter from "dayjs/plugin/isSameOrBefore.js" // <- naming fix
-import isSameOrBefore from "dayjs/plugin/isSameOrBefore.js"
 import "dayjs/locale/es.js"
 import { webcrypto, createHash } from "crypto"
 import { createRequire } from "module"
 import { Client, Environment } from "square"
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto
-dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isSameOrBefore); dayjs.extend(isSameOrBefore) // idempotente
+dayjs.extend(utc); dayjs.extend(tz)
 dayjs.locale("es")
 
 // ====== Zona/horario negocio (España)
@@ -35,7 +33,7 @@ const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
 const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,01/11,06/12,08/12,25/12")
   .split(",").map(s => s.trim()).filter(Boolean)
 
-// ====== OpenAI (IA ligera para extracción y tono si hace falta)
+// ====== OpenAI (IA para extracción ultra-cauta de nombre/email)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini"
 const OPENAI_API_URL = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
@@ -64,13 +62,13 @@ const square = new Client({
 const LOC_TORRE = (process.env.SQUARE_LOCATION_ID || "").trim()
 const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "").trim()
 
-// Textos de dirección (al cliente)
+// Textos de dirección
 const ADDRESS_TORRE = process.env.ADDRESS_TORREMOLINOS || "Av. de Benyamina 18, Torremolinos"
 const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Luz"
 
 // ====== Helpers
 const onlyDigits = s => String(s||"").replace(/\D+/g,"")
-const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
+const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu, "")
 const norm = s => rm(s).toLowerCase()
   .replace(/[+.,;:()/_-]/g, " ")
   .replace(/[^\p{Letter}\p{Number}\s]/gu, " ")
@@ -85,7 +83,7 @@ function normalizePhoneES(raw){
   return `+${d}`
 }
 
-const YES_RE = /\b(s[ií]|ok|vale|okey|okay|va|genial|de acuerdo|confirmo|perfecto|si claro|yes)\b/i
+const YES_RE = /\b(s[ií]|ok|vale|okey|okay|va|genial|de acuerdo|confirmo|perfecto|si claro|sí claro|yes)\b/i
 const NO_RE  = /\b(no|otra|cambia|cambiar|cancel|cancela|anula|mejor mas tarde|mejor más tarde)\b/i
 
 // Detección local
@@ -160,19 +158,20 @@ const insertAppt = db.prepare(`INSERT INTO appointments
 (id, customer_name, customer_phone, customer_square_id, location_key, service_key, service_name, duration_min, start_iso, end_iso, staff_id, status, created_at, square_booking_id)
 VALUES (@id,@customer_name,@customer_phone,@customer_square_id,@location_key,@service_key,@service_name,@duration_min,@start_iso,@end_iso,@staff_id,@status,@created_at,@square_booking_id)`)
 const updateApptStatus = db.prepare(`UPDATE appointments SET status=@status, square_booking_id=@square_booking_id WHERE id=@id`)
-const selectUpcomingByPhone = db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso LIMIT 1`)
 
 function loadSession(phone){
   const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
   if (!row?.data_json) return null
   const json = JSON.parse(row.data_json)
   if (json.startEU_ms) json.startEU = dayjs.tz(json.startEU_ms, EURO_TZ)
+  if (json.selectedStartEU_ms) json.selectedStartEU = dayjs.tz(json.selectedStartEU_ms, EURO_TZ)
   return json
 }
 function saveSession(phone, data){
   const d={...data}
   d.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null
-  delete d.startEU
+  d.selectedStartEU_ms = data.selectedStartEU?.valueOf?.() ?? data.selectedStartEU_ms ?? null
+  delete d.startEU; delete d.selectedStartEU
   const j = JSON.stringify(d)
   const upd = db.prepare(`UPDATE sessions SET data_json=@data_json, updated_at=@updated_at WHERE phone=@phone`)
   const res = upd.run({ phone, data_json:j, updated_at:new Date().toISOString() })
@@ -183,7 +182,18 @@ function saveSession(phone, data){
 }
 function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
 
-// ====== Empleadas (dinámico por .env “ID|BOOKABLE|LOCS”)
+// ====== Empleadas (dinámico por .env “ID|BOOKABLE|LOCS”), con etiquetas de nombre
+function deriveLabelsFromEnvKey(envKey){
+  // SQ_EMP_DESI_DESI -> ["desi"]
+  // SQ_EMP_ROCIO_CHICA_ROCIO -> ["rocio","chica"]
+  const raw = envKey.replace(/^SQ_EMP_/, "")
+  const toks = raw.split("_").map(t=>norm(t)).filter(t=>t && t!=="sq" && t!=="emp")
+  const uniq = Array.from(new Set(toks))
+  // elige etiquetas útiles (1 y 2 tokens)
+  const labels = [...uniq]
+  if (uniq.length>1) labels.push(uniq.join(" "))
+  return labels
+}
 function parseEmployees(){
   const out=[]
   for (const [k,v] of Object.entries(process.env)) {
@@ -192,13 +202,39 @@ function parseEmployees(){
     if (!id) continue
     const bookable = (book||"").toUpperCase()==="BOOKABLE"
     const allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
-    out.push({ envKey:k, id, bookable, allow })
+    const labels = deriveLabelsFromEnvKey(k)
+    out.push({ envKey:k, id, bookable, allow, labels })
   }
   return out
 }
 const EMPLOYEES = parseEmployees()
-function pickStaffForLocation(locKey){
+
+function detectPreferredStaff(text, locKey){
+  const t = norm(text)
   const locId = locationToId(locKey)
+  // match por cualquier etiqueta
+  let cand = null
+  for (const e of EMPLOYEES){
+    if (e.labels.some(lbl => t.includes(lbl))){
+      cand = e; break
+    }
+  }
+  if (!cand) return null
+  // si no es bookable o no trabaja en ese local, lo marcamos “preferido” pero no forzamos
+  if (!cand.bookable || !(cand.allow.includes("ALL") || cand.allow.includes(locId))) {
+    return { id: null, preferId: cand.id, preferLabel: (cand.labels[0]||"") }
+  }
+  return { id: cand.id, preferId: cand.id, preferLabel: (cand.labels[0]||"") }
+}
+
+function pickStaffForLocation(locKey, preferId=null){
+  const locId = locationToId(locKey)
+  // primero, si preferId es válido-bookable
+  if (preferId){
+    const e = EMPLOYEES.find(x=>x.id===preferId)
+    if (e && e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId))) return e.id
+  }
+  // si no, cualquiera bookable del local
   const found = EMPLOYEES.find(e=>e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
   return found?.id || null
 }
@@ -248,7 +284,7 @@ function detectService(text){
   for (const [label,key,extra] of SVC_SYNON) {
     if (t.includes(norm(label)) || (extra||[]).some(x => t.includes(norm(x)))) return key
   }
-  // fuzzy por palabras
+  // fuzzy simple
   const tokens=t.split(/\s+/).filter(Boolean)
   let best=null, scoreBest=0
   for (const k of SERVICE_KEYS) {
@@ -308,16 +344,6 @@ async function createSquareBooking({ startEU, serviceKey, locationKey, customerI
     return resp?.result?.booking || null
   }catch(e){ console.error("createSquareBooking:", e?.message||e); return null }
 }
-async function cancelSquareBooking(bookingId){
-  try{
-    const get=await square.bookingsApi.retrieveBooking(bookingId)
-    const version=get?.result?.booking?.version
-    if (!version) return false
-    const body={ idempotencyKey:`cancel_${bookingId}_${Date.now()}`, bookingVersion:version }
-    const r=await square.bookingsApi.cancelBooking(bookingId, body)
-    return !!r?.result?.booking?.id
-  }catch{ return false }
-}
 
 // ====== Clientes Square
 function isValidEmail(e){ return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim()) }
@@ -339,7 +365,7 @@ async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }){
   }catch(e){ console.error("squareCreateCustomer:", e?.message||e); return null }
 }
 
-// ====== Propuestas de hora (no availability; se corrige si Square rechaza)
+// ====== Propuestas de hora (no availability)
 function fmtES(d){
   const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]
   const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ)
@@ -368,6 +394,68 @@ function proposeSlots({ fromEU, durationMin, n=3 }){
     }
   }
   return out
+}
+
+// ====== Parser de fecha/hora simple
+const DOW = { domingo:0,lunes:1,martes:2,miércoles:3,miercoles:3,jueves:4,viernes:5,sábado:6,sabado:6 }
+const WHEN = { hoy:0, today:0, mañana:1, manana:1, tomorrow:1 }
+function parseDateTimeEU(text){
+  const t = norm(text)
+  const m = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\s+(\d{1,2})(?::(\d{2}))?\b/)
+  if (m){
+    let dd=+m[1], mm=+m[2], yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year()
+    if (yy<100) yy+=2000
+    const hh=+m[4], mi=m[5]?+m[5]:0
+    let dt=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} ${String(hh).padStart(2,"0")}:${String(mi).padStart(2,"0")}`, EURO_TZ)
+    const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
+    if (dt.isBefore(guard)) dt = guard
+    return dt
+  }
+  const hm = t.match(/\b(\d{1,2})(?::(\d{2}))?\b/)
+  const w = Object.keys(WHEN).find(k=>t.includes(k))
+  if (w && hm){
+    const base = dayjs().tz(EURO_TZ).add(WHEN[w],"day").startOf("day")
+    let dt = base.hour(+hm[1]).minute(hm[2]?+hm[2]:0)
+    const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
+    if (dt.isBefore(guard)) dt = guard
+    return dt
+  }
+  for (const [name, dow] of Object.entries(DOW)){
+    if (t.includes(name) && hm){
+      const now = dayjs().tz(EURO_TZ)
+      let dd = now.startOf("day")
+      let delta = (dow - dd.day() + 7) % 7
+      if (delta===0 && now.hour()>=AFTERNOON.end) delta=7
+      dd = dd.add(delta,"day")
+      let dt = dd.hour(+hm[1]).minute(hm[2]?+hm[2]:0)
+      const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
+      if (dt.isBefore(guard)) dt = guard
+      return dt
+    }
+  }
+  return null
+}
+
+// ====== Selección por “el primero / el segundo / 10:00 / 1”
+function parseChoiceIndex(text){
+  const t = norm(text)
+  // ordinales
+  if (/\b(primero|primera|1ro|1ª|1a|1º)\b/.test(t)) return 0
+  if (/\b(segundo|segunda|2do|2ª|2a|2º)\b/.test(t)) return 1
+  if (/\b(tercero|tercera|3ro|3ª|3a|3º)\b/.test(t)) return 2
+  // número suelto 1/2/3
+  const n = t.match(/\b([123])\b/); if (n) return Number(n[1])-1
+  return null
+}
+function parseTimeAgainstOffers(text, offers){
+  if (!offers?.length) return null
+  const t = norm(text)
+  const hm = t.match(/\b(\d{1,2})(?::(\d{2}))?\b/)
+  if (!hm) return null
+  const hh = +hm[1], mi = hm[2]?+hm[2]:0
+  const target = `${String(hh).padStart(2,"0")}:${String(mi).padStart(2,"0")}`
+  const hit = offers.find(o => o.format("HH:mm")===target)
+  return hit || null
 }
 
 // ====== Mensajes tipo
@@ -400,14 +488,14 @@ const ASK_LASH = (haveLoc)=>
 
 Escribe por ejemplo: "Extensiones 2D", "Relleno pelo a pelo" o "Lifting + tinte".`
 
-// ====== Mini-web y WhatsApp
+// ====== Mini-web
 const app=express()
 const PORT=process.env.PORT||8080
 let lastQR=null, conectado=false, sock=null
 
 app.get("/", (_req,res)=>{
   res.send(`<!doctype html><meta charset="utf-8"><style>
-  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#fff}
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh}
   .card{max-width:560px;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08)}
   </style><div class="card"><h1>Gapink Nails</h1>
   <p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>
@@ -422,7 +510,7 @@ app.get("/qr.png", async (_req,res)=>{
 
 app.listen(PORT, ()=>{ console.log("🌐 Web", PORT); startBot().catch(console.error) })
 
-// ====== Carga ROBUSTA de Baileys (soporta ESM/CJS sin romper)
+// ====== Carga ROBUSTA de Baileys (ESM/CJS)
 async function loadBaileys(){
   const require = createRequire(import.meta.url)
   let mod = null
@@ -432,7 +520,6 @@ async function loadBaileys(){
   }
   if (!mod) throw new Error("No se pudo cargar @whiskeysockets/baileys")
 
-  // Normaliza distintas formas de export
   const makeWASocket =
     mod.makeWASocket ||
     mod.default?.makeWASocket ||
@@ -490,18 +577,19 @@ async function startBot(){
 
       let s = loadSession(phone) || {
         greeted:false, lastOOHDay:null,
-        locationKey:null, serviceKey:null, durationMin:null, startEU:null,
-        name:null, email:null,
-        pendingConfirm:false, lastOptions:[], teamId:null
+        locationKey:null, serviceKey:null, durationMin:null,
+        lastOptions:[], pendingConfirm:false,
+        selectedStartEU:null, preferredStaffId:null, preferredStaffLabel:null,
+        name:null, email:null, awaitingName:false, awaitingEmail:false
       }
 
-      // Mensaje de bienvenida (una sola vez)
+      // ===== Bienvenida (una vez)
       if (!s.greeted){
         await sock.sendMessage(from, { text: WELCOME_MSG })
         s.greeted=true; saveSession(phone,s)
       }
 
-      // Fuera de horario ⇒ aviso 1 vez por día
+      // ===== Fuera de horario ⇒ aviso 1 vez/día
       const nowEU = dayjs().tz(EURO_TZ)
       const isOpenNow = insideBusinessHours(nowEU.clone(), 15)
       const todayKey = nowEU.format("YYYY-MM-DD")
@@ -510,18 +598,41 @@ async function startBot(){
         s.lastOOHDay = todayKey; saveSession(phone,s)
       }
 
-      // Captura de local + servicio en cualquier orden
+      // ===== Si estamos esperando NOMBRE/EMAIL, captura directa y sigue al cierre
+      if (s.awaitingName){
+        const candidate = text.replace(/\s+/g," ").trim()
+        if (candidate.length>=3){
+          s.name = candidate; s.awaitingName=false; saveSession(phone,s)
+        } else {
+          await sock.sendMessage(from,{ text:"Dime tu *nombre y apellidos* (por ejemplo: Ana López)." })
+          return
+        }
+      } else if (s.awaitingEmail){
+        if (isValidEmail(text)){
+          s.email = text.trim(); s.awaitingEmail=false; saveSession(phone,s)
+        } else {
+          await sock.sendMessage(from,{ text:"Necesito un email válido (ej.: nombre@correo.com)." })
+          return
+        }
+      }
+
+      // ===== Captura LOCAL + SERVICIO + PREFERENCIA DE STAFF (en cualquier momento)
       const locTxt = detectLocation(text); if (locTxt) s.locationKey = locTxt
       const svcTxt = detectService(text);  if (svcTxt) { s.serviceKey = svcTxt; s.durationMin = SVC[svcTxt]?.dur || 60 }
+      const staffPref = detectPreferredStaff(text, s.locationKey || "torre")
+      if (staffPref){
+        s.preferredStaffId = staffPref.preferId || s.preferredStaffId
+        s.preferredStaffLabel = staffPref.preferLabel || s.preferredStaffLabel
+      }
 
-      // Pestañas: si lo menciona pero sin tipo, mostrar menú específico (sin repetir local si ya lo dijo)
+      // ===== Menú pestañas si hace falta
       const mentionsLash = /\bpesta(?:n|ñ)as\b/.test(low) || /lash/.test(low) || /lifting/.test(low)
       if (mentionsLash && !s.serviceKey){
         await sock.sendMessage(from, { text: ASK_LASH(!!s.locationKey) })
         saveSession(phone,s); return
       }
 
-      // Si falta local + servicio
+      // ===== Falta info base
       if (!s.locationKey && !s.serviceKey){
         await sock.sendMessage(from, { text: ASK_LOC_AND_SVC })
         saveSession(phone,s); return
@@ -536,22 +647,33 @@ async function startBot(){
         saveSession(phone,s); return
       }
 
-      // En este punto tenemos local + servicio
-      const userYes = YES_RE.test(text)
-      const userNo  = NO_RE.test(text)
-
-      if (s.pendingConfirm && userNo){
-        s.pendingConfirm=false; s.lastOptions=[]
-        await sock.sendMessage(from,{ text:"Sin problema. Dime otra hora o día que te venga bien 😄" })
-        saveSession(phone,s); return
+      // ===== Si ya dimos opciones: entiende “el primero / a las 10 / 1 / con desi”
+      let picked = null
+      if (s.lastOptions?.length){
+        const idx = parseChoiceIndex(text)
+        if (idx!=null && s.lastOptions[idx]) picked = s.lastOptions[idx]
+        if (!picked) picked = parseTimeAgainstOffers(text, s.lastOptions)
+        const saysYes = YES_RE.test(text)
+        if (!picked && saysYes) picked = s.lastOptions[0]
+        if (picked){
+          s.selectedStartEU = picked
+          // si vuelve a decir “con X” ahora, ya lo capturamos arriba
+          saveSession(phone,s)
+        }
       }
 
-      // Propuesta de huecos “inteligente” (sin availability)
-      let parsedTime = parseDateTimeEU(text)
-      if (!parsedTime && userYes && s.lastOptions?.length){
-        parsedTime = s.lastOptions[0]
+      // ===== Si no hemos propuesto aún o no hay selección, proponemos
+      if (!s.selectedStartEU){
+        // ¿parsing directo de “a las 10:00” sin día? -> intenta casar con ofertas
+        const parsed = parseDateTimeEU(text)
+        if (parsed){
+          s.selectedStartEU = ceilToSlotEU(parsed)
+          saveSession(phone,s)
+        }
       }
-      if (!parsedTime){
+
+      if (!s.selectedStartEU){
+        // Proponer huecos a partir de ahora
         const base = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
         const fromEU = nextOpeningFrom(base)
         const opts = proposeSlots({ fromEU, durationMin: s.durationMin, n: 3 })
@@ -559,124 +681,92 @@ async function startBot(){
         s.pendingConfirm = true
         const list = opts.map(x=>`• ${fmtES(x)}`).join("\n")
         await sock.sendMessage(from, { text:
-          `Tengo estos huecos para *${SVC[s.serviceKey].name}* en *${locationNice(s.locationKey)}*:\n${list}\n\n¿Te viene bien el primero? Si prefieres otro día/hora, dímelo.`
-        })
+`Tengo estos huecos para *${SVC[s.serviceKey].name}* en *${locationNice(s.locationKey)}*:
+${list}
+
+¿Te viene bien el primero? Si prefieres otro día/hora, dímelo.${s.preferredStaffLabel?`\nSi puedo, te lo asigno con *${s.preferredStaffLabel}*.`:""}` })
         saveSession(phone,s); return
       }
 
-      // Confirmación ⇒ crear cliente y booking en Square
-      if (parsedTime){
-        if (!s.name || !s.email){
+      // ===== En este punto hay selección (p. ej. “el primero” o “a las 10, con desi”)
+      // Comprobamos nombre/email o cliente existente
+      let customer = await squareFindCustomerByPhone(phone)
+      if (!customer){
+        if (!s.name){
+          s.awaitingName = true; saveSession(phone,s)
+          await sock.sendMessage(from,{ text:"Para cerrar, dime tu *nombre y apellidos*." })
+          return
+        }
+        if (!s.email){
+          // Intento IA ultra-cauta (no responde si duda)
           const guess = await aiChat([
             { role:"system", content:"Extrae de forma ultra-cauta nombre y email si aparecen. Responde SOLO JSON con {\"name\":\"\",\"email\":\"\"}. Si dudas, deja vacío." },
             { role:"user", content:text }
           ])
           try {
             const j = JSON.parse(guess)
-            if (!s.name && j?.name) s.name = String(j.name).slice(0,64)
             if (!s.email && j?.email && isValidEmail(j.email)) s.email = j.email
           } catch {}
         }
-        if (!s.name){
-          await sock.sendMessage(from,{ text:"Para cerrar, dime tu *nombre y apellidos*." })
-          saveSession(phone,s); return
-        }
         if (!s.email){
+          s.awaitingEmail = true; saveSession(phone,s)
           await sock.sendMessage(from,{ text:"Genial. Ahora tu email (tipo: nombre@correo.com)." })
-          saveSession(phone,s); return
+          return
         }
-
-        let customer = await squareFindCustomerByPhone(phone)
+        // crear cliente
+        customer = await squareCreateCustomer({ givenName: s.name, emailAddress: s.email, phoneNumber: phone })
         if (!customer){
-          customer = await squareCreateCustomer({ givenName: s.name, emailAddress: s.email, phoneNumber: phone })
-          if (!customer){ await sock.sendMessage(from,{ text:"Ese email no me funciona 🤕. Mándame uno válido y sigo." }); return }
-        }
-
-        const teamId = pickStaffForLocation(s.locationKey)
-        if (!teamId){
-          await sock.sendMessage(from,{ text:"Ahora mismo no puedo asignar profesional para ese salón. ¿Te da igual con quién?" })
+          await sock.sendMessage(from,{ text:"Ese email no me funciona 🤕. Mándame uno válido y sigo." })
           return
         }
+      }
 
-        const startEU = ceilToSlotEU(parsedTime.clone())
-        if (!insideBusinessHours(startEU, s.durationMin)){
-          await sock.sendMessage(from,{ text:"Esa hora cae fuera de horario. Dime otra dentro de L–V 10–14 o 16–20." })
-          return
-        }
+      // Staff final (respeta preferencia si es válida en ese local)
+      const teamId = pickStaffForLocation(s.locationKey, s.preferredStaffId)
+      if (!teamId){
+        await sock.sendMessage(from,{ text:"Ahora mismo no puedo asignar profesional para ese salón. ¿Te da igual con quién?" })
+        return
+      }
 
-        const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(s.durationMin,"minute")
-        const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
-        insertAppt.run({
-          id:aptId, customer_name:s.name, customer_phone:phone, customer_square_id:customer.id,
-          location_key:s.locationKey, service_key:s.serviceKey, service_name:SVC[s.serviceKey].name, duration_min:s.durationMin,
-          start_iso:startUTC.toISOString(), end_iso:endUTC.toISOString(), staff_id:teamId, status:"pending",
-          created_at:new Date().toISOString(), square_booking_id:null
-        })
+      const startEU = ceilToSlotEU(s.selectedStartEU.clone())
+      if (!insideBusinessHours(startEU, s.durationMin)){
+        s.selectedStartEU = null
+        await sock.sendMessage(from,{ text:"Esa hora cae fuera de horario. Dime otra dentro de L–V 10–14 o 16–20." })
+        saveSession(phone,s); return
+      }
 
-        const sq = await createSquareBooking({
-          startEU, serviceKey:s.serviceKey, locationKey:s.locationKey, customerId:customer.id, teamMemberId:teamId
-        })
-        if (!sq){
-          db.prepare(`DELETE FROM appointments WHERE id=@id`).run({id:aptId})
-          s.pendingConfirm=false
-          await sock.sendMessage(from,{ text:"No pude reservar ese hueco. Dime otra hora/día y lo intento de nuevo, o usa el link: https://gapinknails.square.site/" })
-          saveSession(phone,s); return
-        }
+      // Guardamos y creamos en Square
+      const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(s.durationMin,"minute")
+      const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
+      insertAppt.run({
+        id:aptId, customer_name:s.name || customer?.givenName || null, customer_phone:phone, customer_square_id:customer.id,
+        location_key:s.locationKey, service_key:s.serviceKey, service_name:SVC[s.serviceKey].name, duration_min:s.durationMin,
+        start_iso:startUTC.toISOString(), end_iso:endUTC.toISOString(), staff_id:teamId, status:"pending",
+        created_at:new Date().toISOString(), square_booking_id:null
+      })
 
-        updateApptStatus.run({ id:aptId, status:"confirmed", square_booking_id: sq.id || null })
-        s.pendingConfirm=false; s.lastOptions=[]
-        await sock.sendMessage(from,{ text:
+      const sq = await createSquareBooking({
+        startEU, serviceKey:s.serviceKey, locationKey:s.locationKey, customerId:customer.id, teamMemberId:teamId
+      })
+      if (!sq){
+        db.prepare(`DELETE FROM appointments WHERE id=@id`).run({id:aptId})
+        s.pendingConfirm=false; s.selectedStartEU=null
+        await sock.sendMessage(from,{ text:"No pude reservar ese hueco. Dime otra hora/día y lo intento de nuevo, o usa el link: https://gapinknails.square.site/" })
+        saveSession(phone,s); return
+      }
+
+      updateApptStatus.run({ id:aptId, status:"confirmed", square_booking_id: sq.id || null })
+      await sock.sendMessage(from,{ text:
 `Reserva confirmada 🎉
 Salón: ${locationNice(s.locationKey)} (${locationToAddress(s.locationKey)})
-Servicio: ${SVC[s.serviceKey].name}
+Servicio: ${SVC[s.serviceKey].name}${s.preferredStaffLabel?`\nProfesional: ${s.preferredStaffLabel} (si está disponible)`:``}
 Fecha: ${fmtES(startEU)}
 Duración: ${s.durationMin} min
 Pago en persona.` })
-        clearSession(phone)
-        return
-      }
+
+      clearSession(phone)
     })
   }catch(e){
     console.error("startBot:", e?.message||e)
   }
-}
-
-// ====== Parser de fecha/hora simple (dd/mm hh:mm | “lunes 10:30” | “mañana 12”)
-const DOW = { domingo:0,lunes:1,martes:2,miércoles:3,miercoles:3,jueves:4,viernes:5,sábado:6,sabado:6 }
-const WHEN = { hoy:0, today:0, mañana:1, manana:1, tomorrow:1 }
-function parseDateTimeEU(text){
-  const t = norm(text)
-  const m = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\s+(\d{1,2})(?::(\d{2}))?\b/)
-  if (m){
-    let dd=+m[1], mm=+m[2], yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year()
-    if (yy<100) yy+=2000
-    const hh=+m[4], mi=m[5]?+m[5]:0
-    let dt=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} ${String(hh).padStart(2,"0")}:${String(mi).padStart(2,"0")}`, EURO_TZ)
-    const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
-    if (dt.isBefore(guard)) dt = guard
-    return dt
-  }
-  const hm = t.match(/\b(\d{1,2})(?::(\d{2}))?\b/)
-  const w = Object.keys(WHEN).find(k=>t.includes(k))
-  if (w && hm){
-    const base = dayjs().tz(EURO_TZ).add(WHEN[w],"day").startOf("day")
-    let dt = base.hour(+hm[1]).minute(hm[2]?+hm[2]:0)
-    const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
-    if (dt.isBefore(guard)) dt = guard
-    return dt
-  }
-  for (const [name, dow] of Object.entries(DOW)){
-    if (t.includes(name) && hm){
-      const now = dayjs().tz(EURO_TZ)
-      let dd = now.startOf("day")
-      let delta = (dow - dd.day() + 7) % 7
-      if (delta===0 && now.hour()>=AFTERNOON.end) delta=7
-      dd = dd.add(delta,"day")
-      let dt = dd.hour(+hm[1]).minute(hm[2]?+hm[2]:0)
-      const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
-      if (dt.isBefore(guard)) dt = guard
-      return dt
-    }
-  }
-  return null
 }
