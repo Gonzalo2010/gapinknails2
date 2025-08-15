@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.2 “Torremolinos + La Luz”)
+// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.2.2 “Torremolinos + La Luz”)
 // Requisitos: Node 20+, npm i express @whiskeysockets/baileys pino qrcode qrcode-terminal better-sqlite3 dayjs dotenv @square/square
 
 import express from "express"
@@ -160,11 +160,11 @@ const SERVICE = {
   RELLENO_PESTANAS_2D:{ name:"Relleno pestañas 2D", dur:90 },
   RELLENO_PESTANAS_3D:{ name:"Relleno pestañas 3D", dur:90 },
   LIMPIEZA_HYDRA_FACIAL:{ name:"Limpieza hydra facial", dur:90 },
-  LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE:{ name:"Limpieza facial con punta de diamante", dur:90 },
+  LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE:{ name:"Limpieza con punta de diamante", dur:90 },
   MICROBLADING:{ name:"Microblading", dur:120 },
   DERMAPEN:{ name:"Dermapen", dur:60 },
   MASAJE_RELAJANTE:{ name:"Masaje relajante", dur:60 },
-  // (tienes más servicios en .env; si los detectas por texto y no están aquí, dur=60 por defecto)
+  // (más servicios existen en .env; si se detectan por texto y no están aquí, dur=60 por defecto)
 }
 const SVC_KEYS = Object.keys(SERVICE)
 const SERVICE_SYNONYMS = [
@@ -217,7 +217,7 @@ function detectServiceKey(text){
   return score>=1?best:null
 }
 
-// Fecha/hora multiidioma (si viene, la usamos como preferencia; si no, buscamos la primera libre)
+// Fecha/hora multiidioma
 const DOW = {lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,monday:1,tuesday:2,wednesday:3,thursday:4,friday:5}
 function parseDateTimeMulti(text){
   if(!text) return null
@@ -395,7 +395,8 @@ CREATE TABLE IF NOT EXISTS sessions(
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 `)
 const sessGet = db.prepare(`SELECT json FROM sessions WHERE phone=@phone`)
-const sessSet = db.prepare(`INSERT INTO sessions(phone,json,updated_at) VALUES(@phone,@json,@u) ON CONFLICT(phone) DO UPDATE SET json=excluded.json, updated_at=excluded.u`)
+const sessSet = db.prepare(`INSERT INTO sessions(phone,json,updated_at) VALUES(@phone,@json,@updated_at)
+ON CONFLICT(phone) DO UPDATE SET json=excluded.json, updated_at=excluded.updated_at`)
 const sessDel = db.prepare(`DELETE FROM sessions WHERE phone=@phone`)
 const apptInsert = db.prepare(`INSERT INTO appointments(id,phone,name,email,location_id,service_key,service_name,duration_min,staff_id,start_iso,square_booking_id,status,created_at)
 VALUES(@id,@phone,@name,@email,@location_id,@service_key,@service_name,@duration_min,@staff_id,@start_iso,@square_booking_id,@status,@created_at)`)
@@ -407,14 +408,14 @@ function loadSession(phone){
 }
 function saveSession(phone,data){
   const d={...data}; d.startEU_ms = data.startEU?.valueOf?.() ?? null; delete d.startEU
-  sessSet.run({ phone, json: JSON.stringify(d), u: new Date().toISOString() })
+  sessSet.run({ phone, json: JSON.stringify(d), updated_at: new Date().toISOString() })
 }
 
 // ============= Mini web (QR)
 const app=express()
 const PORT=process.env.PORT||8080
 let lastQR=null, conectado=false
-app.get("/",(_req,res)=>res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#fff0f6} .c{background:#fff;padding:24px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.08);}</style><div class="c"><h1>Gapink Nails</h1><p>${conectado?"✅ WhatsApp conectado":"❌ No conectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320"/>`:""}</div>`))
+app.get("/",(_req,res)=>res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#fff0f6} .c{background:#fff;padding:24px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.08);border-radius:16px}</style><div class="c"><h1>Gapink Nails</h1><p>${conectado?"✅ WhatsApp conectado":"❌ No conectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320"/>`:""}</div>`))
 app.get("/qr.png",async(_req,res)=>{ if(!lastQR) return res.status(404).end(); const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1}); res.set("Content-Type","image/png").send(png) })
 app.listen(PORT,()=>startBot().catch(console.error))
 
@@ -452,11 +453,10 @@ async function startBot(){
         // seguimos para procesar el propio mensaje del cliente
       }
 
-      // Horario de atención por WhatsApp (si está fuera, no seguimos, para no “atender”)
+      // Horario de atención por WhatsApp (si está fuera, no seguimos para no “atender”)
       const now=EURO(dayjs())
       const openNow = insideBusinessHours(now)
       if(!openNow){
-        // Si preguntan explícitamente por horario/abierto, respondemos seguro:
         if(/\b(abiertos?|open|horario|hours?)\b/i.test(low)){
           await sock.sendMessage(from,{ text:"Atendemos por WhatsApp L–V 10:00–14:00 y 16:00–20:00. Puedes reservar por la web en cualquier momento: https://gapinknails.square.site/" })
         }
@@ -513,14 +513,13 @@ Dime una opción y te cojo la cita sin pedirte hora.` })
       if(s.serviceKey && s.locationKey){
         const locationId = LOCATION_IDS[s.locationKey]
         const pair = pickServiceEnvPair(s.serviceKey, locationId)
-        if(!pair?.id){ /* por seguridad, no respondemos si el mapeo no existe */ return }
+        if(!pair?.id){ return } // si falta mapeo en .env, no respondemos “inventando”
 
         const seed = (dtPref && insideBusinessHours(dtPref)) ? dtPref : now
         const slot = await searchNextAvailability({ locationId, serviceKey: s.serviceKey, afterEU: seed, preferredTeamId: s.staffId||null })
         if(slot){
           s.startEU = slot.startEU; s.durationMin = slot.duration; s.staffId = slot.teamId || s.staffId || null; s.confirmPending=true; saveSession(phone,s)
           const locName = LOCATION_NAMES[locationId]
-          // Si el usuario dijo “manicura” genérica, mostramos “Manicura” (pero internamente es semi)
           const genericMani = /\bmanicura\b/.test(low) && !/rusa|semi|nivel/i.test(low)
           const visibleSvcName = genericMani ? "Manicura" : (SERVICE[s.serviceKey].name)
           await sock.sendMessage(from,{ text:`Te puedo ofrecer *${fmtES(slot.startEU)}* en *${locName}* para *${visibleSvcName}*. ¿Confirmo? (Pago en persona)` })
@@ -533,7 +532,6 @@ Dime una opción y te cojo la cita sin pedirte hora.` })
 
       // Confirmaciones
       if(s.confirmPending && /\b(si|sí|vale|ok|okay|confirmo|dale|de acuerdo|perfecto)\b/.test(low)){
-        // Pedir nombre/email si faltan
         if(!s.name){ await sock.sendMessage(from,{ text:`Para cerrar, dime tu *nombre y apellidos*.` }); return }
         if(!s.email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s.email)){ 
           if(/@/.test(txt) && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(txt.trim())){ s.email = txt.trim(); saveSession(phone,s) }
