@@ -1,14 +1,4 @@
-// index.js — Gapink Nails · PROD (v3 “ancla de fecha + hora exacta sí o sí”)
-// Cambios clave vs v2:
-// - ANCLA DE FECHA: si dices “18/08 a las 10 con Cristina” y luego “no, a las 10”,
-//   mantiene el 18/08 como fecha. No salta a hoy ni a otros días salvo que lo pidas.
-// - MISMO DÍA ESTRICTO: con fecha explícita, sólo busca ese día (±desviación configurable).
-//   Si no hay, te pregunta “¿miro otro día u otra compañera?” sin ser pesado.
-// - RESPETO DE PROFESIONAL: si pides con Cristina y lo repites, se “bloquea” Cristina.
-// - CANCELACIÓN real (palabras tipo “cancela”, “anular”, etc.):
-//   cancela y NO ofrece nada más en ese turno salvo que tú lo pidas.
-// - Reofertas sensatas y confirmación humana. Pago SIEMPRE en persona.
-// - Mini-web QR pone “Gonzalo García Aranda” enlazado a gonzalog.co
+// index.js — Gapink Nails · PROD (v4 “hora exacta, cancelación Square fix, reoferta amable”)
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -42,9 +32,9 @@ const STEER_ON = (process.env.BOT_STEER_BALANCE || "on").toLowerCase() === "on"
 const STEER_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
 // Desviación máxima el mismo día si el cliente pide hora concreta:
-const MAX_SAME_DAY_DEVIATION_MIN = Number(process.env.BOT_MAX_SAME_DAY_DEVIATION_MIN || 90)
-// Umbral de “sí” seguro si el cliente insiste en una hora:
-const STRICT_YES_DEVIATION_MIN = Number(process.env.BOT_STRICT_YES_DEVIATION_MIN || 60)
+const MAX_SAME_DAY_DEVIATION_MIN = Number(process.env.BOT_MAX_SAME_DAY_DEVIATION_MIN || 60)
+// Umbral de “sí” seguro si la propuesta se aleja de lo pedido:
+const STRICT_YES_DEVIATION_MIN = Number(process.env.BOT_STRICT_YES_DEVIATION_MIN || 45)
 
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
 const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
@@ -52,7 +42,7 @@ const norm = (s="") => rmDiacritics(String(s).toLowerCase()).replace(/[^a-z0-9]+
 const STOP = new Set("de del la el los las un una unos unas y o u a al con por para en me mi su sus quiero quisiera querria hazme hacerme ponme dame porfa por favor hola buenas tardes buenos dias noches necesito reservar cita hora con que tal am pm por la manana por la mañana temprano antes primero siguiente otro otra cualquier cuando sea".split(" "))
 function tokenize(s){ return norm(s).split(/\s+/).filter(w=>w && w.length>1 && !STOP.has(w)) }
 
-const YES_RE = /\b(s[ií]|ok|okay|okey+|vale+|va|venga|dale|confirmo|confirmar|de acuerdo|perfecto|genial|si porfa|sí porfa)\b/i
+const YES_RE = /\b(s[ií]|ok|okay|okey+|vale+|va|venga|dale|confirmo|confirmar|de acuerdo|perfecto|genial)\b/i
 const NO_RE  = /\b(no+|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde|anula|cancela|cancelemos|quitar cita)\b/i
 const RESCH_RE = /\b(cambia|cambiar|modifica|mover|reprograma|reprogramar|edita)\b/i
 const CANCEL_RE = /\b(cancela(?:r|me|la)?|anula(?:r|me|la)?|elimina(?:r|me|la)?|borra(?:r|me|la)?|quitar(?: la)? cita|anulaci[oó]n)\b/i
@@ -139,7 +129,6 @@ const SERVICE_ALIASES = {
   "depilacion de cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilacion cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilar cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
-  "depilacion con hilo cejas":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilacion cejas":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilacion labio con hilo":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
@@ -195,20 +184,17 @@ const DURATION_MIN = {
 }
 const getDuration=(envKey)=>DURATION_MIN[envKey] ?? 60
 
-// ===== Fecha/hora: ANCLA DE FECHA + det. hora
+// ===== Fecha/hora
 const M_MAP={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12}
 const WD_MAP={domingo:0,lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,sabado:6,sábado:6}
 const TIME_RE=/\b(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/i
 
 function detectExplicitDateEU(s){
   const t=rmDiacritics((s||"").toLowerCase())
-  // dd de mes
   const m1=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/)
   if(m1){const dd=+m1[1],mm=M_MAP[m1[2]],yy=m1[3]?+m1[3]:dayjs().tz(EURO_TZ).year();return dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}
-  // dd/mm(/yy)
   const m2=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/)
   if(m2){let yy=m2[3]?+m2[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;return dayjs.tz(`${yy}-${String(+m2[2]).padStart(2,"0")}-${String(+m2[1]).padStart(2,"0")} 00:00`,EURO_TZ)}
-  // día de la semana próximo
   for(const k of Object.keys(WD_MAP)){
     if(t.includes(k)){
       const target=WD_MAP[k]; const now=dayjs().tz(EURO_TZ); let add=(target-now.day()+7)%7
@@ -216,7 +202,6 @@ function detectExplicitDateEU(s){
       return now.add(add,"day").startOf("day")
     }
   }
-  // hoy / mañana
   if(/\bhoy\b/.test(t)) return dayjs().tz(EURO_TZ).startOf("day")
   if(/\bmanana\b/.test(t)) return dayjs().tz(EURO_TZ).add(1,"day").startOf("day")
   return null
@@ -230,7 +215,6 @@ function detectTime(s){
   if(ap==="am"&&h===12)h=0
   return {h, min}
 }
-// Combina fecha (EU) + hora -> dayjs EU
 function mergeDateTimeEU(dateEU,{h,min}){ return dateEU.clone().hour(h).minute(min).second(0).millisecond(0) }
 
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
@@ -258,9 +242,31 @@ async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){try{
 
 async function getServiceVariationVersion(id){try{const resp=await square.catalogApi.retrieveCatalogObject(id,true);return resp?.result?.object?.version}catch(e){console.error("getServiceVariationVersion:",e?.message||e);return undefined}}
 function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`;return createHash("sha256").update(raw).digest("hex").slice(0,48)}
-async function createSquareBooking({startEU,svc,customerId,teamMemberId}){try{const serviceVariationId=svc.variationId;let version=svc.variationVersion||await getServiceVariationVersion(serviceVariationId);if(!serviceVariationId||!teamMemberId||!locationId||!version)return null;const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:getDuration(svc.envKey)}]}};const resp=await square.bookingsApi.createBooking(body);return resp?.result?.booking||null}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
-async function cancelSquareBooking(bookingId){try{const r=await square.bookingsApi.cancelBooking(bookingId);return !!r?.result?.booking?.id}catch(e){console.error("cancelSquareBooking:",e?.message||e);return false}}
-async function updateSquareBooking(bookingId,{startEU,svc,customerId,teamMemberId}){try{const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking;if(!booking)return null;let version=svc.variationVersion||await getServiceVariationVersion(svc.variationId);const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId:svc.variationId,startISO,customerId,teamMemberId}),booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,appointmentSegments:[{teamMemberId,serviceVariationId:svc.variationId,serviceVariationVersion:Number(version),durationMinutes:getDuration(svc.envKey)}]}};const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null}catch(e){console.error("updateSquareBooking:",e?.message||e);return null}}
+async function createSquareBooking({startEU,svc,customerId,teamMemberId}){try{
+  const serviceVariationId=svc.variationId;let version=svc.variationVersion||await getServiceVariationVersion(serviceVariationId)
+  if(!serviceVariationId||!teamMemberId||!locationId||!version)return null
+  const startISO=startEU.tz("UTC").toISOString()
+  const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:getDuration(svc.envKey)}]}}
+  const resp=await square.bookingsApi.createBooking(body)
+  return resp?.result?.booking||null
+}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
+async function cancelSquareBooking(bookingId){ // ← FIX: requiere body {idempotencyKey, bookingVersion}
+  try{
+    const rb = await square.bookingsApi.retrieveBooking(bookingId)
+    const version = rb?.result?.booking?.version
+    if (version===undefined || version===null) return false
+    const body = { idempotencyKey: `cancel_${bookingId}_${Date.now()}`, bookingVersion: version }
+    const r = await square.bookingsApi.cancelBooking(bookingId, body)
+    return !!r?.result?.booking?.id
+  }catch(e){console.error("cancelSquareBooking:",e?.message||e);return false}
+}
+async function updateSquareBooking(bookingId,{startEU,svc,customerId,teamMemberId}){try{
+  const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking;if(!booking)return null
+  let version=svc.variationVersion||await getServiceVariationVersion(svc.variationId)
+  const startISO=startEU.tz("UTC").toISOString()
+  const body={idempotencyKey:stableKey({locationId,serviceVariationId:svc.variationId,startISO,customerId,teamMemberId}),booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,appointmentSegments:[{teamMemberId,serviceVariationId:svc.variationId,serviceVariationVersion:Number(version),durationMinutes:getDuration(svc.envKey)}]}}
+  const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null
+}catch(e){console.error("updateSquareBooking:",e?.message||e);return null}}
 
 // ===== DB & sesiones
 const db=new Database("gapink.db");db.pragma("journal_mode = WAL")
@@ -481,12 +487,13 @@ async function startBot(){
         const userSaysYes = YES_RE.test(textRaw)
         const userSaysNo  = NO_RE.test(textRaw)
 
-        // ===== CANCELAR (duro y al grano)
+        // ===== CANCELAR
         if (CANCEL_RE.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
           if (upc) {
-            const ok = upc.square_booking_id ? await cancelSquareBooking(upc.square_booking_id) : true
-            if (ok) { markCancelled.run({ id: upc.id }); clearSession.run({ phone }); await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` }); }
+            let ok=true
+            if (upc.square_booking_id) ok = await cancelSquareBooking(upc.square_booking_id)
+            if (ok) { markCancelled.run({ id: upc.id }); clearSession.run({ phone }); await __SAFE_SEND__(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` }) }
             else { await __SAFE_SEND__(from,{ text:"No pude cancelarla ahora mismo. Prueba de nuevo en un minuto." }) }
           } else {
             await __SAFE_SEND__(from,{ text:"No veo ninguna cita futura tuya. Si quieres, dime día y hora y te doy hueco." })
@@ -536,14 +543,11 @@ async function startBot(){
           data.durationMin = getDuration(svcDetected.envKey)
         }
 
-        // ===== Fecha/hora con ANCLA
+        // ===== Fecha/hora (ancla)
         const dateEU = detectExplicitDateEU(textRaw)
         const time = detectTime(textRaw)
-        // Actualiza ancla si hay fecha explícita
         if (dateEU) data.anchorDateEU = dateEU
-        // Actualiza hora solicitada
         if (time) {
-          // Usa fecha anclada si existe; si no, si el propio mensaje trae fecha; si tampoco, hoy.
           const baseDate = data.anchorDateEU || dateEU || dayjs().tz(EURO_TZ).startOf("day")
           const dt = mergeDateTimeEU(baseDate, time)
           if (data.lastRequestedEU && data.lastRequestedEU.valueOf()===dt.valueOf()) data.timeInsistCount = (data.timeInsistCount||0)+1
@@ -561,7 +565,7 @@ async function startBot(){
           return
         }
 
-        // ===== YES ⇒ cerrar si hay oferta pendiente (con guardia anti-sí accidental)
+        // ===== YES ⇒ cerrar si hay oferta pendiente (guardia de desvío)
         if (userSaysYes && data.pendingOfferEU && data.serviceEnvKey) {
           const lastWanted = data.lastRequestedEU
           if (lastWanted && minutesApart(lastWanted, data.pendingOfferEU) > STRICT_YES_DEVIATION_MIN && data.timeInsistCount>=2) {
@@ -606,13 +610,13 @@ async function startBot(){
           )
           if (near) offer = near
         }
-        // 4) Buscar otros días SOLO si NO hay fecha anclada ni hora dura
+        // 4) Otros días SOLO si no hay fecha anclada ni hora dura
         if (!offer && !dayLock && !hardTime) {
           offer = (STEER_ON ? findEarliestAny(data.startEU, duration, STEER_WINDOW_DAYS) : null)
                || findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
         }
 
-        // Guardia: si hay hora pedida y la oferta se va de madre, invalídala
+        // Guardia: no proponer fuera del margen
         if (offer && hardTime && data.startEU && minutesApart(data.startEU, offer.time) > MAX_SAME_DAY_DEVIATION_MIN) {
           offer = null
         }
@@ -625,9 +629,9 @@ async function startBot(){
           data.confirmAsked=false; saveSession(phone,data)
           if (dayLock || hardTime) {
             if (forceStaff) {
-              await __SAFE_SEND__(from,{ text:`Ese día a esa hora con ${displayStaff(data.requestedStaffId)} no tengo hueco. ¿Miro esa MISMA hora otro día o te vale con otra compañera?` })
+              await __SAFE_SEND__(from,{ text:`Ese día a esa hora con ${displayStaff(data.requestedStaffId)} no tengo hueco. ¿Miro esa MISMA hora otro día o te vale con otra compañera? (Pago en persona)` })
             } else {
-              await __SAFE_SEND__(from,{ text:`Ese día a esa hora no tengo hueco. ¿Miro esa MISMA hora otro día u otra franja ese día?` })
+              await __SAFE_SEND__(from,{ text:`Ese día a esa hora no tengo hueco. ¿Miro esa MISMA hora otro día u otra franja ese día? (Pago en persona)` })
             }
           } else {
             await __SAFE_SEND__(from,{ text:"Ahora mismo no veo huecos en esa franja. Dime otra hora o día y te digo." })
@@ -640,8 +644,22 @@ async function startBot(){
         data.confirmAsked = true
         saveSession(phone,data)
 
+        const sameAsAsked = data.startEU && offer.time.valueOf()===ceilToSlotEU(data.startEU).valueOf()
         const staffTxt = displayStaff(offer.staffId) ? ` con ${displayStaff(offer.staffId)}` : ""
-        await __SAFE_SEND__(from,{ text:`Tengo ${fmtES(offer.time)}${staffTxt}. ¿Confirmo la ${data.editBookingId?"modificación":"cita"}? (Pago en persona)` })
+
+        if (sameAsAsked) {
+          await __SAFE_SEND__(from,{ text:`Tengo ${fmtES(offer.time)}${staffTxt}. ¿Confirmo la ${data.editBookingId?"modificación":"cita"}? (Pago en persona)` })
+        } else {
+          // Reoferta amable (no “impone”)
+          let msg = `No tengo ${data.startEU.format("HH:mm")} `
+          if (wantsStaff) msg += `con ${displayStaff(data.requestedStaffId)} `
+          msg += `ese día; me sale ${offer.time.format("HH:mm")}${staffTxt}. ¿Te viene bien?`
+          // Empujoncito suave para probar otra compañera
+          if (wantsStaff && !forceStaff) {
+            msg += ` Si quieres probar otra compañera, puedo mirar también ${data.startEU.format("HH:mm")} ese mismo día.`
+          }
+          await __SAFE_SEND__(from,{ text: msg })
+        }
         return
 
       }catch(e){ console.error("messages.upsert error:",e) }
@@ -732,7 +750,10 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
       if (sq) ok=true
     }
     if (!ok) {
-      if (upc.square_booking_id) await cancelSquareBooking(upc.square_booking_id)
+      if (upc.square_booking_id) {
+        const cancelled = await cancelSquareBooking(upc.square_booking_id)
+        if (!cancelled) { data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No pude reprogramar ahora mismo. Probamos otra franja?"}); return }
+      }
       const sqNew = await createSquareBooking({ startEU, svc, customerId: upc.customer_square_id, teamMemberId: teamId })
       if (!sqNew) { data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No pude reprogramar ahora mismo. Probamos otra franja?"}); return }
       markCancelled.run({ id: upc.id })
