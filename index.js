@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.3 “blindado Baileys”)
+// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.4 “24/7 intake”)
 // Requisitos: Node 20+, npm i express pino qrcode qrcode-terminal better-sqlite3 dayjs dotenv @square/square @whiskeysockets/baileys
 
 import express from "express"
@@ -51,7 +51,7 @@ const LOCATION_NAMES = {
   [LOCATION_IDS.LA_LUZ]: "Málaga – La Luz"
 }
 
-// ============= Mensaje bienvenida
+// ============= Mensaje bienvenida (se mantiene)
 const WELCOME_TEXT =
 `Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.
 
@@ -66,11 +66,10 @@ Y si quieres modificarla puedes hacerlo a través del link del sms que llega con
 Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.
 Gracias 😘`
 
-// ============= OpenAI (redacción, nunca inventa precios/horarios)
+// ============= OpenAI
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY
 const OPENAI_API_URL  = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
 const OPENAI_MODEL    = process.env.OPENAI_MODEL || "gpt-4o-mini"
-
 async function aiChat(messages, temperature=0.25){
   if(!OPENAI_API_KEY) return ""
   try{
@@ -133,7 +132,7 @@ function detectLocationFromText(text){
   return null
 }
 
-// Catálogo (duración por defecto si no listado: 60)
+// Catálogo (duración por defecto)
 const SERVICE = {
   MANICURA_CON_ESMALTE_NORMAL:{ name:"Manicura con esmalte normal", dur:30 },
   MANICURA_SEMIPERMANENTE:{ name:"Manicura semipermanente", dur:30 },
@@ -204,7 +203,7 @@ function detectServiceKey(text){
   return score>=1?best:null
 }
 
-// Fecha/hora multiidioma
+// Fecha/hora
 const DOW = {lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,monday:1,tuesday:2,wednesday:3,thursday:4,friday:5}
 function parseDateTimeMulti(text){
   if(!text) return null
@@ -407,8 +406,6 @@ async function loadBaileysModule(){
     try { mod = await import("@whiskeysockets/baileys") } catch {}
   }
   if(!mod) throw new Error("No se pudo cargar @whiskeysockets/baileys. Instálalo: npm i @whiskeysockets/baileys")
-  // Unificar formas de export
-  const pick = (...cands)=>cands.find(x=>typeof x==="function"||typeof x==="object")||null
   const _default = (mod.default && (typeof mod.default==="function"||typeof mod.default==="object")) ? mod.default : null
   const makeWASocket =
     (typeof mod.makeWASocket==="function" && mod.makeWASocket) ||
@@ -430,7 +427,8 @@ async function loadBaileysModule(){
 }
 
 // ============= WhatsApp bot
-const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
+const BOOKING_INTENT_RE = /\b(cita|reserv|hora|pesta(?:n|ñ)as|u(?:n|ñ)as|manicura|pedicura|cejas|microblading|facial|limpieza|masaje|depilaci(?:o|ó)n|laser|l[aá]ser|lash|lifting)\b/i
+
 async function startBot(){
   try{
     const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileysModule()
@@ -472,12 +470,16 @@ async function startBot(){
         s.welcomeSent = true; saveSession(phone,s)
       }
 
-      // Fuera de horario de atención por WhatsApp => silencio (solo respondemos si preguntan “horario/abiertos”)
       const now=EURO(dayjs())
       const openNow = insideBusinessHours(now)
-      if(!openNow){
+      const bookingIntent = BOOKING_INTENT_RE.test(low)
+
+      // 🔒 Fuera de horario: ahora SÍ atendemos peticiones de cita; para lo demás, aviso.
+      if(!openNow && !bookingIntent){
         if(/\b(abiertos?|open|horario|hours?)\b/i.test(low)){
           await sock.sendMessage(from,{ text:"Atendemos por WhatsApp L–V 10:00–14:00 y 16:00–20:00. Puedes reservar por la web en cualquier momento: https://gapinknails.square.site/" })
+        } else {
+          await sock.sendMessage(from,{ text:"Ahora estamos fuera de horario. Si necesitas una cita, dímela y te la gestiono igual 😊 (o usa https://gapinknails.square.site/)." })
         }
         return
       }
@@ -516,15 +518,16 @@ async function startBot(){
       }
 
       // Genérico uñas/pies sin servicio
-      if(!s.serviceKey && /\b(u[nñ]as|manicura|pedicura|pies|manos)\b/.test(low)){
+      if(!s.serviceKey && /\b(u[nñ]as|manicura|pedicura|pies|manos|pesta(?:n|ñ)as|cejas)\b/.test(low)){
         await sock.sendMessage(from,{ text:
 `¿Qué necesitas exactamente?
 • Manicura semipermanente (o con nivelación / rusa)
 • Uñas esculpidas (nuevas) o Relleno
 • Pedicura (normal o semipermanente)
-• Solo esmaltado en pies
+• Lifting de pestañas o Extensiones (pelo a pelo / 2D / 3D)
+• Cejas (diseño con henna / hilo)
 
-Dime una opción y te cojo la cita sin pedirte hora.` })
+Dime una opción y el local (Málaga – La Luz o Torremolinos) y te cojo el primer hueco libre.` })
         return
       }
 
