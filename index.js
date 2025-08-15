@@ -112,7 +112,6 @@ function loadServiceCatalogFromEnv(){
       tokens: new Set(toks)
     })
   }
-  // ordenar por nombres más largos (más específicos)
   catalog.sort((a,b)=>b.normName.length - a.normName.length)
   return catalog
 }
@@ -135,54 +134,47 @@ const SERVICE_ALIASES = {
   "labios efecto acuarela":"SQ_SVC_LABIOS_EFECTO_AQUARELA",
 }
 
-// Fuzzy por tokens: score = (#intersección ponderada) / (#tokens servicio)
+// Fuzzy por tokens
+function intersectCount(a,b){let c=0; for(const x of a) if(b.has(x)) c++; return c}
 function fuzzyService(userText){
   const t = tokenize(userText)
   if (!t.length) return null
   const U = new Set(t)
   let best=null
   for(const svc of SERVICE_CATALOG){
-    // alias exacto por nombre normalizado
     if (norm(userText).includes(svc.normName)) {
       const score=1
       if(!best || score>best.score) best={svc,score,why:"substring"}
       continue
     }
-    // tokens
     let match=0
     for(const tok of svc.tokens){
-      if (U.has(tok)) match += (tok.length>=6? 2 : 1) // peso por longitud
+      if (U.has(tok)) match += (tok.length>=6? 2 : 1)
     }
     const denom = [...svc.tokens].length || 1
     const score = match/denom
     if (!best || score>best.score) best={svc,score,why:"tokens"}
   }
-  // umbral: al menos 2 tokens o score >= 0.5
   if (best && (best.score>=0.5 || intersectCount(best.svc.tokens, new Set(t))>=2)) return best.svc
   return null
 }
-function intersectCount(a,b){let c=0; for(const x of a) if(b.has(x)) c++; return c}
-
 function resolveServiceFromText(userText){
   const n = norm(userText)
-  // 1) alias explícitos
   for(const [k,envKey] of Object.entries(SERVICE_ALIASES)){
     if (n.includes(norm(k))) {
       const svc = SERVICE_CATALOG.find(s=>s.envKey===envKey)
       if (svc) return svc
     }
   }
-  // 2) fuzzy tokens
   const f = fuzzyService(userText)
   if (f) return f
-  // 3) último cartucho: incluye por palabras clave largas
   for (const svc of SERVICE_CATALOG){
     if (n.includes(svc.normName)) return svc
   }
   return null
 }
 
-// Duraciones (mins)
+// Duraciones (mins) — recortado para brevedad, mantenlo como en tu .env mapeo
 const DURATION_MIN = {
   "SQ_SVC_BONO_5_SESIONES_MADEROTERAPIA_MAS_5_SESIONES_PUSH_UP":60,
   "SQ_SVC_CARBON_PEEL":60,
@@ -357,7 +349,6 @@ function getBookedIntervals(fromIso,toIso){
 function isFree(intervals, staffId, startUTC, endUTC){
   return !intervals.filter(i=>i.staff_id===staffId).some(i => (startUTC<i.end) && (i.start<endUTC))
 }
-function ceilToDayWindowStart(t){ return t.clone().second(0).millisecond(0) }
 function findEarliestAny(startEU, durationMin, daysWindow){
   const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
   const startBase = startEU && startEU.isAfter(now) ? ceilToSlotEU(startEU.clone()) : ceilToSlotEU(now.clone())
@@ -368,7 +359,8 @@ function findEarliestAny(startEU, durationMin, daysWindow){
     const dow=day.day()===0?7:day.day()
     if(!WORK_DAYS.includes(dow)) continue
     const dayStart=day.clone().hour(OPEN_HOUR).minute(0).second(0)
-    const firstSlot = d===0 ? startBase.clone().max(dayStart) : dayStart
+    // FIX: dayjs no tiene .max() de instancia → elegimos a mano el mayor
+    const firstSlot = d===0 ? (startBase.isAfter(dayStart) ? startBase.clone() : dayStart) : dayStart
     const dayEnd=day.clone().hour(CLOSE_HOUR).minute(0).second(0)
     for(let t=ceilToSlotEU(firstSlot.clone()); !t.isAfter(dayEnd); t=t.add(SLOT_MIN,"minute")){
       const e=t.clone().add(durationMin,"minute"); if(e.isAfter(dayEnd)) break
@@ -391,7 +383,8 @@ function findEarliestForStaff(startEU, durationMin, daysWindow, staffId){
     const dow=day.day()===0?7:day.day()
     if(!WORK_DAYS.includes(dow)) continue
     const dayStart=day.clone().hour(OPEN_HOUR).minute(0).second(0)
-    const firstSlot = d===0 ? startBase.clone().max(dayStart) : dayStart
+    // FIX aquí también
+    const firstSlot = d===0 ? (startBase.isAfter(dayStart) ? startBase.clone() : dayStart) : dayStart
     const dayEnd=day.clone().hour(CLOSE_HOUR).minute(0).second(0)
     for(let t=ceilToSlotEU(firstSlot.clone()); !t.isAfter(dayEnd); t=t.add(SLOT_MIN,"minute")){
       const e=t.clone().add(durationMin,"minute"); if(e.isAfter(dayEnd)) break
@@ -502,15 +495,13 @@ async function startBot(){
         // NO ⇒ reset confirm
         if (userSaysNo) { data.confirmAsked=false; saveSession(phone,data); await __SAFE_SEND__(from,{text:"Sin problema. Dime otra hora o día y lo miro."}); return }
 
-        // ====== FLOW por pasos (en un solo listener)
+        // ====== FLOW por pasos
 
-        // 1) servicio
         if (!data.serviceEnvKey) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:"¿Qué te hago? (Ej: “Manicura semipermanente”, “Limpieza facial con punta de diamante”…)" }); return }
 
-        // 2) fecha/hora
         if (!data.startEU) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:`Genial, ${data.service}. Dime día y hora (ej: “mañana 10:30” o “15/09 18:00”).` }); return }
 
-        // 3) disponibilidad + steering
+        // Disponibilidad + steering
         const duration = data.durationMin || 60
         const earliestAny = findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
         const earliestRequested = data.requestedStaffId ? findEarliestForStaff(data.startEU, duration, STEER_WINDOW_DAYS, data.requestedStaffId) : null
@@ -535,7 +526,6 @@ async function startBot(){
         data.confirmAsked = true
         saveSession(phone,data)
 
-        // Si dice “sí/confirmo” en el mismo mensaje (pasa), intentamos cerrar
         if (userSaysYes && data.serviceEnvKey && data.startEU) {
           if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
           else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
