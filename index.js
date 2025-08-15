@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.4 “24/7 intake”)
+// index.js — Gapink Nails · MULTI-LOCAL + IA + Square (v9.5 hot-fix)
 // Requisitos: Node 20+, npm i express pino qrcode qrcode-terminal better-sqlite3 dayjs dotenv @square/square @whiskeysockets/baileys
 
 import express from "express"
@@ -18,26 +18,25 @@ import isSameOrBefore from "dayjs/plugin/isSameOrBefore.js"
 import "dayjs/locale/es.js"
 import { Client, Environment } from "square"
 
-// ============= Dayjs
+// ===== Dayjs
 dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isoWeek); dayjs.extend(isSameOrAfter); dayjs.extend(isSameOrBefore)
 dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
 
-// ============= Config negocio
+// ===== Negocio
 const WORK_DAYS = [1,2,3,4,5] // L–V
 const SHIFT_A_START=10, SHIFT_A_END=14
 const SHIFT_B_START=16, SHIFT_B_END=20
 const SLOT_MIN=30
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
 const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
+const WELCOME_MUTE_MS = 90_000 // no repetir fuera-de-horario justo tras bienvenida
 
-// Festivos (nacionales+Andalucía) + extras por .env (dd/mm)
-const HOLI_BASE = new Set([
-  "01/01","06/01","28/02","01/05","15/08","12/10","01/11","06/12","08/12","25/12"
-])
+// Festivos
+const HOLI_BASE = new Set(["01/01","06/01","28/02","01/05","15/08","12/10","01/11","06/12","08/12","25/12"])
 ;(String(process.env.HOLIDAYS_EXTRA||"").split(",").map(s=>s.trim()).filter(Boolean)).forEach(x=>HOLI_BASE.add(x))
 
-// ============= Square
+// ===== Square
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment: process.env.SQUARE_ENV==="production" ? Environment.Production : Environment.Sandbox
@@ -51,7 +50,7 @@ const LOCATION_NAMES = {
   [LOCATION_IDS.LA_LUZ]: "Málaga – La Luz"
 }
 
-// ============= Mensaje bienvenida (se mantiene)
+// ===== Mensaje de bienvenida (sin cambios)
 const WELCOME_TEXT =
 `Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.
 
@@ -66,7 +65,7 @@ Y si quieres modificarla puedes hacerlo a través del link del sms que llega con
 Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.
 Gracias 😘`
 
-// ============= OpenAI
+// ===== OpenAI
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY
 const OPENAI_API_URL  = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
 const OPENAI_MODEL    = process.env.OPENAI_MODEL || "gpt-4o-mini"
@@ -85,7 +84,7 @@ async function aiChat(messages, temperature=0.25){
 }
 const SYS_TONE = `Eres recepcionista WhatsApp de Gapink Nails (España). Responde breve, cálida y clara, sin emojis. No inventes horarios ni precios. Si falta local o servicio, pregunta SOLO eso. Español.`
 
-// ============= Helpers
+// ===== Helpers
 const rm = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = (s="") => rm(String(s).toLowerCase()).replace(/[^a-z0-9]+/g," ").trim()
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
@@ -121,7 +120,7 @@ const normalizePhoneES=(raw)=>{
   return `+${d}`
 }
 
-// ============= NLP: local + servicio + fecha/hora
+// ===== NLP local/servicio/fecha
 const LOC_SYNON = {
   TORREMOLINOS:["torremolinos","playamar","benyamina","benyamaina","benyamina 18"],
   LA_LUZ:["la luz","malaga","málaga","centro","cruz de humilladero","huelin","carretera cadiz","carretera cádiz","barrio de la luz"]
@@ -132,7 +131,7 @@ function detectLocationFromText(text){
   return null
 }
 
-// Catálogo (duración por defecto)
+// Catálogo (duraciones)
 const SERVICE = {
   MANICURA_CON_ESMALTE_NORMAL:{ name:"Manicura con esmalte normal", dur:30 },
   MANICURA_SEMIPERMANENTE:{ name:"Manicura semipermanente", dur:30 },
@@ -203,7 +202,6 @@ function detectServiceKey(text){
   return score>=1?best:null
 }
 
-// Fecha/hora
 const DOW = {lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,monday:1,tuesday:2,wednesday:3,thursday:4,friday:5}
 function parseDateTimeMulti(text){
   if(!text) return null
@@ -234,7 +232,7 @@ function parseDateTimeMulti(text){
   return clampFuture(base.hour(h).minute(m2))
 }
 
-// ============= ENV: servicios por local
+// ===== ENV: servicios por local
 function pickServiceEnvPair(serviceKey, locationId){
   const envName = (locationId===LOCATION_IDS.LA_LUZ) ? `SQ_SVC_luz_${serviceKey}` : `SQ_SVC_${serviceKey}`
   const raw = process.env[envName]
@@ -245,7 +243,7 @@ function pickServiceEnvPair(serviceKey, locationId){
   return { id, version: verStr?Number(verStr):undefined, duration, name }
 }
 
-// ============= Empleadas por local
+// ===== Empleadas por local
 function loadTeamByLocation(){
   const byLoc = { [LOCATION_IDS.TORREMOLINOS]:[], [LOCATION_IDS.LA_LUZ]:[] }
   for(const [k,v] of Object.entries(process.env)){
@@ -259,12 +257,10 @@ function loadTeamByLocation(){
 }
 const TEAM_BY_LOC = loadTeamByLocation()
 
-// ============= Square helpers
+// ===== Square helpers
 async function getServiceVariationVersion(id){
-  try{
-    const r = await square.catalogApi.retrieveCatalogObject(id, true)
-    return r?.result?.object?.version
-  }catch(e){ console.error("catalog version:", e?.message||e); return undefined }
+  try{ const r = await square.catalogApi.retrieveCatalogObject(id, true)
+       return r?.result?.object?.version }catch(e){ console.error("catalog version:", e?.message||e); return undefined }
 }
 async function findOrCreateCustomer({ name, email, phone }){
   try{
@@ -351,7 +347,7 @@ async function cancelBookingSquare(bookingId){
   }catch(e){ console.error("cancelBooking:", e?.message||e); return false }
 }
 
-// ============= DB mínima
+// ===== DB
 const db=new Database("gapink.db"); db.pragma("journal_mode = WAL")
 db.exec(`
 CREATE TABLE IF NOT EXISTS appointments(
@@ -389,7 +385,7 @@ function saveSession(phone,data){
   sessSet.run({ phone, json: JSON.stringify(d), updated_at: new Date().toISOString() })
 }
 
-// ============= Mini web (QR)
+// ===== Mini web (QR)
 const app=express()
 const PORT=process.env.PORT||8080
 let lastQR=null, conectado=false
@@ -397,7 +393,7 @@ app.get("/",(_req,res)=>res.send(`<!doctype html><meta charset="utf-8"><style>bo
 app.get("/qr.png",async(_req,res)=>{ if(!lastQR) return res.status(404).end(); const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1}); res.set("Content-Type","image/png").send(png) })
 app.listen(PORT,()=>startBot().catch(console.error))
 
-// ============= Cargador BAILEYS “blindado”
+// ===== Baileys loader blindado
 async function loadBaileysModule(){
   const require = createRequire(import.meta.url)
   let mod = null
@@ -426,7 +422,7 @@ async function loadBaileysModule(){
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
 
-// ============= WhatsApp bot
+// ===== Bot
 const BOOKING_INTENT_RE = /\b(cita|reserv|hora|pesta(?:n|ñ)as|u(?:n|ñ)as|manicura|pedicura|cejas|microblading|facial|limpieza|masaje|depilaci(?:o|ó)n|laser|l[aá]ser|lash|lifting)\b/i
 
 async function startBot(){
@@ -435,7 +431,7 @@ async function startBot(){
 
     if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
-    const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]})) // fallback
+    const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
 
     const sock = makeWASocket({
       logger:pino({level:"silent"}),
@@ -460,26 +456,40 @@ async function startBot(){
       const txt = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
       if(!txt) return
 
-      // Sesión
-      let s = loadSession(phone) || { welcomeSent:false, locationKey:null, serviceKey:null, startEU:null, durationMin:null, staffId:null, name:null, email:null, confirmPending:false }
+      let s = loadSession(phone) || { welcomeSent:false, welcomeAtMs:0, locationKey:null, serviceKey:null, startEU:null, durationMin:null, staffId:null, name:null, email:null, confirmPending:false }
       const low = rm(txt.toLowerCase())
 
       // Bienvenida (una sola vez)
       if(!s.welcomeSent){
         await sock.sendMessage(from,{ text: WELCOME_TEXT })
-        s.welcomeSent = true; saveSession(phone,s)
+        s.welcomeSent = true; s.welcomeAtMs = Date.now(); saveSession(phone,s)
       }
 
       const now=EURO(dayjs())
       const openNow = insideBusinessHours(now)
-      const bookingIntent = BOOKING_INTENT_RE.test(low)
 
-      // 🔒 Fuera de horario: ahora SÍ atendemos peticiones de cita; para lo demás, aviso.
+      // Pre-parse fecha/hora y local
+      const dtPref = parseDateTimeMulti(txt)
+      const localFromText = detectLocationFromText(txt)
+      if(localFromText){ s.locationKey = localFromText; saveSession(phone,s) }
+      const svcK = detectServiceKey(txt); if(svcK){ s.serviceKey=svcK; s.durationMin = SERVICE[svcK]?.dur ?? 60; saveSession(phone,s) }
+
+      // ¿Hay flujo de reserva en curso? (permite "Torremolinos" o "a las 6" fuera de horario)
+      const inBookingFlow =
+        !!(s.serviceKey || s.locationKey || s.confirmPending || dtPref ||
+           /\b(la luz|torremolinos)\b/.test(low))
+
+      const bookingIntent = BOOKING_INTENT_RE.test(low) || inBookingFlow
+
+      // Fuera de horario: solo bloquea si NO hay intención/flujo de reserva
       if(!openNow && !bookingIntent){
-        if(/\b(abiertos?|open|horario|hours?)\b/i.test(low)){
-          await sock.sendMessage(from,{ text:"Atendemos por WhatsApp L–V 10:00–14:00 y 16:00–20:00. Puedes reservar por la web en cualquier momento: https://gapinknails.square.site/" })
-        } else {
-          await sock.sendMessage(from,{ text:"Ahora estamos fuera de horario. Si necesitas una cita, dímela y te la gestiono igual 😊 (o usa https://gapinknails.square.site/)." })
+        if(!s.welcomeAtMs || (Date.now()-s.welcomeAtMs) > WELCOME_MUTE_MS){
+          if(/\b(abiertos?|open|horario|hours?)\b/i.test(low)){
+            await sock.sendMessage(from,{ text:"Atendemos por WhatsApp L–V 10:00–14:00 y 16:00–20:00. Puedes reservar por la web en cualquier momento: https://gapinknails.square.site/" })
+          } else {
+            await sock.sendMessage(from,{ text:"Ahora estamos fuera de horario. Si necesitas una cita, dímela y te la gestiono igual 😊 (o usa https://gapinknails.square.site/)." })
+          }
+          s.welcomeAtMs = Date.now(); saveSession(phone,s)
         }
         return
       }
@@ -495,29 +505,7 @@ async function startBot(){
         return
       }
 
-      // Detectar local/servicio/datetime si vienen
-      const locK = detectLocationFromText(txt); if(locK) { s.locationKey = locK; saveSession(phone,s) }
-      const svcK = detectServiceKey(txt); if(svcK){ s.serviceKey=svcK; s.durationMin = SERVICE[svcK]?.dur ?? 60; saveSession(phone,s) }
-      const dtPref = parseDateTimeMulti(txt)
-
-      // Precios → IA sin inventar cantidades
-      if(/\b(precio|cu[aá]nto|tarifa|vale|coste|costos?)\b/.test(low)){
-        const svcName = s.serviceKey ? SERVICE[s.serviceKey].name : "el servicio que te interese"
-        const msg = await aiChat([
-          { role:"system", content: SYS_TONE },
-          { role:"user", content:`Cliente pregunta precio sobre "${svcName}". No inventes cantidades: di que los precios pueden variar según técnica y que en recepción lo confirman. Ofrece coger cita directamente.`}
-        ])
-        await sock.sendMessage(from,{ text: msg || `Los precios pueden variar según la técnica. Si quieres te cojo cita directamente y allí te lo confirman sin compromiso.` })
-        return
-      }
-
-      // Falta local
-      if(s.serviceKey && !s.locationKey){
-        await sock.sendMessage(from,{ text:`¿En qué salón te viene mejor, *Málaga – La Luz* o *Torremolinos*?` })
-        return
-      }
-
-      // Genérico uñas/pies sin servicio
+      // Preguntar servicio si hace falta
       if(!s.serviceKey && /\b(u[nñ]as|manicura|pedicura|pies|manos|pesta(?:n|ñ)as|cejas)\b/.test(low)){
         await sock.sendMessage(from,{ text:
 `¿Qué necesitas exactamente?
@@ -531,19 +519,24 @@ Dime una opción y el local (Málaga – La Luz o Torremolinos) y te cojo el pri
         return
       }
 
-      // Ya hay servicio + local → proponemos primer hueco
+      // Si hay servicio pero falta local
+      if(s.serviceKey && !s.locationKey){
+        await sock.sendMessage(from,{ text:`¿En qué salón te viene mejor, *Málaga – La Luz* o *Torremolinos*?` })
+        return
+      }
+
+      // Ya hay servicio + local → proponer hueco
       if(s.serviceKey && s.locationKey){
         const locationId = LOCATION_IDS[s.locationKey]
         const pair = pickServiceEnvPair(s.serviceKey, locationId)
-        if(!pair?.id){ return } // no inventar
+        if(!pair?.id){ await sock.sendMessage(from,{ text:`Ese servicio no está disponible en ese salón ahora mismo.` }); return }
 
         const seed = (dtPref && insideBusinessHours(dtPref)) ? dtPref : now
         const slot = await searchNextAvailability({ locationId, serviceKey: s.serviceKey, afterEU: seed, preferredTeamId: s.staffId||null })
         if(slot){
           s.startEU = slot.startEU; s.durationMin = slot.duration; s.staffId = slot.teamId || s.staffId || null; s.confirmPending=true; saveSession(phone,s)
           const locName = LOCATION_NAMES[locationId]
-          const genericMani = /\bmanicura\b/.test(low) && !/rusa|semi|nivel/i.test(low)
-          const visibleSvcName = genericMani ? "Manicura" : (SERVICE[s.serviceKey].name)
+          const visibleSvcName = SERVICE[s.serviceKey].name
           await sock.sendMessage(from,{ text:`Te puedo ofrecer *${fmtES(slot.startEU)}* en *${locName}* para *${visibleSvcName}*. ¿Confirmo? (Pago en persona)` })
           return
         } else {
