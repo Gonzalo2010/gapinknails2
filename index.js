@@ -1,10 +1,7 @@
-// index.js — Gapink Nails WhatsApp Bot (Playamar, robusto + parches)
-// - Un solo messages.upsert (sin respuestas dobles)
-// - Chequeo de empleadas configuradas (.env) -> aborta si vacío
-// - Alias de servicios (corrige typos comunes)
-// - Caché de versiones de variaciones de Square (menos fallos / latencia)
-// - Limpieza de 'pending' viejos al arrancar
-// - Lógica "primer hueco disponible", sin mostrar profesional (steering ON)
+// index.js — Gapink Nails WhatsApp Bot (Playamar, 1 listener + intent robusto)
+// - Un solo messages.upsert (evita duplicados)
+// - Detección de servicios sin IA (tokens + alias + fuzzy score)
+// - Lógica “primer hueco disponible”, sin mostrar profesional
 // - Pago siempre en persona
 
 import express from "express"
@@ -34,17 +31,20 @@ const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
-// Steering (equilibrar carga)
 const STEER_ON = (process.env.BOT_STEER_BALANCE || "on").toLowerCase() === "on"
-const STEER_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)   // “esta semana”
+const STEER_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
 
-// ===== Utils
+// ===== Utils texto
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
 const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = (s="") => rmDiacritics(String(s).toLowerCase()).replace(/[^a-z0-9]+/g," ").trim()
+const STOP = new Set("de del la el los las un una unos unas y o u a al con por para en me mi mi@ su sus quiero quisiera hazme hacerme ponme dame porfa por favor hola buenas buenas tardes buenos dias noches necesito querria reservar cita hora con que tal".split(" "))
 
-// YES / NO (ampliado)
+function tokenize(s){
+  return norm(s).split(/\s+/).filter(w=>w && w.length>1 && !STOP.has(w))
+}
+
 const YES_RE = /\b(s[ií]|ok|okay|okey+|vale+|va|venga|dale|confirmo|confirmar|de acuerdo|perfecto|genial)\b/i
 const NO_RE  = /\b(no+|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde|anula|cancela)\b/i
 const RESCH_RE = /\b(cambia|cambiar|modifica|mover|reprograma|reprogramar|edita|mejor)\b/i
@@ -55,11 +55,11 @@ function normalizePhoneES(raw){
   if (d.startsWith("34") && d.length===11) return `+${d}`
   if (d.length===9) return `+34${d}`
   if (d.startsWith("00")) return `+${d.slice(2)}`
-  return `+${d}` // como último recurso, no “españolizamos” falsos positivos
+  return `+${d}`
 }
 const isValidEmail=(e)=>/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim())
 
-// ===== Empleadas Playamar (por nombre, desde .env). NO se muestran.
+// ===== Empleadas Playamar
 const EMPLOYEES = {
   rocio: process.env.SQ_EMP_ROCIO || "",
   cristina: process.env.SQ_EMP_CRISTINA || "",
@@ -94,7 +94,7 @@ if (!TEAM_MEMBER_IDS.length) {
   process.exit(1)
 }
 
-// ===== Servicios desde .env (SQ_SVC_* = id|version)
+// ===== Servicios desde .env
 function titleCase(s){return s.replace(/\b[a-záéíóúñ0-9]+\b/gi, w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase())}
 function humanizeEnvKey(k){return titleCase(k.replace(/^SQ_SVC_/,"").replace(/_/g," ").trim())}
 function loadServiceCatalogFromEnv(){
@@ -104,15 +104,85 @@ function loadServiceCatalogFromEnv(){
     const [variationId, versionRaw] = String(v||"").split("|")
     if(!variationId) continue
     const display = humanizeEnvKey(k)
-    const keyNorm = norm(display)
-    catalog.push({ envKey:k, displayName:display, variationId, variationVersion:versionRaw?Number(versionRaw):undefined, normName:keyNorm })
+    const toks = tokenize(display)
+    catalog.push({
+      envKey:k, displayName:display, variationId,
+      variationVersion:versionRaw?Number(versionRaw):undefined,
+      normName: norm(display),
+      tokens: new Set(toks)
+    })
   }
+  // ordenar por nombres más largos (más específicos)
   catalog.sort((a,b)=>b.normName.length - a.normName.length)
   return catalog
 }
 const SERVICE_CATALOG = loadServiceCatalogFromEnv()
 
-// Duraciones (mins). Si no listado, 60.
+// Alias explícitos (errores comunes/variantes)
+const SERVICE_ALIASES = {
+  "depilacion de cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "depilacion cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "depilar cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "depilacion labio con hilo":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
+  "esmaltado semipermanente pies":"SQ_SVC_ESMALTADO_SEMIPERMANETE_PIES",
+  "lifting de pestanas y tinte":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
+  "lifting de pestañas y tinte":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
+  "limpieza facial con punta de diamante":"SQ_SVC_LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE",
+  "limpieza hidra facial":"SQ_SVC_LIMPIEZA_HYDRA_FACIAL",
+  "fotodepilacion ingles":"SQ_SVC_FOTODEPILACION_INGLES",
+  "fotodepilación ingles":"SQ_SVC_FOTODEPILACION_INGLES",
+  "laser cejas":"SQ_SVC_LASER_CEJAS","láser cejas":"SQ_SVC_LASER_CEJAS",
+  "labios efecto acuarela":"SQ_SVC_LABIOS_EFECTO_AQUARELA",
+}
+
+// Fuzzy por tokens: score = (#intersección ponderada) / (#tokens servicio)
+function fuzzyService(userText){
+  const t = tokenize(userText)
+  if (!t.length) return null
+  const U = new Set(t)
+  let best=null
+  for(const svc of SERVICE_CATALOG){
+    // alias exacto por nombre normalizado
+    if (norm(userText).includes(svc.normName)) {
+      const score=1
+      if(!best || score>best.score) best={svc,score,why:"substring"}
+      continue
+    }
+    // tokens
+    let match=0
+    for(const tok of svc.tokens){
+      if (U.has(tok)) match += (tok.length>=6? 2 : 1) // peso por longitud
+    }
+    const denom = [...svc.tokens].length || 1
+    const score = match/denom
+    if (!best || score>best.score) best={svc,score,why:"tokens"}
+  }
+  // umbral: al menos 2 tokens o score >= 0.5
+  if (best && (best.score>=0.5 || intersectCount(best.svc.tokens, new Set(t))>=2)) return best.svc
+  return null
+}
+function intersectCount(a,b){let c=0; for(const x of a) if(b.has(x)) c++; return c}
+
+function resolveServiceFromText(userText){
+  const n = norm(userText)
+  // 1) alias explícitos
+  for(const [k,envKey] of Object.entries(SERVICE_ALIASES)){
+    if (n.includes(norm(k))) {
+      const svc = SERVICE_CATALOG.find(s=>s.envKey===envKey)
+      if (svc) return svc
+    }
+  }
+  // 2) fuzzy tokens
+  const f = fuzzyService(userText)
+  if (f) return f
+  // 3) último cartucho: incluye por palabras clave largas
+  for (const svc of SERVICE_CATALOG){
+    if (n.includes(svc.normName)) return svc
+  }
+  return null
+}
+
+// Duraciones (mins)
 const DURATION_MIN = {
   "SQ_SVC_BONO_5_SESIONES_MADEROTERAPIA_MAS_5_SESIONES_PUSH_UP":60,
   "SQ_SVC_CARBON_PEEL":60,
@@ -160,7 +230,7 @@ const DURATION_MIN = {
   "SQ_SVC_PEDICURA_GLAM_JELLY_CON_ESMALTE_SEMIPERMANENTE":60,
   "SQ_SVC_PEDICURA_SPA_CON_ESMALTE_NORMAL":60,
   "SQ_SVC_PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE":60,
-  "SQ_SVC_PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE_2":60, // si tienes segundo item
+  "SQ_SVC_PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE_2":60,
   "SQ_SVC_QUITAR_ESMALTADO_SEMIPERMANENTE":30,
   "SQ_SVC_QUITAR_ESMALTADO_SEMIPERMANENTE_PIES":30,
   "SQ_SVC_QUITAR_EXTENSIONES_PESTANAS":30,
@@ -194,90 +264,12 @@ const DURATION_MIN = {
   "SQ_SVC_UNAS_NUEVAS_ESCULPIDAS_FRANCESA_BABY_BOOMER_ENCAPSULADOS":90,
   "SQ_SVC_UNAS_NUEVAS_FORMAS_SUPERIORES_Y_MANICURA_RUSA":90,
 }
-function getDurationForServiceEnvKey(envKey){ return DURATION_MIN[envKey] ?? 60 }
-
-// Alias de servicios (corrige nombres “humanos” a envKey concretos)
-const SERVICE_ALIASES = {
-  "esmaltado semipermanente pies":"SQ_SVC_ESMALTADO_SEMIPERMANETE_PIES",
-  "esmaltado semipermanente en pies":"SQ_SVC_ESMALTADO_SEMIPERMANETE_PIES",
-  "lifting de pestanas y tinte":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
-  "lifting de pestañas y tinte":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
-  "tratamiento hidratante laminas de oro":"SQ_SVC_TRATAMIENDO_HIDRATANTE_LAMINAS_DE_ORO",
-  "tratamiento hidratante láminas de oro":"SQ_SVC_TRATAMIENDO_HIDRATANTE_LAMINAS_DE_ORO",
-  "laser cejas":"SQ_SVC_LASER_CEJAS",
-  "láser cejas":"SQ_SVC_LASER_CEJAS",
-  "labios efecto acuarela":"SQ_SVC_LABIOS_EFECTO_AQUARELA",
-  "limpieza facial básica":"SQ_SVC_LIMPIEZA_FACIAL_BASICA",
-  "limpieza facial basica":"SQ_SVC_LIMPIEZA_FACIAL_BASICA",
-  "fotodepilacion ingles":"SQ_SVC_FOTODEPILACION_INGLES",
-  "fotodepilación ingles":"SQ_SVC_FOTODEPILACION_INGLES",
-}
-function getServiceByText(txt){
-  const t=norm(txt)
-  for(const [alias,envKey] of Object.entries(SERVICE_ALIASES)){
-    if(t.includes(norm(alias))){
-      const svc=SERVICE_CATALOG.find(s=>s.envKey===envKey)
-      if(svc) return svc
-    }
-  }
-  for (const svc of SERVICE_CATALOG){ if (svc.normName && t.includes(svc.normName)) return svc }
-  return null
-}
-
-// ===== OpenAI (silencioso si peta)
-const OPENAI_API_KEY  = process.env.OPENAI_API_KEY
-const OPENAI_API_URL  = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
-const OPENAI_MODEL    = process.env.OPENAI_MODEL || "gpt-4o-mini"
-
-async function aiChat(messages, { temperature=0.35 } = {}) {
-  try {
-    const r = await fetch(OPENAI_API_URL, {
-      method: "POST",
-      headers: { "Content-Type":"application/json", "Authorization":`Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature })
-    })
-    if (!r.ok) throw new Error(`OpenAI ${r.status}`)
-    const j = await r.json()
-    return (j?.choices?.[0]?.message?.content || "").trim()
-  } catch (e) { console.error("OpenAI error:", e?.message || e); return "" }
-}
-
-const SYS_TONE = `Eres el asistente de WhatsApp de Gapink Nails (España).
-Habla natural, breve y sin emojis. No digas que eres IA.
-Nunca muestres ni ofrezcas elegir profesional.
-Si la hora pedida está libre, ofrécela; si no, propone la más cercana y pide confirmación.
-Pago siempre en persona.`
-async function extractFromText(userText="") {
-  const schema = `
-Devuelve SOLO un JSON válido (omite claves que no apliquen):
-{
-  "intent": "greeting|booking|cancel|reschedule|other",
-  "datetime_text": "texto con fecha/hora si lo hay",
-  "confirm": "yes|no|unknown",
-  "name": "si aparece",
-  "email": "si aparece",
-  "staff_hint": "si menciona 'con rocio', 'con cristina', etc",
-  "polite_reply": "respuesta breve y natural para avanzar"
-}`
-  const content = await aiChat([
-    { role: "system", content: `${SYS_TONE}\n${schema}\nUsa español de España.` },
-    { role: "user", content: userText }
-  ], { temperature: 0.2 })
-  try {
-    const jsonStr = content.trim().replace(/^```(json)?/i,"").replace(/```$/,"")
-    return JSON.parse(jsonStr)
-  } catch { return { intent:"other", polite_reply:"" } }
-}
-async function aiSay(contextSummary) {
-  return await aiChat([
-    { role:"system", content: SYS_TONE },
-    { role:"user", content: contextSummary }
-  ], { temperature: 0.35 })
-}
+const getDurationForServiceEnvKey=(k)=>DURATION_MIN[k] ?? 60
 
 // ===== Fecha/hora ES
 function parseDateTimeES(dtText){if(!dtText)return null;const t=rmDiacritics(dtText.toLowerCase());let base=null;if(/\bhoy\b/.test(t))base=dayjs().tz(EURO_TZ);else if(/\bmanana\b/.test(t))base=dayjs().tz(EURO_TZ).add(1,"day");if(!base){const M={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12};const m=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/);if(m){const dd=+m[1],mm=M[m[2]],yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();base=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base){const m=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);if(m){let yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;base=dayjs.tz(`${yy}-${String(+m[2]).padStart(2,"0")}-${String(+m[1]).padStart(2,"0")} 00:00`,EURO_TZ)}}if(!base)base=dayjs().tz(EURO_TZ);let hour=null,minute=0;const hm=t.match(/(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/);if(hm){hour=+hm[1];minute=hm[2]?+hm[2]:0;const ap=hm[3];if(ap==="pm"&&hour<12)hour+=12;if(ap==="am"&&hour===12)hour=0}if(hour===null)return null;return base.hour(hour).minute(minute).second(0).millisecond(0)}
 const fmtES=(d)=>{const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ);const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];const DD=String(t.date()).padStart(2,"0"),MM=String(t.month()+1).padStart(2,"0"),HH=String(t.hour()).padStart(2,"0"),mm=String(t.minute()).padStart(2,"0");return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`}
+function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
 // ===== Square
 const square = new Client({
@@ -299,50 +291,11 @@ async function squareCreateCustomer({givenName,emailAddress,phoneNumber}){try{
   return resp?.result?.customer||null
 }catch(e){console.error("Square create:",e?.message||e);return null}}
 
-// Caché de versiones de variaciones
-const VAR_VERSION_CACHE = new Map() // variationId -> {version, ts}
-const VERSION_TTL_MS = 30*60*1000
-async function getServiceVariationVersionRaw(id){const resp=await square.catalogApi.retrieveCatalogObject(id,true);return resp?.result?.object?.version}
-async function getServiceVariationVersion(id){
-  const cached = VAR_VERSION_CACHE.get(id)
-  const now = Date.now()
-  if (cached && (now - cached.ts) < VERSION_TTL_MS) return cached.version
-  try{
-    const v = await getServiceVariationVersionRaw(id)
-    if (v) VAR_VERSION_CACHE.set(id, {version:Number(v), ts:now})
-    return v
-  }catch(e){console.error("getServiceVariationVersion:",e?.message||e);return undefined}
-}
-
-function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){
-  const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`
-  return createHash("sha256").update(raw).digest("hex").slice(0,48)
-}
-async function createSquareBooking({startEU,svc,customerId,teamMemberId}){
-  try{
-    const serviceVariationId = svc.variationId
-    let version = svc.variationVersion || await getServiceVariationVersion(serviceVariationId)
-    if(!serviceVariationId||!teamMemberId||!locationId||!version) return null
-    const startISO=startEU.tz("UTC").toISOString()
-    const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),
-      booking:{locationId,startAt:startISO,customerId,
-        appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:getDurationForServiceEnvKey(svc.envKey)}]}}
-    const resp=await square.bookingsApi.createBooking(body)
-    return resp?.result?.booking||null
-  }catch(e){console.error("createSquareBooking:",e?.message||e);return null}
-}
+async function getServiceVariationVersion(id){try{const resp=await square.catalogApi.retrieveCatalogObject(id,true);return resp?.result?.object?.version}catch(e){console.error("getServiceVariationVersion:",e?.message||e);return undefined}}
+function stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}){const raw=`${locationId}|${serviceVariationId}|${startISO}|${customerId}|${teamMemberId}`;return createHash("sha256").update(raw).digest("hex").slice(0,48)}
+async function createSquareBooking({startEU,svc,customerId,teamMemberId}){try{const serviceVariationId=svc.variationId;let version=svc.variationVersion||await getServiceVariationVersion(serviceVariationId);if(!serviceVariationId||!teamMemberId||!locationId||!version)return null;const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId,startISO,customerId,teamMemberId}),booking:{locationId,startAt:startISO,customerId,appointmentSegments:[{teamMemberId,serviceVariationId,serviceVariationVersion:Number(version),durationMinutes:getDurationForServiceEnvKey(svc.envKey)}]}};const resp=await square.bookingsApi.createBooking(body);return resp?.result?.booking||null}catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
 async function cancelSquareBooking(bookingId){try{const r=await square.bookingsApi.cancelBooking(bookingId);return !!r?.result?.booking?.id}catch(e){console.error("cancelSquareBooking:",e?.message||e);return false}}
-async function updateSquareBooking(bookingId,{startEU,svc,customerId,teamMemberId}){
-  try{
-    const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking;if(!booking)return null
-    let version = svc.variationVersion || await getServiceVariationVersion(svc.variationId)
-    const startISO=startEU.tz("UTC").toISOString()
-    const body={idempotencyKey:stableKey({locationId,serviceVariationId:svc.variationId,startISO,customerId,teamMemberId}),
-      booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,
-        appointmentSegments:[{teamMemberId,serviceVariationId:svc.variationId,serviceVariationVersion:Number(version),durationMinutes:getDurationForServiceEnvKey(svc.envKey)}]}}
-    const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null
-  }catch(e){console.error("updateSquareBooking:",e?.message||e);return null}
-}
+async function updateSquareBooking(bookingId,{startEU,svc,customerId,teamMemberId}){try{const get=await square.bookingsApi.retrieveBooking(bookingId);const booking=get?.result?.booking;if(!booking)return null;let version=svc.variationVersion||await getServiceVariationVersion(svc.variationId);const startISO=startEU.tz("UTC").toISOString();const body={idempotencyKey:stableKey({locationId,serviceVariationId:svc.variationId,startISO,customerId,teamMemberId}),booking:{id:bookingId,version:booking.version,locationId,customerId,startAt:startISO,appointmentSegments:[{teamMemberId,serviceVariationId:svc.variationId,serviceVariationVersion:Number(version),durationMinutes:getDurationForServiceEnvKey(svc.envKey)}]}};const resp=await square.bookingsApi.updateBooking(bookingId, body);return resp?.result?.booking||null}catch(e){console.error("updateSquareBooking:",e?.message||e);return null}}
 
 // ===== DB & sesiones
 const db=new Database("gapink.db");db.pragma("journal_mode = WAL")
@@ -384,9 +337,7 @@ VALUES (@phone, @data_json, @updated_at)
 ON CONFLICT(phone) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at`)
 const clearSession=db.prepare(`DELETE FROM sessions WHERE phone=@phone`)
 const getUpcomingByPhone=db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso ASC LIMIT 1`)
-const cleanupPendingOld=db.prepare(`DELETE FROM appointments WHERE status='pending' AND created_at < @cutoff`)
 
-// Persistimos MILLISECONDS locales para evitar desplazamientos TZ
 function loadSession(phone){
   const row=getSessionRow.get({phone}); if(!row?.data_json) return null
   const raw=JSON.parse(row.data_json); const data={...raw}
@@ -406,6 +357,7 @@ function getBookedIntervals(fromIso,toIso){
 function isFree(intervals, staffId, startUTC, endUTC){
   return !intervals.filter(i=>i.staff_id===staffId).some(i => (startUTC<i.end) && (i.start<endUTC))
 }
+function ceilToDayWindowStart(t){ return t.clone().second(0).millisecond(0) }
 function findEarliestAny(startEU, durationMin, daysWindow){
   const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
   const startBase = startEU && startEU.isAfter(now) ? ceilToSlotEU(startEU.clone()) : ceilToSlotEU(now.clone())
@@ -448,7 +400,6 @@ function findEarliestForStaff(startEU, durationMin, daysWindow, staffId){
   }
   return null
 }
-function ceilToSlotEU(t){const m=t.minute();const rem=m%SLOT_MIN;if(rem===0)return t.second(0).millisecond(0);return t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)}
 
 // ===== Mini web
 const app=express()
@@ -457,23 +408,14 @@ let lastQR=null,conectado=false
 app.get("/",(_req,res)=>{res.send(`<!doctype html><meta charset="utf-8"><style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#fce4ec,#f8bbd0);color:#4a148c} .card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);text-align:center;max-width:520px}</style><div class="card"><h1>Gapink Nails</h1><p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>${!conectado&&lastQR?`<img src="/qr.png" width="320" />`:``}<p><small>Pago en persona · Playamar</small></p></div>`)})
 app.get("/qr.png",async(_req,res)=>{if(!lastQR)return res.status(404).send("No hay QR");const png=await qrcode.toBuffer(lastQR,{type:"png",width:512,margin:1});res.set("Content-Type","image/png").send(png)})
 
-// ===== Cola envío Baileys
 const wait=(ms)=>new Promise(r=>setTimeout(r,ms))
 app.listen(PORT,async()=>{
   console.log(`🌐 Web en puerto ${PORT}`)
-  // Limpieza de pending > 30 minutos
-  const cutoff = dayjs().subtract(30, "minute").toISOString()
-  cleanupPendingOld.run({ cutoff })
   await squareCheckCredentials()
   startBot().catch(console.error)
 })
 
-// ===== Bot
-const PROCESSED_IDS = new Set()
-function markProcessed(id){ PROCESSED_IDS.add(id); if (PROCESSED_IDS.size>2000){ // GC simple
-  const arr=[...PROCESSED_IDS]; PROCESSED_IDS.clear(); for(let i=arr.length-1000;i<arr.length;i++) if(i>=0) PROCESSED_IDS.add(arr[i])
-}}
-
+// ===== Bot (UN solo listener)
 async function startBot(){
   console.log("🚀 Bot arrancando…")
   try{
@@ -494,34 +436,28 @@ async function startBot(){
     })
     sock.ev.on("creds.update",saveCreds)
 
-    // ===== ÚNICO listener de mensajes
     sock.ev.on("messages.upsert",async({messages})=>{
       try{
         const m=messages?.[0]; if (!m?.message || m.key.fromMe) return
-        const msgId=m.key.id; if (PROCESSED_IDS.has(msgId)) return; markProcessed(msgId)
-
         const from=m.key.remoteJid
         const phone=normalizePhoneES((from||"").split("@")[0]||"")||(from||"").split("@")[0]||""
         const body=m.message.conversation||m.message.extendedTextMessage?.text||m.message?.imageMessage?.caption||""
         const textRaw=(body||"").trim()
         const textNorm = norm(textRaw)
 
-        // Sesión
         let data=loadSession(phone)||{
           serviceEnvKey:null, service:null, durationMin:null,
           startEU:null, name:null, email:null,
           requestedStaffId:null, staffInsistCount:0,
-          confirmApproved:false,confirmAsked:false,bookingInFlight:false,
-          lastUserDtText:null, selectedStaffId:null,
+          confirmAsked:false, bookingInFlight:false,
           editBookingId:null
         }
 
-        // IA extracción (silencioso si peta)
-        const extra=await extractFromText(textRaw)
-        const incomingDt = extra.datetime_text || null
+        const userSaysYes = YES_RE.test(textRaw)
+        const userSaysNo  = NO_RE.test(textRaw)
 
-        // Cancelación explícita
-        if (extra.intent==="cancel" || /\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
+        // Cancelar
+        if (/\b(cancel|anul|borra|elimina)r?\b/i.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
           if (upc) {
             const ok = upc.square_booking_id ? await cancelSquareBooking(upc.square_booking_id) : true
@@ -532,55 +468,49 @@ async function startBot(){
           return
         }
 
-        // ¿Pide reprogramar?
-        if (extra.intent==="reschedule" || RESCH_RE.test(textRaw)) {
+        // Reprogramar
+        if (RESCH_RE.test(textRaw)) {
           const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
-          if (upc) { data.editBookingId = upc.id; data.serviceEnvKey = upc.service_env_key; data.service = upc.service_display; data.durationMin = upc.duration_min; data.selectedStaffId = upc.staff_id }
+          if (upc) { data.editBookingId = upc.id; data.serviceEnvKey = upc.service_env_key; data.service = upc.service_display; data.durationMin = upc.duration_min; data.requestedStaffId = upc.staff_id }
         }
 
-        // Staff en texto (sin mostrarlo)
-        const staffFromText = detectStaffFromText(textNorm, String(extra.staff_hint||"").toLowerCase())
-        if (staffFromText?.id) {
-          if (data.requestedStaffId && data.requestedStaffId===staffFromText.id) data.staffInsistCount++
-          else { data.requestedStaffId = staffFromText.id; data.staffInsistCount = 1 }
+        // Staff por texto
+        for (const w of textNorm.split(/\s+/)) {
+          const key=EMP_ALIASES[w]; if (key && EMPLOYEES[key]) {
+            if (data.requestedStaffId===EMPLOYEES[key]) data.staffInsistCount++
+            else { data.requestedStaffId=EMPLOYEES[key]; data.staffInsistCount=1 }
+          }
         }
 
-        // Servicio detectado
-        const svcDetected = getServiceByText(textRaw)
+        // Servicio desde el texto (robusto)
+        const svcDetected = resolveServiceFromText(textRaw)
         if (svcDetected) {
-          if (svcDetected.envKey!==data.serviceEnvKey) { data.confirmApproved=false; data.confirmAsked=false }
+          if (svcDetected.envKey!==data.serviceEnvKey) { data.confirmAsked=false }
           data.serviceEnvKey = svcDetected.envKey
           data.service = svcDetected.displayName
           data.durationMin = getDurationForServiceEnvKey(svcDetected.envKey)
         }
 
-        // Fecha/hora parsing
-        if (incomingDt && incomingDt !== data.lastUserDtText) { data.confirmApproved=false; data.confirmAsked=false }
-        if (incomingDt) data.lastUserDtText = incomingDt
-        const parsed = parseDateTimeES(incomingDt ? incomingDt : textRaw)
-        if (parsed) data.startEU = parsed
+        // Fecha/hora
+        const parsed = parseDateTimeES(textRaw)
+        if (parsed) { data.startEU = parsed; data.confirmAsked=false }
 
-        // Nombre/Email si los extrae
-        if (!data.name && extra.name) data.name = extra.name.trim()
-        if (!data.email && extra.email && isValidEmail(extra.email)) data.email = extra.email.trim()
+        // Nombre/email si llegan en claro
+        if (!data.name && !textRaw.includes("@") && !/\d/.test(textRaw)) data.name = textRaw.length<40 ? textRaw : data.name
+        if (!data.email && /\S+@\S+\.\S+/.test(textRaw) && isValidEmail(textRaw)) data.email = textRaw.trim()
 
-        saveSession(phone, data)
+        // NO ⇒ reset confirm
+        if (userSaysNo) { data.confirmAsked=false; saveSession(phone,data); await __SAFE_SEND__(from,{text:"Sin problema. Dime otra hora o día y lo miro."}); return }
 
-        // ======= FLUJO por pasos
+        // ====== FLOW por pasos (en un solo listener)
 
-        // Paso 1: Servicio
-        if (!data.serviceEnvKey) {
-          await __SAFE_SEND__(from,{ text:"¿Qué te hago? (Ej: “Manicura semipermanente”, “Limpieza facial con punta de diamante”…)" })
-          return
-        }
+        // 1) servicio
+        if (!data.serviceEnvKey) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:"¿Qué te hago? (Ej: “Manicura semipermanente”, “Limpieza facial con punta de diamante”…)" }); return }
 
-        // Paso 2: Fecha/hora
-        if (!data.startEU) {
-          await __SAFE_SEND__(from,{ text:`Genial, ${data.service}. Dime día y hora (ej: “mañana 10:30” o “15/09 18:00”).` })
-          return
-        }
+        // 2) fecha/hora
+        if (!data.startEU) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:`Genial, ${data.service}. Dime día y hora (ej: “mañana 10:30” o “15/09 18:00”).` }); return }
 
-        // Paso 3: Disponibilidad con steering
+        // 3) disponibilidad + steering
         const duration = data.durationMin || 60
         const earliestAny = findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
         const earliestRequested = data.requestedStaffId ? findEarliestForStaff(data.startEU, duration, STEER_WINDOW_DAYS, data.requestedStaffId) : null
@@ -590,87 +520,35 @@ async function startBot(){
 
         if (STEER_ON && data.requestedStaffId && earliestRequested) {
           if (earliestAny && earliestAny.time.isBefore(earliestRequested.time)) {
-            offer = earliestAny
-            staffToAssign = earliestAny.staffId
-            await __SAFE_SEND__(from,{ text:`No me aparece hueco esta semana con esa opción. Te puedo ofrecer ${fmtES(offer.time)}. ¿Te viene bien? Si es sí, responde “confirmo”.` })
-            data.startEU = offer.time; data.selectedStaffId = staffToAssign; data.confirmAsked = true; data.confirmApproved=false; saveSession(phone,data)
-            return
-          }
+            offer = earliestAny; staffToAssign = earliestAny.staffId
+          } else { offer = earliestRequested; staffToAssign = earliestRequested.staffId }
         }
-
-        // Si insistió 2+ veces, respetamos la profesional pedida
-        if (data.requestedStaffId && data.staffInsistCount >= 2) {
+        if (data.requestedStaffId && data.staffInsistCount>=2) {
           const forced = findEarliestForStaff(data.startEU, duration, SEARCH_WINDOW_DAYS, data.requestedStaffId)
-          if (forced) { offer = forced; staffToAssign = forced.staffId }
+          if (forced) { offer=forced; staffToAssign=forced.staffId }
         }
 
-        if (offer) {
-          data.startEU = offer.time
-          data.selectedStaffId = staffToAssign || TEAM_MEMBER_IDS[0]
-          if (!data.selectedStaffId) { await __SAFE_SEND__(from,{ text:"Ahora mismo no puedo asignar equipo. Dime otra hora y lo miro." }); return }
-          data.confirmAsked = true
-          saveSession(phone,data)
-          await __SAFE_SEND__(from,{ text:`Puedo darte ${fmtES(offer.time)}. ¿Confirmo la ${data.editBookingId?"modificación":"cita"}?` })
-          return
-        }
+        if (!offer) { data.confirmAsked=false; saveSession(phone,data); await __SAFE_SEND__(from,{ text:"Ahora mismo no veo huecos en esa franja. Dime otra hora o día y te digo." }); return }
 
-        // Sin huecos
-        data.confirmAsked=false; saveSession(phone,data)
-        await __SAFE_SEND__(from,{ text:"Ahora mismo no veo huecos en esa franja. Dime otra hora o día y te digo." })
-        return
+        data.startEU = offer.time
+        data.selectedStaffId = staffToAssign || TEAM_MEMBER_IDS[0]
+        data.confirmAsked = true
+        saveSession(phone,data)
 
-      } catch(e){ console.error("messages.upsert error:",e) }
-    })
-
-    // ===== Confirmaciones / capturas dentro del mismo listener (con state)
-    sock.ev.on("messages.upsert",async({messages})=>{
-      try{
-        const m=messages?.[0]; if (!m?.message || m.key.fromMe) return
-        const msgId=m.key.id; if (PROCESSED_IDS.has(msgId)) return; markProcessed(msgId)
-
-        const from=m.key.remoteJid
-        const phone=normalizePhoneES((from||"").split("@")[0]||"")||(from||"").split("@")[0]||""
-        const body=m.message.conversation||m.message.extendedTextMessage?.text||m.message?.imageMessage?.caption||""
-        const textRaw=(body||"").trim()
-
-        let data=loadSession(phone); if(!data) return
-
-        const userSaysYes = YES_RE.test(textRaw)
-        const userSaysNo  = NO_RE.test(textRaw)
-        if (userSaysNo){ data.confirmApproved=false; data.confirmAsked=false; saveSession(phone,data); await __SAFE_SEND__(from,{text:"Sin problema. Dime otra hora o día y lo miro."}); return }
-
-        // Captura paso a paso (solo altas)
-        if (!data.editBookingId) {
-          if (!data.name) {
-            const maybeName = textRaw.replace(/[,;].*/,'').trim()
-            if (!userSaysYes && maybeName && !maybeName.match(/@|\d/)) { data.name=maybeName; saveSession(phone,data); await __SAFE_SEND__(from,{text:"Gracias. Ahora tu email (ej: “nombre@correo.com”)."}); return }
-            if (userSaysYes && data.confirmAsked) { await __SAFE_SEND__(from,{ text:"Para cerrar, dime tu nombre (ej: “Ana Pérez”)." }); return }
-          } else if (!data.email) {
-            if (!userSaysYes && isValidEmail(textRaw)) { data.email=textRaw.trim(); saveSession(phone,data); await __SAFE_SEND__(from,{text:"Perfecto. Si estás conforme, responde “confirmo” para cerrar la cita."}); return }
-            if (userSaysYes && data.confirmAsked) { await __SAFE_SEND__(from,{ text:"Y ahora tu email (ej: “ana@correo.com”)." }); return }
-          }
-        }
-
-        // Confirmación final
-        if (data.confirmAsked && userSaysYes && data.serviceEnvKey && data.startEU) {
+        // Si dice “sí/confirmo” en el mismo mensaje (pasa), intentamos cerrar
+        if (userSaysYes && data.serviceEnvKey && data.startEU) {
           if (data.editBookingId) await finalizeReschedule({ from, phone, data, safeSend: __SAFE_SEND__ })
           else await finalizeBooking({ from, phone, data, safeSend: __SAFE_SEND__ })
           return
         }
-      }catch(e){ console.error("confirm handler error:",e) }
+
+        await __SAFE_SEND__(from,{ text:`Puedo darte ${fmtES(offer.time)}. ¿Confirmo la ${data.editBookingId?"modificación":"cita"}?` })
+        return
+
+      }catch(e){ console.error("messages.upsert error:",e) }
     })
 
   }catch(e){ console.error("startBot error:",e) }
-}
-
-// Detectar staff por texto (sin mostrarlo)
-function detectStaffFromText(textNorm, hint){
-  const words=[...(textNorm||"").split(/\s+/), (hint||"").toLowerCase()].filter(Boolean)
-  for (const w of words){
-    const key=EMP_ALIASES[w]
-    if (key && EMPLOYEES[key]) return { id: EMPLOYEES[key] }
-  }
-  return null
 }
 
 // ===== Finalizar alta
@@ -679,23 +557,20 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     if (data.bookingInFlight) return
     data.bookingInFlight = true; saveSession(phone, data)
 
-    // Cliente Square
     let customer = await squareFindCustomerByPhone(phone)
     if (!customer) {
       if (!data.name || !data.email || !isValidEmail(data.email)) {
         data.bookingInFlight=false; saveSession(phone,data);
-        await safeSend(from,{text:"Me falta nombre y/o email válido para crear tu ficha. Dime: “Nombre Apellido” y luego “correo@ejemplo.com”"});
+        await safeSend(from,{text:"Para cerrar necesito tu nombre y un email válido. Mándame: “Nombre Apellido” y luego “correo@ejemplo.com”"});
         return
       }
       customer = await squareCreateCustomer({ givenName: data.name, emailAddress: data.email, phoneNumber: phone })
     }
     if (!customer) { data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No pude crear tu ficha (email no válido). Pásame un email válido por favor."}); return }
 
-    // Servicio
     const svc = SERVICE_CATALOG.find(s=>s.envKey===data.serviceEnvKey)
     if (!svc) { data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No encuentro el servicio ahora mismo. Dime de nuevo el servicio, por favor."}); return }
 
-    // Fecha/hora
     const startEU = dayjs.isDayjs(data.startEU) ? data.startEU : (data.startEU_ms ? dayjs.tz(Number(data.startEU_ms), EURO_TZ) : null)
     if (!startEU || !startEU.isValid()) { data.bookingInFlight=false; saveSession(phone,data); return }
 
@@ -704,7 +579,6 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     const durationMin = getDurationForServiceEnvKey(svc.envKey)
     const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
 
-    // Inserción previa (pending)
     const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
     try {
       insertAppt.run({
@@ -750,7 +624,6 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
 
     const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(upc.duration_min,"minute")
     const teamId   = data.selectedStaffId || upc.staff_id || TEAM_MEMBER_IDS[0]
-
     if(!teamId){ data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No puedo asignar equipo ahora mismo. Probamos otro día?"}); return }
 
     let ok=false
@@ -784,6 +657,3 @@ Pago en persona.` })
   }catch(e){ console.error("finalizeReschedule:", e) }
   finally{ data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
 }
-
-// ==== Lanzar
-startBot().catch(console.error)
