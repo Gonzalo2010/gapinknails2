@@ -1,11 +1,6 @@
-// index.js — Gapink Nails · v12 “La Luz + IA pestañas • 2 locales • Square-safe”
+// index.js — Gapink Nails · v12.1 “Baileys robusto + IA pestañas + 2 locales + Square-safe”
 
 import express from "express"
-import makeWASocket, {
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  Browsers
-} from "@whiskeysockets/baileys"
 import pino from "pino"
 import qrcode from "qrcode"
 import qrcodeTerminal from "qrcode-terminal"
@@ -15,14 +10,15 @@ import Database from "better-sqlite3"
 import dayjs from "dayjs"
 import utc from "dayjs/plugin/utc.js"
 import tz from "dayjs/plugin/timezone.js"
-import isSameOrAfter from "dayjs/plugin/isSameOrAfter.js"
+import isSameOrAfter from "dayjs/plugin/isSameOrBefore.js" // <- naming fix
 import isSameOrBefore from "dayjs/plugin/isSameOrBefore.js"
 import "dayjs/locale/es.js"
 import { webcrypto, createHash } from "crypto"
+import { createRequire } from "module"
 import { Client, Environment } from "square"
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto
-dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isSameOrAfter); dayjs.extend(isSameOrBefore)
+dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isSameOrBefore); dayjs.extend(isSameOrBefore) // idempotente
 dayjs.locale("es")
 
 // ====== Zona/horario negocio (España)
@@ -124,19 +120,10 @@ function ceilToSlotEU(t){
   return rem===0 ? t.second(0).millisecond(0) : t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)
 }
 function nextOpeningFrom(d){
-  // Si cae fuera de franja, salta al inicio de la siguiente franja hábil
   let t=d.clone()
-  const inMorning = t.hour() < MORNING.start || (t.hour()>=MORNING.start && t.hour()<MORNING.end)
-  const inAfternoon = t.hour() < AFTERNOON.start || (t.hour()>=AFTERNOON.start && t.hour()<AFTERNOON.end)
-  // Si dentro de mañana pero pasada la 14, o entre 14 y 16, salta a 16:00
-  if (t.hour()>=MORNING.end && t.hour()<AFTERNOON.start) {
-    t=t.hour(AFTERNOON.start).minute(0).second(0).millisecond(0)
-  }
-  // Si antes de abrir por la mañana, ajusta a 10:00
-  if (t.hour()<MORNING.start) t=t.hour(MORNING.start).minute(0).second(0).millisecond(0)
-  // Si después de 20:00, pasa al siguiente día laborable a 10:00
-  if (t.hour()>=AFTERNOON.end) t=t.add(1,"day").hour(MORNING.start).minute(0).second(0).millisecond(0)
-  // Evita festivos o fines de semana
+  if (t.hour()>=AFTERNOON.end) t = t.add(1,"day").hour(MORNING.start).minute(0).second(0).millisecond(0)
+  else if (t.hour()>=MORNING.end && t.hour()<AFTERNOON.start) t = t.hour(AFTERNOON.start).minute(0).second(0).millisecond(0)
+  else if (t.hour()<MORNING.start) t = t.hour(MORNING.start).minute(0).second(0).millisecond(0)
   while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) {
     t=t.add(1,"day").hour(MORNING.start).minute(0).second(0).millisecond(0)
   }
@@ -173,7 +160,6 @@ const insertAppt = db.prepare(`INSERT INTO appointments
 (id, customer_name, customer_phone, customer_square_id, location_key, service_key, service_name, duration_min, start_iso, end_iso, staff_id, status, created_at, square_booking_id)
 VALUES (@id,@customer_name,@customer_phone,@customer_square_id,@location_key,@service_key,@service_name,@duration_min,@start_iso,@end_iso,@staff_id,@status,@created_at,@square_booking_id)`)
 const updateApptStatus = db.prepare(`UPDATE appointments SET status=@status, square_booking_id=@square_booking_id WHERE id=@id`)
-const updateApptTimes  = db.prepare(`UPDATE appointments SET start_iso=@start_iso, end_iso=@end_iso, staff_id=@staff_id WHERE id=@id`)
 const selectUpcomingByPhone = db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso LIMIT 1`)
 
 function loadSession(phone){
@@ -188,7 +174,6 @@ function saveSession(phone, data){
   d.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null
   delete d.startEU
   const j = JSON.stringify(d)
-  // Sin UPSERT (compat total)
   const upd = db.prepare(`UPDATE sessions SET data_json=@data_json, updated_at=@updated_at WHERE phone=@phone`)
   const res = upd.run({ phone, data_json:j, updated_at:new Date().toISOString() })
   if (res.changes===0) {
@@ -213,14 +198,14 @@ function parseEmployees(){
 }
 const EMPLOYEES = parseEmployees()
 function pickStaffForLocation(locKey){
-  // Prefer bookable con ese local o ALL
-  const id = (EMPLOYEES.find(e=>e.bookable && (e.allow.includes("ALL") || e.allow.includes(locationToId(locKey))))?.id)
-  return id || null
+  const locId = locationToId(locKey)
+  const found = EMPLOYEES.find(e=>e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
+  return found?.id || null
 }
 
 // ====== Servicios
 const SVC = {
-  // --- pestañas (claves iguales entre locales; ID varía por env) ---
+  // pestañas
   LIFITNG_DE_PESTANAS_Y_TINTE: { name:"Lifting de pestañas y tinte", dur:60 },
   EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO: { name:"Extensiones nuevas pelo a pelo", dur:120 },
   EXTENSIONES_PESTANAS_NUEVAS_2D: { name:"Extensiones nuevas 2D", dur:120 },
@@ -230,13 +215,12 @@ const SVC = {
   RELLENO_PESTANAS_3D: { name:"Relleno pestañas 3D", dur:90 },
   QUITAR_EXTENSIONES_PESTANAS: { name:"Quitar extensiones de pestañas", dur:30 },
 
-  // --- uñas rápidas (por si preguntan) ---
+  // uñas rápidas
   MANICURA_SEMIPERMANENTE: { name:"Manicura semipermanente", dur:30 },
   MANICURA_SEMIPERMANENTE_QUITAR: { name:"Manicura semipermanente + quitar", dur:40 },
   MANICURA_CON_ESMALTE_NORMAL: { name:"Manicura con esmalte normal", dur:30 },
   PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE: { name:"Pedicura spa (semipermanente)", dur:60 },
 }
-
 const SERVICE_KEYS = Object.keys(SVC)
 
 const SVC_SYNON = [
@@ -249,7 +233,6 @@ const SVC_SYNON = [
   ["relleno 2d", "RELLENO_PESTANAS_2D", []],
   ["relleno 3d", "RELLENO_PESTANAS_3D", []],
   ["quitar extensiones", "QUITAR_EXTENSIONES_PESTANAS", ["retirar extensiones","retirar pestañas","quitar pestañas"]],
-
   // uñas
   ["manicura semipermanente", "MANICURA_SEMIPERMANENTE", ["semi"]],
   ["manicura semipermanente quitar", "MANICURA_SEMIPERMANENTE_QUITAR", ["retirar semi","remove gel"]],
@@ -298,7 +281,7 @@ function stableKey(parts){
   return createHash("sha256").update(raw).digest("hex").slice(0,48)
 }
 
-// ====== Bookings Square (crear/actualizar/cancelar)
+// ====== Bookings Square
 async function createSquareBooking({ startEU, serviceKey, locationKey, customerId, teamMemberId }){
   try{
     const pair = pickServiceEnvPair(serviceKey, locationKey)
@@ -335,33 +318,6 @@ async function cancelSquareBooking(bookingId){
     return !!r?.result?.booking?.id
   }catch{ return false }
 }
-async function updateSquareBooking(bookingId,{startEU,serviceKey,locationKey,customerId,teamMemberId}){
-  try{
-    const get=await square.bookingsApi.retrieveBooking(bookingId)
-    const booking=get?.result?.booking; if(!booking) return null
-    const pair=pickServiceEnvPair(serviceKey,locationKey)
-    const version=pair?.version || await getServiceVariationVersion(pair?.id)
-    const startISO=startEU.tz("UTC").toISOString()
-    const body={
-      idempotencyKey: stableKey({loc:locationToId(locationKey),sv:pair?.id,startISO,customerId,teamMemberId}),
-      booking:{
-        id: bookingId,
-        version: booking.version,
-        locationId: locationToId(locationKey),
-        customerId,
-        startAt: startISO,
-        appointmentSegments:[{
-          teamMemberId,
-          serviceVariationId: pair?.id,
-          serviceVariationVersion: Number(version),
-          durationMinutes: pair?.duration ?? 60
-        }]
-      }
-    }
-    const resp=await square.bookingsApi.updateBooking(bookingId, body)
-    return resp?.result?.booking||null
-  }catch(e){ console.error("updateSquareBooking:", e?.message||e); return null }
-}
 
 // ====== Clientes Square
 function isValidEmail(e){ return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim()) }
@@ -383,7 +339,7 @@ async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }){
   }catch(e){ console.error("squareCreateCustomer:", e?.message||e); return null }
 }
 
-// ====== Propuestas de hora (sin llamar a availability para evitar 400)
+// ====== Propuestas de hora (no availability; se corrige si Square rechaza)
 function fmtES(d){
   const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]
   const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ)
@@ -393,7 +349,6 @@ function fmtES(d){
   const mm=String(t.minute()).padStart(2,"0")
   return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`
 }
-
 function proposeSlots({ fromEU, durationMin, n=3 }){
   const out=[]
   let t = ceilToSlotEU(fromEU.clone())
@@ -404,7 +359,6 @@ function proposeSlots({ fromEU, durationMin, n=3 }){
       out.push(t.clone())
       t = t.add(SLOT_MIN,"minute")
     } else {
-      // Salta a siguiente apertura
       if (t.hour()>=AFTERNOON.end) t = t.add(1,"day").hour(MORNING.start).minute(0)
       else if (t.hour()>=MORNING.end && t.hour()<AFTERNOON.start) t = t.hour(AFTERNOON.start).minute(0)
       else t=t.add(SLOT_MIN,"minute")
@@ -468,191 +422,223 @@ app.get("/qr.png", async (_req,res)=>{
 
 app.listen(PORT, ()=>{ console.log("🌐 Web", PORT); startBot().catch(console.error) })
 
+// ====== Carga ROBUSTA de Baileys (soporta ESM/CJS sin romper)
+async function loadBaileys(){
+  const require = createRequire(import.meta.url)
+  let mod = null
+  try { mod = require("@whiskeysockets/baileys") } catch {}
+  if (!mod) {
+    try { mod = await import("@whiskeysockets/baileys") } catch {}
+  }
+  if (!mod) throw new Error("No se pudo cargar @whiskeysockets/baileys")
+
+  // Normaliza distintas formas de export
+  const makeWASocket =
+    mod.makeWASocket ||
+    mod.default?.makeWASocket ||
+    (typeof mod.default === "function" ? mod.default : undefined)
+
+  const useMultiFileAuthState =
+    mod.useMultiFileAuthState ||
+    mod.default?.useMultiFileAuthState
+
+  const fetchLatestBaileysVersion =
+    mod.fetchLatestBaileysVersion ||
+    mod.default?.fetchLatestBaileysVersion ||
+    (async()=>({ version:[2,3000,0] }))
+
+  const Browsers =
+    mod.Browsers ||
+    mod.default?.Browsers || { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
+
+  if (typeof makeWASocket !== "function" || typeof useMultiFileAuthState !== "function") {
+    throw new Error("Baileys incompatible. Instala @whiskeysockets/baileys ^6.x")
+  }
+  return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
+}
+
 async function startBot(){
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info")
-  const { version } = await fetchLatestBaileysVersion()
-  sock = makeWASocket({
-    logger: pino({ level:"silent" }),
-    printQRInTerminal: false,
-    auth: state,
-    version,
-    browser: Browsers.macOS("Desktop"),
-    syncFullHistory: false
-  })
+  try{
+    const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
+    if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info")
+    const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
 
-  sock.ev.on("connection.update", ({connection, qr})=>{
-    if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
-    if (connection==="open"){ lastQR=null; conectado=true; console.log("✅ WhatsApp listo") }
-    if (connection==="close"){ conectado=false; console.log("❌ Conexión cerrada. Reintentando…"); setTimeout(()=>startBot().catch(console.error), 2500) }
-  })
-  sock.ev.on("creds.update", saveCreds)
+    sock = makeWASocket({
+      logger: pino({ level:"silent" }),
+      printQRInTerminal: false,
+      auth: state,
+      version,
+      browser: Browsers.macOS("Desktop"),
+      syncFullHistory: false
+    })
 
-  sock.ev.on("messages.upsert", async ({messages})=>{
-    const m=messages?.[0]; if (!m?.message || m.key.fromMe) return
-    const from = m.key.remoteJid
-    const phone = normalizePhoneES((from||"").split("@")[0]||"") || (from||"").split("@")[0]
-    const body  = m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || ""
-    const text  = (body||"").trim()
-    const low   = norm(text)
+    sock.ev.on("connection.update", ({connection, qr})=>{
+      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
+      if (connection==="open"){ lastQR=null; conectado=true; console.log("✅ WhatsApp listo") }
+      if (connection==="close"){ conectado=false; console.log("❌ Conexión cerrada. Reintentando…"); setTimeout(()=>startBot().catch(console.error), 2500) }
+    })
+    sock.ev.on("creds.update", saveCreds)
 
-    let s = loadSession(phone) || {
-      greeted:false, lastOOHDay:null,
-      locationKey:null, serviceKey:null, durationMin:null, startEU:null,
-      name:null, email:null,
-      pendingConfirm:false, lastOptions:[], teamId:null
-    }
+    sock.ev.on("messages.upsert", async ({messages})=>{
+      const m=messages?.[0]; if (!m?.message || m.key.fromMe) return
+      const from = m.key.remoteJid
+      const phone = normalizePhoneES((from||"").split("@")[0]||"") || (from||"").split("@")[0]
+      const body  = m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || ""
+      const text  = (body||"").trim()
+      const low   = norm(text)
 
-    // Mensaje de bienvenida (una sola vez)
-    if (!s.greeted){
-      await sock.sendMessage(from, { text: WELCOME_MSG })
-      s.greeted=true; saveSession(phone,s)
-    }
-
-    // Fuera de horario ⇒ aviso 1 vez por día
-    const nowEU = dayjs().tz(EURO_TZ)
-    const isOpenNow = insideBusinessHours(nowEU.clone(), 15) // 15min check
-    const todayKey = nowEU.format("YYYY-MM-DD")
-    if (!isOpenNow && s.lastOOHDay !== todayKey){
-      await sock.sendMessage(from, { text: OOH_MSG("https://gapinknails.square.site/") })
-      s.lastOOHDay = todayKey; saveSession(phone,s)
-    }
-
-    // Captura de local + servicio en cualquier orden
-    const locTxt = detectLocation(text); if (locTxt) s.locationKey = locTxt
-    const svcTxt = detectService(text);  if (svcTxt) { s.serviceKey = svcTxt; s.durationMin = SVC[svcTxt]?.dur || 60 }
-
-    // Pestañas: si lo menciona pero sin tipo, mostrar menú específico (sin repetir local si ya lo dijo)
-    const mentionsLash = /\bpesta(?:n|ñ)as\b/.test(low) || /lash/.test(low) || /lifting/.test(low)
-    if (mentionsLash && !s.serviceKey){
-      await sock.sendMessage(from, { text: ASK_LASH(!!s.locationKey) })
-      saveSession(phone,s); return
-    }
-
-    // Si falta local + servicio
-    if (!s.locationKey && !s.serviceKey){
-      await sock.sendMessage(from, { text: ASK_LOC_AND_SVC })
-      saveSession(phone,s); return
-    }
-    if (!s.locationKey && s.serviceKey){
-      await sock.sendMessage(from, { text:"¿En qué salón te viene mejor, Málaga – La Luz o Torremolinos?" })
-      saveSession(phone,s); return
-    }
-    if (s.locationKey && !s.serviceKey){
-      // si venía de “pestañas”, ya se mostró menú; si no, pide servicio genérico
-      const msg = mentionsLash ? ASK_LASH(true) : "¿Qué servicio necesitas? (ej.: “manicura semipermanente”, “Extensiones 2D”, “Lifting + tinte”)."
-      await sock.sendMessage(from, { text: msg })
-      saveSession(phone,s); return
-    }
-
-    // En este punto tenemos local + servicio
-    // ¿Ya propusimos horas y el cliente dice sí/no?
-    const userYes = YES_RE.test(text)
-    const userNo  = NO_RE.test(text)
-
-    if (s.pendingConfirm && userNo){
-      s.pendingConfirm=false; s.lastOptions=[]
-      await sock.sendMessage(from,{ text:"Sin problema. Dime otra hora o día que te venga bien 😄" })
-      saveSession(phone,s); return
-    }
-
-    // Parse rápido de fecha/hora si el usuario la escribió (dd/mm hh:mm o "lunes 10:30")
-    let parsedTime = parseDateTimeEU(text)
-    if (!parsedTime && userYes && s.lastOptions?.length){
-      parsedTime = s.lastOptions[0] // eligió la primera propuesta con un "sí"
-    }
-
-    if (!parsedTime){
-      // Proponer slots a partir de ahora (o +offset)
-      const base = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
-      const fromEU = nextOpeningFrom(base)
-      const opts = proposeSlots({ fromEU, durationMin: s.durationMin, n: 3 })
-      s.lastOptions = opts
-      s.pendingConfirm = true
-      const list = opts.map(x=>`• ${fmtES(x)}`).join("\n")
-      await sock.sendMessage(from, { text:
-        `Tengo estos huecos para *${SVC[s.serviceKey].name}* en *${locationNice(s.locationKey)}*:\n${list}\n\n¿Te viene bien el primero? Si prefieres otro día/hora, dímelo.`
-      })
-      saveSession(phone,s); return
-    }
-
-    // Confirmación ⇒ crear cliente y booking en Square
-    if (parsedTime){
-      // Nombre y email (si no existen, los pedimos con IA ultraligera)
-      if (!s.name || !s.email){
-        // Extra con IA (no respondas si no estás 100% seguro -> pedimos explícito)
-        const guess = await aiChat([
-          { role:"system", content:"Extrae de forma ultra-cauta nombre y email si aparecen. Responde SOLO JSON con {\"name\":\"\",\"email\":\"\"}. Si dudas, deja vacío." },
-          { role:"user", content:text }
-        ])
-        try {
-          const j = JSON.parse(guess)
-          if (!s.name && j?.name) s.name = String(j.name).slice(0,64)
-          if (!s.email && j?.email && isValidEmail(j.email)) s.email = j.email
-        } catch {}
+      let s = loadSession(phone) || {
+        greeted:false, lastOOHDay:null,
+        locationKey:null, serviceKey:null, durationMin:null, startEU:null,
+        name:null, email:null,
+        pendingConfirm:false, lastOptions:[], teamId:null
       }
-      if (!s.name){
-        await sock.sendMessage(from,{ text:"Para cerrar, dime tu *nombre y apellidos*." })
-        saveSession(phone,s); return
+
+      // Mensaje de bienvenida (una sola vez)
+      if (!s.greeted){
+        await sock.sendMessage(from, { text: WELCOME_MSG })
+        s.greeted=true; saveSession(phone,s)
       }
-      if (!s.email){
-        await sock.sendMessage(from,{ text:"Genial. Ahora tu email (tipo: nombre@correo.com)." })
+
+      // Fuera de horario ⇒ aviso 1 vez por día
+      const nowEU = dayjs().tz(EURO_TZ)
+      const isOpenNow = insideBusinessHours(nowEU.clone(), 15)
+      const todayKey = nowEU.format("YYYY-MM-DD")
+      if (!isOpenNow && s.lastOOHDay !== todayKey){
+        await sock.sendMessage(from, { text: OOH_MSG("https://gapinknails.square.site/") })
+        s.lastOOHDay = todayKey; saveSession(phone,s)
+      }
+
+      // Captura de local + servicio en cualquier orden
+      const locTxt = detectLocation(text); if (locTxt) s.locationKey = locTxt
+      const svcTxt = detectService(text);  if (svcTxt) { s.serviceKey = svcTxt; s.durationMin = SVC[svcTxt]?.dur || 60 }
+
+      // Pestañas: si lo menciona pero sin tipo, mostrar menú específico (sin repetir local si ya lo dijo)
+      const mentionsLash = /\bpesta(?:n|ñ)as\b/.test(low) || /lash/.test(low) || /lifting/.test(low)
+      if (mentionsLash && !s.serviceKey){
+        await sock.sendMessage(from, { text: ASK_LASH(!!s.locationKey) })
         saveSession(phone,s); return
       }
 
-      // Cliente Square
-      let customer = await squareFindCustomerByPhone(phone)
-      if (!customer){
-        customer = await squareCreateCustomer({ givenName: s.name, emailAddress: s.email, phoneNumber: phone })
-        if (!customer){ await sock.sendMessage(from,{ text:"Ese email no me funciona 🤕. Mándame uno válido y sigo." }); return }
+      // Si falta local + servicio
+      if (!s.locationKey && !s.serviceKey){
+        await sock.sendMessage(from, { text: ASK_LOC_AND_SVC })
+        saveSession(phone,s); return
       }
-
-      // Staff para ese local
-      const teamId = pickStaffForLocation(s.locationKey)
-      if (!teamId){
-        await sock.sendMessage(from,{ text:"Ahora mismo no puedo asignar profesional para ese salón. ¿Te da igual con quién?" })
-        return
+      if (!s.locationKey && s.serviceKey){
+        await sock.sendMessage(from, { text:"¿En qué salón te viene mejor, Málaga – La Luz o Torremolinos?" })
+        saveSession(phone,s); return
       }
-
-      const startEU = ceilToSlotEU(parsedTime.clone())
-      if (!insideBusinessHours(startEU, s.durationMin)){
-        await sock.sendMessage(from,{ text:"Esa hora cae fuera de horario. Dime otra dentro de L–V 10–14 o 16–20." })
-        return
-      }
-
-      // Guardamos como pending y creamos en Square
-      const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(s.durationMin,"minute")
-      const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
-      insertAppt.run({
-        id:aptId, customer_name:s.name, customer_phone:phone, customer_square_id:customer.id,
-        location_key:s.locationKey, service_key:s.serviceKey, service_name:SVC[s.serviceKey].name, duration_min:s.durationMin,
-        start_iso:startUTC.toISOString(), end_iso:endUTC.toISOString(), staff_id:teamId, status:"pending",
-        created_at:new Date().toISOString(), square_booking_id:null
-      })
-
-      const sq = await createSquareBooking({
-        startEU, serviceKey:s.serviceKey, locationKey:s.locationKey, customerId:customer.id, teamMemberId:teamId
-      })
-      if (!sq){
-        // Si falla, borramos y pedimos otra hora
-        db.prepare(`DELETE FROM appointments WHERE id=@id`).run({id:aptId})
-        s.pendingConfirm=false
-        await sock.sendMessage(from,{ text:"No pude reservar ese hueco. Dime otra hora/día y lo intento de nuevo, o usa el link: https://gapinknails.square.site/" })
+      if (s.locationKey && !s.serviceKey){
+        const msg = mentionsLash ? ASK_LASH(true) : "¿Qué servicio necesitas? (ej.: “manicura semipermanente”, “Extensiones 2D”, “Lifting + tinte”)."
+        await sock.sendMessage(from, { text: msg })
         saveSession(phone,s); return
       }
 
-      updateApptStatus.run({ id:aptId, status:"confirmed", square_booking_id: sq.id || null })
-      s.pendingConfirm=false; s.lastOptions=[]
-      await sock.sendMessage(from,{ text:
+      // En este punto tenemos local + servicio
+      const userYes = YES_RE.test(text)
+      const userNo  = NO_RE.test(text)
+
+      if (s.pendingConfirm && userNo){
+        s.pendingConfirm=false; s.lastOptions=[]
+        await sock.sendMessage(from,{ text:"Sin problema. Dime otra hora o día que te venga bien 😄" })
+        saveSession(phone,s); return
+      }
+
+      // Propuesta de huecos “inteligente” (sin availability)
+      let parsedTime = parseDateTimeEU(text)
+      if (!parsedTime && userYes && s.lastOptions?.length){
+        parsedTime = s.lastOptions[0]
+      }
+      if (!parsedTime){
+        const base = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
+        const fromEU = nextOpeningFrom(base)
+        const opts = proposeSlots({ fromEU, durationMin: s.durationMin, n: 3 })
+        s.lastOptions = opts
+        s.pendingConfirm = true
+        const list = opts.map(x=>`• ${fmtES(x)}`).join("\n")
+        await sock.sendMessage(from, { text:
+          `Tengo estos huecos para *${SVC[s.serviceKey].name}* en *${locationNice(s.locationKey)}*:\n${list}\n\n¿Te viene bien el primero? Si prefieres otro día/hora, dímelo.`
+        })
+        saveSession(phone,s); return
+      }
+
+      // Confirmación ⇒ crear cliente y booking en Square
+      if (parsedTime){
+        if (!s.name || !s.email){
+          const guess = await aiChat([
+            { role:"system", content:"Extrae de forma ultra-cauta nombre y email si aparecen. Responde SOLO JSON con {\"name\":\"\",\"email\":\"\"}. Si dudas, deja vacío." },
+            { role:"user", content:text }
+          ])
+          try {
+            const j = JSON.parse(guess)
+            if (!s.name && j?.name) s.name = String(j.name).slice(0,64)
+            if (!s.email && j?.email && isValidEmail(j.email)) s.email = j.email
+          } catch {}
+        }
+        if (!s.name){
+          await sock.sendMessage(from,{ text:"Para cerrar, dime tu *nombre y apellidos*." })
+          saveSession(phone,s); return
+        }
+        if (!s.email){
+          await sock.sendMessage(from,{ text:"Genial. Ahora tu email (tipo: nombre@correo.com)." })
+          saveSession(phone,s); return
+        }
+
+        let customer = await squareFindCustomerByPhone(phone)
+        if (!customer){
+          customer = await squareCreateCustomer({ givenName: s.name, emailAddress: s.email, phoneNumber: phone })
+          if (!customer){ await sock.sendMessage(from,{ text:"Ese email no me funciona 🤕. Mándame uno válido y sigo." }); return }
+        }
+
+        const teamId = pickStaffForLocation(s.locationKey)
+        if (!teamId){
+          await sock.sendMessage(from,{ text:"Ahora mismo no puedo asignar profesional para ese salón. ¿Te da igual con quién?" })
+          return
+        }
+
+        const startEU = ceilToSlotEU(parsedTime.clone())
+        if (!insideBusinessHours(startEU, s.durationMin)){
+          await sock.sendMessage(from,{ text:"Esa hora cae fuera de horario. Dime otra dentro de L–V 10–14 o 16–20." })
+          return
+        }
+
+        const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(s.durationMin,"minute")
+        const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
+        insertAppt.run({
+          id:aptId, customer_name:s.name, customer_phone:phone, customer_square_id:customer.id,
+          location_key:s.locationKey, service_key:s.serviceKey, service_name:SVC[s.serviceKey].name, duration_min:s.durationMin,
+          start_iso:startUTC.toISOString(), end_iso:endUTC.toISOString(), staff_id:teamId, status:"pending",
+          created_at:new Date().toISOString(), square_booking_id:null
+        })
+
+        const sq = await createSquareBooking({
+          startEU, serviceKey:s.serviceKey, locationKey:s.locationKey, customerId:customer.id, teamMemberId:teamId
+        })
+        if (!sq){
+          db.prepare(`DELETE FROM appointments WHERE id=@id`).run({id:aptId})
+          s.pendingConfirm=false
+          await sock.sendMessage(from,{ text:"No pude reservar ese hueco. Dime otra hora/día y lo intento de nuevo, o usa el link: https://gapinknails.square.site/" })
+          saveSession(phone,s); return
+        }
+
+        updateApptStatus.run({ id:aptId, status:"confirmed", square_booking_id: sq.id || null })
+        s.pendingConfirm=false; s.lastOptions=[]
+        await sock.sendMessage(from,{ text:
 `Reserva confirmada 🎉
 Salón: ${locationNice(s.locationKey)} (${locationToAddress(s.locationKey)})
 Servicio: ${SVC[s.serviceKey].name}
 Fecha: ${fmtES(startEU)}
 Duración: ${s.durationMin} min
 Pago en persona.` })
-      clearSession(phone)
-      return
-    }
-  })
+        clearSession(phone)
+        return
+      }
+    })
+  }catch(e){
+    console.error("startBot:", e?.message||e)
+  }
 }
 
 // ====== Parser de fecha/hora simple (dd/mm hh:mm | “lunes 10:30” | “mañana 12”)
@@ -660,7 +646,6 @@ const DOW = { domingo:0,lunes:1,martes:2,miércoles:3,miercoles:3,jueves:4,viern
 const WHEN = { hoy:0, today:0, mañana:1, manana:1, tomorrow:1 }
 function parseDateTimeEU(text){
   const t = norm(text)
-  // dd/mm hh(:mm)
   const m = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\s+(\d{1,2})(?::(\d{2}))?\b/)
   if (m){
     let dd=+m[1], mm=+m[2], yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year()
@@ -671,9 +656,8 @@ function parseDateTimeEU(text){
     if (dt.isBefore(guard)) dt = guard
     return dt
   }
-  // hoy/mañana + hh(:mm)
-  const w = Object.keys(WHEN).find(k=>t.includes(k))
   const hm = t.match(/\b(\d{1,2})(?::(\d{2}))?\b/)
+  const w = Object.keys(WHEN).find(k=>t.includes(k))
   if (w && hm){
     const base = dayjs().tz(EURO_TZ).add(WHEN[w],"day").startOf("day")
     let dt = base.hour(+hm[1]).minute(hm[2]?+hm[2]:0)
@@ -681,7 +665,6 @@ function parseDateTimeEU(text){
     if (dt.isBefore(guard)) dt = guard
     return dt
   }
-  // día de semana + hh(:mm)
   for (const [name, dow] of Object.entries(DOW)){
     if (t.includes(name) && hm){
       const now = dayjs().tz(EURO_TZ)
