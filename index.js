@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · PROD (v4 “hora exacta, cancelación Square fix, reoferta amable”)
+// index.js — Gapink Nails · PROD (v6 “no pasado + +idiomas + flexible”)
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -22,30 +22,54 @@ const EURO_TZ = "Europe/Madrid"
 const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = baileys
 
 // ===== Config negocio
-const WORK_DAYS = [1,2,3,4,5,6]  // L-S (domingo cerrado)
+const WORK_DAYS = [1,2,3,4,5,6]      // L-S (domingo cerrado)
 const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
-// “Rellenar semana” solo cuando NO hay hora exacta pedida
+// “Rellenar semana” cuando NO hay hora exacta pedida
 const STEER_ON = (process.env.BOT_STEER_BALANCE || "on").toLowerCase() === "on"
 const STEER_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
-// Desviación máxima el mismo día si el cliente pide hora concreta:
 const MAX_SAME_DAY_DEVIATION_MIN = Number(process.env.BOT_MAX_SAME_DAY_DEVIATION_MIN || 60)
-// Umbral de “sí” seguro si la propuesta se aleja de lo pedido:
 const STRICT_YES_DEVIATION_MIN = Number(process.env.BOT_STRICT_YES_DEVIATION_MIN || 45)
+// Nunca ofrecer pasado: margen de seguridad
+const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
 
+// ===== Helpers
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
 const rmDiacritics = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = (s="") => rmDiacritics(String(s).toLowerCase()).replace(/[^a-z0-9]+/g," ").trim()
-const STOP = new Set("de del la el los las un una unos unas y o u a al con por para en me mi su sus quiero quisiera querria hazme hacerme ponme dame porfa por favor hola buenas tardes buenos dias noches necesito reservar cita hora con que tal am pm por la manana por la mañana temprano antes primero siguiente otro otra cualquier cuando sea".split(" "))
+const minutesApart=(a,b)=>Math.abs(a.diff(b,"minute"))
+const clampFuture = (t)=> {
+  const now = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute").second(0).millisecond(0)
+  return t.isBefore(now) ? now.clone() : t.clone()
+}
+
+// Stopwords (ES/EN/FR/IT/PT/DE + NL/PL/RO/RU)
+const STOP = new Set(`
+de del la el los las un una unos unas y o u a al con por para en me mi su sus
+quiero quisiera querria hazme hacerme ponme dame porfa por favor hola buenas
+tardes buenos dias noches necesito reservar coger cogerme cojer cita para por a la las
+am pm por la manana por la mañana temprano antes primero siguiente otro otra cualquier
+cuando sea book booking appointment schedule date time hora day
+
+je bonjour salut prendre rendez vous rdv svp merci s il vous plait
+ciao buongiorno prenotare appuntamento per favore
+olá ola por favor marcar agendar consulta horario
+hallo bitte termin vereinbaren ausmachen
+hallo ik wil afspraak maken alstublieft aub
+prosze umowic wizyte wizyta dziekuje
+buna ziua programare doresc va rog multumesc
+privet hocu zapisatsya pozhalujsta
+`.trim().split(/\s+/))
+
 function tokenize(s){ return norm(s).split(/\s+/).filter(w=>w && w.length>1 && !STOP.has(w)) }
 
-const YES_RE = /\b(s[ií]|ok|okay|okey+|vale+|va|venga|dale|confirmo|confirmar|de acuerdo|perfecto|genial)\b/i
-const NO_RE  = /\b(no+|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde|anula|cancela|cancelemos|quitar cita)\b/i
-const RESCH_RE = /\b(cambia|cambiar|modifica|mover|reprograma|reprogramar|edita)\b/i
-const CANCEL_RE = /\b(cancela(?:r|me|la)?|anula(?:r|me|la)?|elimina(?:r|me|la)?|borra(?:r|me|la)?|quitar(?: la)? cita|anulaci[oó]n)\b/i
+const YES_RE = /\b(s[ií]|ok|okay|okey+|vale+|va|venga|dale|confirmo|confirmar|de acuerdo|perfecto|genial|yes|oui|sim|ja|si claro|ok dale)\b/i
+const NO_RE  = /\b(no+|otra|cambia|no confirmo|mejor mas tarde|mejor más tarde|anula|cancela|cancel|annuler|stornare|nein|niet|nie)\b/i
+const RESCH_RE = /\b(cambia|cambiar|modifica|mover|reprograma|reprogramar|edita|change|reschedul|verschieb|umbuch|rebook|aplaza|mueva)\b/i
+const CANCEL_RE = /\b(cancela(?:r|me|la)?|anula(?:r|me|la)?|elimina(?:r|me|la)?|borra(?:r|me|la)?|quitar(?: la)? cita|anulaci[oó]n|cancel (my |mi )?appointment|annuler|storna|cancelar|delete appointment)\b/i
 
 function normalizePhoneES(raw){
   const d=onlyDigits(raw); if(!d) return null
@@ -56,7 +80,6 @@ function normalizePhoneES(raw){
   return `+${d}`
 }
 const isValidEmail=(e)=>/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim())
-const minutesApart=(a,b)=>Math.abs(a.diff(b,"minute"))
 
 // ===== Empleadas — SOLO Playamar (desde .env)
 const EMPLOYEES = {
@@ -124,8 +147,9 @@ function loadServiceCatalogFromEnv(){
 }
 const SERVICE_CATALOG = loadServiceCatalogFromEnv()
 
-// Alias frecuentes
+// Alias multilenguaje → envKey (ES/EN/FR/IT/PT/DE + NL/PL/RO/RU básicos)
 const SERVICE_ALIASES = {
+  // ES
   "depilacion de cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilacion cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilar cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
@@ -143,36 +167,55 @@ const SERVICE_ALIASES = {
   "fotodepilacion ingles":"SQ_SVC_FOTODEPILACION_INGLES",
   "fotodepilacion axilas":"SQ_SVC_FOTODEPILACION_AXILAS",
   "fotodepilacion facial":"SQ_SVC_FOTODEPILACION_FACIAL_COMPLETO",
-}
-function resolveServiceFromText(userText){
-  const n = norm(userText)
-  for (const [k, envKey] of Object.entries(SERVICE_ALIASES)){
-    if (n.includes(norm(k))){
-      const svc = SERVICE_CATALOG.find(s => s.envKey === envKey)
-      if (svc) return svc
-    }
-  }
-  for (const svc of SERVICE_CATALOG){
-    if (n.includes(svc.normName)) return svc
-  }
-  const t = tokenize(userText)
-  if (!t.length) return null
-  const U = new Set(t)
-  let best = null
-  for (const svc of SERVICE_CATALOG){
-    let match = 0
-    for (const tok of svc.tokens){
-      if (U.has(tok)) match += (tok.length>=6 ? 2 : 1)
-    }
-    const denom = Math.max(1, svc.tokens.size)
-    const score = match/denom
-    if (!best || score > best.score) best = { svc, score, hits: match }
-  }
-  if (best && (best.score >= 0.5 || best.hits >= 2)) return best.svc
-  return null
+  // EN
+  "eyebrow threading":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "brow threading":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "upper lip threading":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
+  "gel polish manicure":"SQ_SVC_MANICURA_SEMIPERMANENTE",
+  "russian manicure":"SQ_SVC_MANICURA_RUSA_CON_NIVELACION",
+  "lash lift":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
+  "lash lift and tint":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
+  "diamond tip facial":"SQ_SVC_LIMPIEZA_FACIAL_CON_PUNTA_DE_DIAMANTE",
+  "hydrafacial":"SQ_SVC_LIMPIEZA_HYDRA_FACIAL",
+  "microneedling":"SQ_SVC_DERMAPEN",
+  "armpits laser":"SQ_SVC_FOTODEPILACION_AXILAS",
+  "bikini line laser":"SQ_SVC_FOTODEPILACION_INGLES",
+  "full face laser":"SQ_SVC_FOTODEPILACION_FACIAL_COMPLETO",
+  // FR
+  "epilation sourcils au fil":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "epilation levre au fil":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
+  "manicure semi permanent":"SQ_SVC_MANICURA_SEMIPERMANENTE",
+  "rehaussement de cils":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
+  "soin hydrafacial":"SQ_SVC_LIMPIEZA_HYDRA_FACIAL",
+  // IT
+  "depilazione sopracciglia col filo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "depilazione baffetti col filo":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
+  "manicure semipermanente":"SQ_SVC_MANICURA_SEMIPERMANENTE",
+  "laminazione ciglia":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
+  // PT
+  "depilacao sobrancelhas linha":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "depilacao buco linha":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
+  "manicure gelinho":"SQ_SVC_MANICURA_SEMIPERMANENTE",
+  "lifting de cilios":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
+  // DE
+  "faden augenbrauen":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "faden oberlippe":"SQ_SVC_DEPILACION_LABIO_CON_HILO",
+  "shellac manicure":"SQ_SVC_MANICURA_SEMIPERMANENTE",
+  "wimpernlifting":"SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE",
+  // NL
+  "wenkbrauwen touwtje":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "bikinilijn laser":"SQ_SVC_FOTODEPILACION_INGLES",
+  // PL
+  "nitkowanie brwi":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "manicure hybrydowy":"SQ_SVC_MANICURA_SEMIPERMANENTE",
+  // RO
+  "pensat cu ata":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  // RU (translit)
+  "depilyatsiya brovey nitkoy":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
+  "brovi nit":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
 }
 
-// Duraciones (fallback 60)
+// Fallback duraciones (min)
 const DURATION_MIN = {
   "SQ_SVC_DEPILACION_CEJAS_CON_HILO":15,
   "SQ_SVC_DEPILACION_LABIO_CON_HILO":10,
@@ -184,33 +227,93 @@ const DURATION_MIN = {
 }
 const getDuration=(envKey)=>DURATION_MIN[envKey] ?? 60
 
-// ===== Fecha/hora
-const M_MAP={enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12}
-const WD_MAP={domingo:0,lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,sabado:6,sábado:6}
-const TIME_RE=/\b(\d{1,2})(?::|h)?(\d{2})?\s*(am|pm)?\b/i
+// ===== Multilenguaje fechas
+const MONTHS = {
+  // es
+  enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,
+  ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,oct:10,nov:11,dic:12,
+  // en
+  january:1,february:2,march:3,april:4,may:5,june:6,july:7,august:8,september:9,october:10,november:11,december:12,
+  jan:1,feb:2,mar:3,apr:4,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12,
+  // fr
+  janvier:1,fevrier:2,février:2,mars:3,avril:4,mai:5,juin:6,juillet:7,aout:8,août:8,septembre:9,octobre:10,novembre:11,decembre:12,décembre:12,
+  // it
+  gennaio:1,febbraio:2,marzo:3,aprile:4,maggio:5,giugno:6,luglio:7,agosto:8,settembre:9,ottobre:10,novembre:11,dicembre:12,
+  // pt
+  janeiro:1,fevereiro:2,marco:3,março:3,abril:4,maio:5,junho:6,julho:7,agosto:8,setembro:9,outubro:10,novembro:11,dezembro:12,
+  // de
+  januar:1,februar:2,märz:3,maerz:3,april:4,mai:5,juni:6,juli:7,august:8,september:9,oktober:10,november:11,dezember:12,
+  // nl
+  januari:1,februari:2,maart:3,april:4,mei:5,juni:6,juli:7,augustus:8,september:9,oktober:10,november:11,december:12,
+  // pl
+  styczen:1,styczeń:1,luty:2,marzec:3,kwiecien:4,kwiecień:4,maj:5,czerwiec:6,lipiec:7,sierpien:8,sierpień:8,wrzesien:9,wrzesień:9,pazdziernik:10,październik:10,listopad:11,grudzien:12,grudzień:12,
+  // ro
+  ianuarie:1,februarie:2,martie:3,aprilie:4,mai:5,iunie:6,iulie:7,august:8,septembrie:9,octombrie:10,noiembrie:11,decembrie:12
+}
+const WEEKDAYS = {
+  // es
+  domingo:0,lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5,sabado:6,sábado:6,
+  // en
+  sunday:0,monday:1,tuesday:2,wednesday:3,thursday:4,friday:5,saturday:6,
+  // fr
+  dimanche:0,lundi:1,mardi:2,mercredi:3,jeudi:4,vendredi:5,samedi:6,
+  // it
+  domenica:0,lunedi:1,lunedì:1,martedi:2,martedì:2,mercoledi:3,mercoledì:3,giovedi:4,giovedì:4,venerdi:5,venerdì:5,sabato:6,
+  // pt
+  domingo:0,segunda:1,segunda feira:1,terca:2,terça:2,terca feira:2,terça feira:2,quarta:3,quarta feira:3,quinta:4,quinta feira:4,sexta:5,sexta feira:5,sabado:6,sábado:6,
+  // de
+  sonntag:0, montag:1, dienstag:2, mittwoch:3, donnerstag:4, freitag:5, samstag:6,
+  // nl
+  zondag:0,maandag:1,dinsdag:2,woensdag:3,donderdag:4,vrijdag:5,zaterdag:6,
+  // pl
+  niedziela:0,poniedzialek:1,poniedziałek:1,wtorek:2,sroda:3,środa:3,czwartek:4,piatek:5,piątek:5,sobota:6,
+  // ro
+  duminica:0,duminică:0,luni:1,marti:2,marţi:2,miercuri:3,joi:4,vineri:5,sambata:6,sâmbătă:6
+}
+const TODAY_RE = /\b(hoy|today|aujourd.?hui|oggi|hoje|heute|vandaag|dzi[eę]?|azi|segodnia|segodnya)\b/i
+const TOMORROW_RE = /\b(ma[nñ]ana|tomorrow|demain|domani|amanh[ãa]|morgen|morgen|jutro|maine|ma[iî]ne|zavtra)\b/i
+// Horas: 10, 10:30, 10h, 10h30, 10.30, 10am, 10 pm, “a la 10”, “a las 10”
+const TIME_RE=/\b(?:a\s+l[ao]s?\s+)?(\d{1,2})(?:[:h\.](\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm|uhr)?\b/i
 
 function detectExplicitDateEU(s){
   const t=rmDiacritics((s||"").toLowerCase())
-  const m1=t.match(/\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b(?:\s+de\s+(\d{4}))?/)
-  if(m1){const dd=+m1[1],mm=M_MAP[m1[2]],yy=m1[3]?+m1[3]:dayjs().tz(EURO_TZ).year();return dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)}
-  const m2=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/)
-  if(m2){let yy=m2[3]?+m2[3]:dayjs().tz(EURO_TZ).year();if(yy<100)yy+=2000;return dayjs.tz(`${yy}-${String(+m2[2]).padStart(2,"0")}-${String(+m2[1]).padStart(2,"0")} 00:00`,EURO_TZ)}
-  for(const k of Object.keys(WD_MAP)){
-    if(t.includes(k)){
-      const target=WD_MAP[k]; const now=dayjs().tz(EURO_TZ); let add=(target-now.day()+7)%7
+
+  // 1) hoy / mañana
+  if (TODAY_RE.test(t)) return dayjs().tz(EURO_TZ).startOf("day")
+  if (TOMORROW_RE.test(t)) return dayjs().tz(EURO_TZ).add(1,"day").startOf("day")
+
+  // 2) nombre de día (varios idiomas)
+  for (const [wdName, wdIdx] of Object.entries(WEEKDAYS)){
+    if (t.includes(rmDiacritics(wdName))) {
+      const now=dayjs().tz(EURO_TZ)
+      let add=(wdIdx-now.day()+7)%7
       if(add===0) add=7
       return now.add(add,"day").startOf("day")
     }
   }
-  if(/\bhoy\b/.test(t)) return dayjs().tz(EURO_TZ).startOf("day")
-  if(/\bmanana\b/.test(t)) return dayjs().tz(EURO_TZ).add(1,"day").startOf("day")
+
+  // 3) “15 de agosto [de 2025]”
+  const m1=t.match(/\b(\d{1,2})\s+(?:de\s+)?([a-záéíóúñ\.]+)(?:\s+(?:de\s+)??(\d{4}))?\b/)
+  if(m1 && MONTHS[m1[2]]){
+    const dd=+m1[1],mm=MONTHS[m1[2]],yy=m1[3]?+m1[3]:dayjs().tz(EURO_TZ).year()
+    return dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} 00:00`,EURO_TZ)
+  }
+
+  // 4) 18/08[/2025] o 18-08-2025 (DD/MM/YY|YYYY)
+  const m2=t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/)
+  if(m2){
+    let yy=m2[3]?+m2[3]:dayjs().tz(EURO_TZ).year()
+    if(yy<100) yy+=2000
+    return dayjs.tz(`${yy}-${String(+m2[2]).padStart(2,"0")}-${String(+m2[1]).padStart(2,"0")} 00:00`,EURO_TZ)
+  }
+
   return null
 }
 function detectTime(s){
   const m = (s||"").toLowerCase().match(TIME_RE)
   if(!m) return null
   let h=+m[1], min=m[2]?+m[2]:0
-  const ap=m[3]
+  const ap=m[3]?.replace(/\./g,"")
   if(ap==="pm"&&h<12)h+=12
   if(ap==="am"&&h===12)h=0
   return {h, min}
@@ -250,7 +353,7 @@ async function createSquareBooking({startEU,svc,customerId,teamMemberId}){try{
   const resp=await square.bookingsApi.createBooking(body)
   return resp?.result?.booking||null
 }catch(e){console.error("createSquareBooking:",e?.message||e);return null}}
-async function cancelSquareBooking(bookingId){ // ← FIX: requiere body {idempotencyKey, bookingVersion}
+async function cancelSquareBooking(bookingId){
   try{
     const rb = await square.bookingsApi.retrieveBooking(bookingId)
     const version = rb?.result?.booking?.version
@@ -327,7 +430,7 @@ function saveSession(phone,data){
   upsertSession.run({phone, data_json:JSON.stringify(s), updated_at:new Date().toISOString()})
 }
 
-// ===== Disponibilidad (DB local)
+// ===== Disponibilidad
 function getBookedIntervals(fromIso,toIso){
   const rows=db.prepare(`SELECT start_iso,end_iso,staff_id FROM appointments WHERE status IN ('pending','confirmed') AND start_iso < @to AND end_iso > @from`).all({from:fromIso,to:toIso})
   return rows.map(r=>({start:dayjs(r.start_iso),end:dayjs(r.end_iso),staff_id:r.staff_id}))
@@ -336,19 +439,23 @@ function isFree(intervals, staffId, startUTC, endUTC){
   return !intervals.filter(i=>i.staff_id===staffId).some(i => (startUTC<i.end) && (i.start<endUTC))
 }
 function findExactSlot(startEU, durationMin, staffId=null){
-  const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
-  const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
-  if (startEU.isBefore(dayStart) || startEU.add(durationMin,"minute").isAfter(dayEnd)) return null
-  const start = ceilToSlotEU(startEU.clone())
+  const now=dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute").second(0).millisecond(0)
+  const dStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
+  const dEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
+  if (startEU.isBefore(dStart) || startEU.add(durationMin,"minute").isAfter(dEnd)) return null
+  const start = ceilToSlotEU(clampFuture(startEU.clone()))
+  if (start.isAfter(dEnd)) return null
   const end = start.clone().add(durationMin,"minute")
-  const from = dayStart.tz("UTC").toISOString()
-  const to   = dayEnd.tz("UTC").toISOString()
+  const from = dStart.tz("UTC").toISOString()
+  const to   = dEnd.tz("UTC").toISOString()
   const intervals=getBookedIntervals(from,to)
   if (staffId) {
+    if (start.isBefore(now)) return null
     if (isFree(intervals,staffId,start.tz("UTC"),end.tz("UTC"))) return { time:start, staffId }
     return null
   }
   for (const id of TEAM_MEMBER_IDS){
+    if (start.isBefore(now)) continue
     if (isFree(intervals,id,start.tz("UTC"),end.tz("UTC"))) return { time:start, staffId:id }
   }
   return null
@@ -362,6 +469,7 @@ function* sameDayRing(startEU, preferEarlier=false){
   }
 }
 function findNearestSameDay(startEU, durationMin, staffId=null, declined=[], preferEarlier=false, maxDeviationMin=MAX_SAME_DAY_DEVIATION_MIN) {
+  const now=dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute").second(0).millisecond(0)
   const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
   const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
   const from = dayStart.tz("UTC").toISOString()
@@ -373,6 +481,7 @@ function findNearestSameDay(startEU, durationMin, staffId=null, declined=[], pre
     if (diff > maxDeviationMin) break
     const e=t.clone().add(durationMin,"minute")
     if (t.isBefore(dayStart) || e.isAfter(dayEnd)) continue
+    if (t.isBefore(now)) continue
     if (declined.includes(t.valueOf())) continue
     if (staffId) {
       if (isFree(intervals,staffId,t.tz("UTC"),e.tz("UTC"))) return { time:t, staffId }
@@ -394,7 +503,7 @@ function preferredDayList(startBase, daysWindow){
   return [...early, ...others]
 }
 function findEarliestAny(startEU, durationMin, daysWindow){
-  const now=dayjs().tz(EURO_TZ).add(30,"minute").second(0).millisecond(0)
+  const now=dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute").second(0).millisecond(0)
   const startBase = startEU && startEU.isAfter(now) ? ceilToSlotEU(startEU.clone()) : ceilToSlotEU(now.clone())
   const toEU = startBase.clone().add(daysWindow,"day").hour(CLOSE_HOUR).minute(0).second(0)
   const intervals=getBookedIntervals(startBase.tz("UTC").toISOString(), toEU.tz("UTC").toISOString())
@@ -470,6 +579,7 @@ async function startBot(){
         const body=m.message.conversation||m.message.extendedTextMessage?.text||m.message?.imageMessage?.caption||""
         const textRaw=(body||"").trim()
         const textNorm=norm(textRaw)
+        const nowEU = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute").second(0).millisecond(0)
 
         // ===== Session
         let data=loadSession(phone)||{
@@ -543,7 +653,7 @@ async function startBot(){
           data.durationMin = getDuration(svcDetected.envKey)
         }
 
-        // ===== Fecha/hora (ancla)
+        // ===== Fecha/hora
         const dateEU = detectExplicitDateEU(textRaw)
         const time = detectTime(textRaw)
         if (dateEU) data.anchorDateEU = dateEU
@@ -552,6 +662,22 @@ async function startBot(){
           const dt = mergeDateTimeEU(baseDate, time)
           if (data.lastRequestedEU && data.lastRequestedEU.valueOf()===dt.valueOf()) data.timeInsistCount = (data.timeInsistCount||0)+1
           else { data.timeInsistCount = 1; data.lastRequestedEU = dt.clone() }
+
+          // ⛔ Si la hora ya pasó, no la aceptamos. Proponemos siguiente hueco futuro.
+          if (dt.isBefore(nowEU)) {
+            const dur = data.durationMin || 60
+            const alt = findEarliestAny(nowEU, dur, STEER_WINDOW_DAYS) || findEarliestAny(nowEU, dur, SEARCH_WINDOW_DAYS)
+            if (alt) {
+              data.pendingOfferEU = alt.time; data.selectedStaffId = alt.staffId; data.confirmAsked=true
+              saveSession(phone,data)
+              await __SAFE_SEND__(from,{ text:`Esa hora ya ha pasado. Te puedo dar ${fmtES(alt.time)}${displayStaff(alt.staffId)?` con ${displayStaff(alt.staffId)}`:""}. ¿Te viene bien?` })
+              return
+            } else {
+              await __SAFE_SEND__(from,{ text:"Esa hora ya ha pasado y ahora mismo no veo huecos. Dime otra hora o día y lo miro." })
+              return
+            }
+          }
+
           data.startEU = dt
           data.confirmAsked=false; data.pendingOfferEU=null
         }
@@ -583,15 +709,31 @@ async function startBot(){
           return
         }
 
-        // ===== GUIADO
-        if (!data.serviceEnvKey) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:"¿Qué te hago? (Ej: “Manicura semipermanente”, “Depilación cejas con hilo”…)" }); return }
-        if (!data.startEU) { saveSession(phone,data); await __SAFE_SEND__(from,{ text:`Genial, ${data.service}. Dime día y hora (ej: “lunes 10:00” o “15/09 18:00”).` }); return }
+        // ===== GUIADO humano
+        if (!data.serviceEnvKey && data.startEU) {
+          saveSession(phone,data)
+          await __SAFE_SEND__(from,{ text:`Perfecto, te guardo ${fmtES(data.startEU)}. ¿Para qué servicio te apunto? (Ej: “Manicura semipermanente”, “Depilación cejas con hilo”…)` })
+          return
+        }
 
+        if (data.serviceEnvKey && !data.startEU) {
+          saveSession(phone,data)
+          await __SAFE_SEND__(from,{ text:`Genial, ${data.service}. Dime día y hora (ej: “lunes 10:00” o “15/09 18:00”).` })
+          return
+        }
+
+        if (!data.serviceEnvKey && !data.startEU) {
+          saveSession(phone,data)
+          await __SAFE_SEND__(from,{ text:`¿Qué te hago? (Ej: “Manicura semipermanente”, “Depilación cejas con hilo”…). Si quieres, también me puedes decir directamente el día y la hora.` })
+          return
+        }
+
+        // ===== Disponibilidad y ofertas
         const duration = data.durationMin || 60
         let offer = null
         const declined = data.declinedSlots || []
         const hardTime   = !!time || (data.timeInsistCount>=1)
-        const dayLock    = !!data.anchorDateEU // con fecha explícita, no mover de día
+        const dayLock    = !!data.anchorDateEU
 
         // 1) Exacto con staff si lo pidió
         if (!offer && wantsStaff) offer = findExactSlot(data.startEU, duration, data.requestedStaffId)
@@ -616,11 +758,10 @@ async function startBot(){
                || findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
         }
 
-        // Guardia: no proponer fuera del margen
+        // Guardias de margen
         if (offer && hardTime && data.startEU && minutesApart(data.startEU, offer.time) > MAX_SAME_DAY_DEVIATION_MIN) {
           offer = null
         }
-        // Guardia: si hay fecha anclada, NO proponer otro día
         if (offer && data.anchorDateEU && !offer.time.isSame(data.anchorDateEU, "day")){
           offer = null
         }
@@ -646,15 +787,12 @@ async function startBot(){
 
         const sameAsAsked = data.startEU && offer.time.valueOf()===ceilToSlotEU(data.startEU).valueOf()
         const staffTxt = displayStaff(offer.staffId) ? ` con ${displayStaff(offer.staffId)}` : ""
-
         if (sameAsAsked) {
           await __SAFE_SEND__(from,{ text:`Tengo ${fmtES(offer.time)}${staffTxt}. ¿Confirmo la ${data.editBookingId?"modificación":"cita"}? (Pago en persona)` })
         } else {
-          // Reoferta amable (no “impone”)
           let msg = `No tengo ${data.startEU.format("HH:mm")} `
           if (wantsStaff) msg += `con ${displayStaff(data.requestedStaffId)} `
           msg += `ese día; me sale ${offer.time.format("HH:mm")}${staffTxt}. ¿Te viene bien?`
-          // Empujoncito suave para probar otra compañera
           if (wantsStaff && !forceStaff) {
             msg += ` Si quieres probar otra compañera, puedo mirar también ${data.startEU.format("HH:mm")} ese mismo día.`
           }
@@ -689,12 +827,20 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     const svc = SERVICE_CATALOG.find(s=>s.envKey===data.serviceEnvKey)
     if (!svc) { data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No encuentro el servicio ahora mismo. Dime de nuevo el servicio, por favor."}); return }
 
-    const startEU = data.pendingOfferEU || data.startEU
+    const startEU = (data.pendingOfferEU || data.startEU)
     if (!startEU) { data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"Necesito una hora concreta. Dímela y te la reservo."}); return }
+
+    // Bloqueo absoluto de pasado
+    const startSafe = clampFuture(startEU.clone())
+    if (startSafe.valueOf() !== ceilToSlotEU(startEU).valueOf()) {
+      data.bookingInFlight=false; saveSession(phone,data)
+      await safeSend(from,{text:`Esa hora ya ha pasado. Dime otra hora futura y te la confirmo.`})
+      return
+    }
 
     const teamMemberId = data.selectedStaffId || TEAM_MEMBER_IDS[0]
     const durationMin = getDuration(svc.envKey)
-    const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
+    const startUTC = startSafe.tz("UTC"), endUTC = startUTC.clone().add(durationMin,"minute")
 
     const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
     try {
@@ -709,8 +855,8 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
       throw e
     }
 
-    const sq = await createSquareBooking({ startEU, svc, customerId: customer.id, teamMemberId })
-    if (!sq) { deleteAppt.run({ id: aptId }); data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No pude confirmar ahora mismo. Probamos con otra hora?"}); return }
+    const sq = await createSquareBooking({ startEU: startSafe, svc, customerId: customer.id, teamMemberId })
+    if (!sq) { deleteAppt.run({ id: aptId }); data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No pude confirmar ahora mismo. ¿Probamos con otra hora?"}); return }
 
     updateAppt.run({ id: aptId, status: "confirmed", square_booking_id: sq.id || null })
     clearSession.run({ phone })
@@ -718,7 +864,7 @@ async function finalizeBooking({ from, phone, data, safeSend }) {
     await safeSend(from,{ text:
 `Reserva confirmada 🎉
 Servicio: ${svc.displayName}
-Fecha: ${fmtES(startEU)}${staffTxt}
+Fecha: ${fmtES(startSafe)}${staffTxt}
 Duración: ${durationMin} min
 Pago en persona. ¡Te esperamos!` })
   } catch (e) { console.error("finalizeBooking:", e) }
@@ -737,16 +883,23 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
     const startEU = data.pendingOfferEU || data.startEU
     if (!startEU) { data.bookingInFlight=false; saveSession(phone,data); return }
 
+    const startSafe = clampFuture(startEU.clone())
+    if (startSafe.valueOf() !== ceilToSlotEU(startEU).valueOf()) {
+      data.bookingInFlight=false; saveSession(phone,data)
+      await safeSend(from,{text:`No puedo moverla a una hora pasada. Dime una hora futura y la cambio.`})
+      return
+    }
+
     const svc = SERVICE_CATALOG.find(s=>s.envKey === (data.serviceEnvKey || upc.service_env_key))
     if (!svc) { data.bookingInFlight=false; saveSession(phone,data); return }
 
-    const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(upc.duration_min,"minute")
+    const startUTC = startSafe.tz("UTC"), endUTC = startUTC.clone().add(upc.duration_min,"minute")
     const teamId   = data.selectedStaffId || upc.staff_id || TEAM_MEMBER_IDS[0]
-    if(!teamId){ data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No puedo asignar equipo ahora mismo. Probamos otro día?"}); return }
+    if(!teamId){ data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No puedo asignar equipo ahora mismo. ¿Probamos otro día?"}); return }
 
     let ok=false
     if (upc.square_booking_id) {
-      const sq = await updateSquareBooking(upc.square_booking_id, { startEU, svc, customerId: upc.customer_square_id, teamMemberId: teamId })
+      const sq = await updateSquareBooking(upc.square_booking_id, { startEU: startSafe, svc, customerId: upc.customer_square_id, teamMemberId: teamId })
       if (sq) ok=true
     }
     if (!ok) {
@@ -754,7 +907,7 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
         const cancelled = await cancelSquareBooking(upc.square_booking_id)
         if (!cancelled) { data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No pude reprogramar ahora mismo. Probamos otra franja?"}); return }
       }
-      const sqNew = await createSquareBooking({ startEU, svc, customerId: upc.customer_square_id, teamMemberId: teamId })
+      const sqNew = await createSquareBooking({ startEU: startSafe, svc, customerId: upc.customer_square_id, teamMemberId: teamId })
       if (!sqNew) { data.bookingInFlight=false; saveSession(phone,data); await safeSend(from,{text:"No pude reprogramar ahora mismo. Probamos otra franja?"}); return }
       markCancelled.run({ id: upc.id })
       const newId=`apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
@@ -762,7 +915,7 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
         id:newId, customer_name: upc.customer_name, customer_phone: phone, customer_square_id: upc.customer_square_id,
         service_env_key: svc.envKey, service_display: upc.service_display, duration_min: upc.duration_min,
         start_iso: startUTC.toISOString(), end_iso: endUTC.toISOString(),
-        staff_id: teamId, status:"confirmed", created_at:new Date().toISOString(), square_booking_id: sqNew.id || null
+        staff_id: teamId, status:"confirmed", created_at: new Date().toISOString(), square_booking_id: sqNew.id || null
       })
     } else {
       updateApptTimes.run({ id: upc.id, start_iso: startUTC.toISOString(), end_iso: endUTC.toISOString(), staff_id: teamId })
@@ -772,9 +925,41 @@ async function finalizeReschedule({ from, phone, data, safeSend }) {
     await safeSend(from,{ text:
 `Cita actualizada ✔️
 Servicio: ${upc.service_display}
-Nueva fecha: ${fmtES(startEU)}
+Nueva fecha: ${fmtES(startSafe)}
 Duración: ${upc.duration_min} min
 Pago en persona.` })
   }catch(e){ console.error("finalizeReschedule:", e) }
   finally{ data.bookingInFlight=false; try{ saveSession(phone, data) }catch{} }
+}
+
+// ===== Resolución servicio (fuzzy + alias)
+function resolveServiceFromText(userText){
+  const n = norm(userText)
+  // Alias directos
+  for (const [k, envKey] of Object.entries(SERVICE_ALIASES)){
+    if (n.includes(norm(k))){
+      const svc = SERVICE_CATALOG.find(s => s.envKey === envKey)
+      if (svc) return svc
+    }
+  }
+  // Coincidencia por nombre de catálogo (ES)
+  for (const svc of SERVICE_CATALOG){
+    if (n.includes(svc.normName)) return svc
+  }
+  // Coincidencia difusa por tokens
+  const t = tokenize(userText)
+  if (!t.length) return null
+  const U = new Set(t)
+  let best = null
+  for (const svc of SERVICE_CATALOG){
+    let match = 0
+    for (const tok of svc.tokens){
+      if (U.has(tok)) match += (tok.length>=6 ? 2 : 1)
+    }
+    const denom = Math.max(1, svc.tokens.size)
+    const score = match/denom
+    if (!best || score > best.score) best = { svc, score, hits: match }
+  }
+  if (best && (best.score >= 0.5 || best.hits >= 2)) return best.svc
+  return null
 }
