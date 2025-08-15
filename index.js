@@ -1,10 +1,9 @@
-// index.js — Gapink Nails · PROD (v “hora exacta”, desviación limitada, web QR personalizada)
+// index.js — Gapink Nails · PROD (v2 “hora exacta blindada”)
+// - Ancla hora pedida: mismo día ± BOT_MAX_SAME_DAY_DEVIATION_MIN (prioriza antes)
+// - Respeta “con {empleada}” si insistes (>=2 veces)
+// - Reoferta sin ser pesado (misma hora otro día / otra compañera)
+// - Alta cliente por pasos; cancelación robusta; pago en persona
 // - Mini-web QR: muestra “Gonzalo García Aranda” con enlace a gonzalog.co
-// - Hora exacta: si pides 10:00, no salta a 18:00
-// - Si no hay con esa persona, intenta misma hora con otra (salvo insistencia >=2)
-// - Si no hay, busca misma fecha ±MAX_SAME_DAY_DEVIATION_MIN (por defecto 90) priorizando ANTES
-// - Si sigue sin haber, propone “misma hora otro día” (no insiste con horas lejanas)
-// - Cancelación robusta; alta cliente por pasos; pago en persona
 
 import express from "express"
 import baileys from "@whiskeysockets/baileys"
@@ -33,12 +32,14 @@ const OPEN_HOUR  = 10
 const CLOSE_HOUR = 20
 const SLOT_MIN   = 30
 
-// Steering (rellenar pronto solo si NO hay hora exacta en el mensaje)
+// Steering para rellenar antes la semana (solo si el cliente NO pidió hora exacta)
 const STEER_ON = (process.env.BOT_STEER_BALANCE || "on").toLowerCase() === "on"
 const STEER_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
-// Desviación máxima el mismo día cuando el cliente ha pedido una hora exacta:
+// Desviación máxima el mismo día cuando el cliente ha pedido hora exacta:
 const MAX_SAME_DAY_DEVIATION_MIN = Number(process.env.BOT_MAX_SAME_DAY_DEVIATION_MIN || 90)
+// Umbral de “sí” seguro (si la oferta difiere mucho de lo insistido, pedir confirmación explícita):
+const STRICT_YES_DEVIATION_MIN = Number(process.env.BOT_STRICT_YES_DEVIATION_MIN || 60)
 
 // ===== Utils texto
 const onlyDigits = (s="") => (s||"").replace(/\D+/g,"")
@@ -62,8 +63,9 @@ function normalizePhoneES(raw){
   return `+${d}`
 }
 const isValidEmail=(e)=>/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim())
+const minutesApart=(a,b)=>Math.abs(a.diff(b,"minute"))
 
-// ===== Empleadas (usar SOLO Playamar configuradas en .env)
+// ===== Empleadas (solo Playamar desde .env)
 const EMPLOYEES = {
   rocio:     process.env.SQ_EMP_ROCIO     || "",
   cristina:  process.env.SQ_EMP_CRISTINA  || "",
@@ -129,7 +131,7 @@ function loadServiceCatalogFromEnv(){
 }
 const SERVICE_CATALOG = loadServiceCatalogFromEnv()
 
-// Alias explícitos comunes
+// Alias libres útiles
 const SERVICE_ALIASES = {
   "depilacion de cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
   "depilacion cejas con hilo":"SQ_SVC_DEPILACION_CEJAS_CON_HILO",
@@ -180,7 +182,7 @@ function resolveServiceFromText(userText){
   return null
 }
 
-// Duraciones
+// Duraciones (fallback 60)
 const DURATION_MIN = {
   "SQ_SVC_DEPILACION_CEJAS_CON_HILO":15,
   "SQ_SVC_DEPILACION_LABIO_CON_HILO":10,
@@ -341,7 +343,6 @@ function findExactSlot(startEU, durationMin, staffId=null){
   return null
 }
 
-// Generador MISMO día (preferEarlier: alterna, empezando por antes)
 function* sameDayRing(startEU, preferEarlier=false){
   const base = ceilToSlotEU(startEU.clone())
   yield base
@@ -350,7 +351,6 @@ function* sameDayRing(startEU, preferEarlier=false){
     else { yield base.clone().add(k*SLOT_MIN,"minute"); yield base.clone().subtract(k*SLOT_MIN,"minute") }
   }
 }
-// Busca misma fecha pero limitando desviación en minutos
 function findNearestSameDay(startEU, durationMin, staffId=null, declined=[], preferEarlier=false, maxDeviationMin=MAX_SAME_DAY_DEVIATION_MIN) {
   const dayStart=startEU.clone().hour(OPEN_HOUR).minute(0).second(0)
   const dayEnd=startEU.clone().hour(CLOSE_HOUR).minute(0).second(0)
@@ -374,6 +374,7 @@ function findNearestSameDay(startEU, durationMin, staffId=null, declined=[], pre
   }
   return null
 }
+
 // Orden de días preferente: primero L-M-X
 function preferredDayList(startBase, daysWindow){
   const days=[]
@@ -523,6 +524,7 @@ async function startBot(){
           }
         }
         const wantsStaff = !!data.requestedStaffId
+        const forceStaff = wantsStaff && data.staffInsistCount>=2
 
         // ===== Servicio
         const svcDetected = resolveServiceFromText(textRaw)
@@ -550,8 +552,13 @@ async function startBot(){
           return
         }
 
-        // ===== YES ⇒ cerrar si hay oferta pendiente
+        // ===== YES ⇒ cerrar si hay oferta pendiente (con guardia anti-sí accidental)
         if (userSaysYes && data.pendingOfferEU && data.serviceEnvKey) {
+          const lastWanted = data.lastRequestedEU
+          if (lastWanted && minutesApart(lastWanted, data.pendingOfferEU) > STRICT_YES_DEVIATION_MIN && data.timeInsistCount>=2) {
+            await __SAFE_SEND__(from,{text:`Me dijiste ${fmtES(lastWanted)}. La propuesta es ${fmtES(data.pendingOfferEU)}. Si te encaja, escribe “confirmo ${data.pendingOfferEU.format("HH:mm")}”.`})
+            return
+          }
           const existing = await squareFindCustomerByPhone(phone)
           if (!existing && (!data.name || !data.email)) {
             data.mode = data.name ? "await_email" : "await_name"
@@ -572,18 +579,16 @@ async function startBot(){
         let offer = null
         const declined = data.declinedSlots || []
         const isDeclined = (t)=> declined.includes(t.valueOf())
-        const forceStaff = wantsStaff && data.staffInsistCount>=2
-        const hardTime   = explicitTimeInMsg || data.timeInsistCount>=1
+        const hardTime   = TIME_RE.test(textRaw) || (data.timeInsistCount>=1)
 
-        // 1) Exacto con staff si lo pidió
+        // 1) Exacto con staff si lo pidió (y lo insistió)
         if (wantsStaff) offer = findExactSlot(data.startEU, duration, data.requestedStaffId)
-        // 2) Exacto con cualquiera (si no insistió >=2)
+        // 2) Exacto con cualquiera (si no está “forzado” el staff)
         if (!offer && (!wantsStaff || !forceStaff)) {
           const sameAny = findExactSlot(data.startEU, duration, null)
           if (sameAny) offer = sameAny
         }
-
-        // 3) Si no hay exacto y pidió hora exacta => buscar solo ±MAX_SAME_DAY_DEVIATION_MIN
+        // 3) Si no hay exacto y pidió hora exacta => buscar solo ±MAX_SAME_DAY_DEVIATION_MIN (antes->después)
         if (!offer && hardTime) {
           const near = findNearestSameDay(
             data.startEU, duration,
@@ -601,10 +606,19 @@ async function startBot(){
                || findEarliestAny(data.startEU, duration, SEARCH_WINDOW_DAYS)
         }
 
+        // Guardia: si hay hora pedida y la oferta se va de madre, invalídala
+        if (offer && hardTime && data.startEU && minutesApart(data.startEU, offer.time) > MAX_SAME_DAY_DEVIATION_MIN) {
+          offer = null
+        }
+
         if (!offer) {
           data.confirmAsked=false; saveSession(phone,data)
           if (hardTime) {
-            await __SAFE_SEND__(from,{ text:`A esa hora el ${fmtES(data.startEU).split(" ")[0]} no veo hueco. ¿Te miro **esa misma hora** otro día?` })
+            if (forceStaff) {
+              await __SAFE_SEND__(from,{ text:`Con ${displayStaff(data.requestedStaffId)} a esa hora no veo hueco ese día. ¿Miro esa MISMA hora otro día o te vale con otra compañera?` })
+            } else {
+              await __SAFE_SEND__(from,{ text:`A esa hora ese día no veo hueco. ¿Te miro esa MISMA hora otro día?` })
+            }
           } else {
             await __SAFE_SEND__(from,{ text:"Ahora mismo no veo huecos en esa franja. Dime otra hora o día y te digo." })
           }
