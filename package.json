@@ -1,24 +1,18 @@
 {
   "name": "gapink-whatsapp-bot",
-  "version": "2.1.0",
-  "description": "Bot WhatsApp Gapink Nails — Square Bookings + Baileys + DeepSeek (1 servicio: uñas acrílicas)",
+  "version": "2.2.0",
+  "description": "Gapink Nails WhatsApp + IA + Square",
   "type": "module",
   "main": "index.js",
-  "license": "MIT",
-  "engines": { "node": "20.x" },
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
-    "better-sqlite3": "^9.6.0",
+    "@whiskeysockets/baileys": "^6.7.8",
     "dayjs": "^1.11.11",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "pino": "^9.3.2",
-    "qrcode": "^1.5.4",
-    "qrcode-terminal": "^0.12.0",
-    "square": "^38.0.0"
+    "dotenv": "^16.4.5"
   }
 }
