@@ -6,12 +6,14 @@ import 'dotenv/config'
 import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
-import makeWASocket, {
+import {
+  makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers
 } from '@whiskeysockets/baileys'
+
 import dayjsBase from 'dayjs'
 import tz from 'dayjs/plugin/timezone.js'
 import utc from 'dayjs/plugin/utc.js'
