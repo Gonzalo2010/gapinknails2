@@ -1,10 +1,10 @@
-// index.js — Gapink Nails · v15.1 (orquestador JSON + hardening)
-// “Sesiones seguras · anti-duplicados · validación de decisiones · reintentos Square”
+// index.js — Gapink Nails · v15.2 (DeepSeek edition)
+// “Sesiones seguras · anti-duplicados · validación de decisiones · reintentos LLM · QR ok”
 //
 // Requiere: node 18+, @whiskeysockets/baileys, express, pino, qrcode, qrcode-terminal,
 // dotenv, better-sqlite3, dayjs, square.
 //
-// .env: ver el que ya usas (SQUARE_LOCATION_ID_TORREMOLINOS, SQUARE_LOCATION_ID_LA_LUZ, etc.)
+// .env: ver ejemplo al final (DEEPSEEK_API_KEY, DEEPSEEK_API_URL, DEEPSEEK_MODEL, etc.)
 
 import express from "express"
 import pino from "pino"
@@ -46,28 +46,40 @@ const ADDRESS_TORRE = process.env.ADDRESS_TORREMOLINOS || "Av. de Benyamina 18, 
 const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Luz"
 const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "")
 
-// ===== OpenAI (orquestador)
+// ===== LLM (DeepSeek)
 import { SYSTEM_PROMPT } from "./orchestrator-prompt.js"
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""
-const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini"
-const OPENAI_API_URL = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
+const LLM_API_KEY  = process.env.DEEPSEEK_API_KEY || ""
+const LLM_MODEL    = process.env.DEEPSEEK_MODEL   || "deepseek-chat"
+const LLM_API_URL  = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/v1/chat/completions"
 
-async function aiChat(messages, { temperature=0.2, retries=2 } = {}) {
-  if (!OPENAI_API_KEY) return ""
+// Cliente Chat (compatible con OpenAI Chat Completions)
+async function aiChat(messages, { temperature=0.2, retries=3 } = {}) {
+  if (!LLM_API_KEY) return ""
   let attempt=0, lastErr=null
   while (attempt<=retries){
     try{
-      const r = await fetch(OPENAI_API_URL, {
+      const r = await fetch(LLM_API_URL, {
         method: "POST",
-        headers: { "Content-Type":"application/json", "Authorization":`Bearer ${OPENAI_API_KEY}` },
-        body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature })
+        headers: {
+          "Content-Type":"application/json",
+          "Authorization":`Bearer ${LLM_API_KEY}`
+        },
+        body: JSON.stringify({ model: LLM_MODEL, messages, temperature })
       })
-      if (!r.ok) throw new Error(`OpenAI ${r.status}`)
+      if (r.status === 429) throw new Error("429")
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
       const j = await r.json()
       return (j?.choices?.[0]?.message?.content || "").trim()
-    }catch(e){ lastErr=e; await new Promise(res=>setTimeout(res, 300*(attempt+1))); attempt++ }
+    }catch(e){
+      lastErr = e
+      // backoff exponencial suave: 300ms, 600ms, 1200ms, 2400ms...
+      const wait = 300 * Math.pow(2, attempt)
+      console.warn(`aiChat failed: ${e?.message||e} — retry in ${wait}ms`)
+      await new Promise(res=>setTimeout(res, wait))
+      attempt++
+    }
   }
-  console.error("aiChat failed:", lastErr?.message||lastErr)
+  console.error("aiChat ultimately failed:", lastErr?.message||lastErr)
   return ""
 }
 
@@ -544,7 +556,7 @@ async function startBot(){
           s.lastOOHDay = todayKey; saveSession(phone,s)
         }
 
-        // Actualiza sede por texto libre (“Velázquez”, “Málaga”, “Torre…”)
+        // Actualiza sede por texto libre
         const maybeSede = detectSedeFromText(textRaw)
         if (maybeSede) s.sede = maybeSede
 
