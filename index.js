@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v24.1
+// index.js — Gapink Nails · v24.0
 // Staff LOCK (Desi), categorías primero, “otro día/otra hora” con Desi, cancelación real por usuario (próxima o lista breve)
 
 import express from "express"
