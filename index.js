@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v26.4
+// index.js — Gapink Nails · v26.4 (parches booleanos para SQLite)
 // Fixes CRÍTICOS:
 // - IA DeepSeek reforzada en TODOS los procesos
 // - Validación robusta antes de crear citas en Square
@@ -8,6 +8,7 @@
 // - Interceptar 1/2/3 ANTES de la IA → sin doble confirmación
 // - Priorizar profesional del slot elegido
 // - Sistema de respaldo si Square no responde
+// - FIX: booleans a enteros (0/1) para better-sqlite3
 
 import express from "express"
 import pino from "pino"
@@ -91,7 +92,7 @@ function insideBusinessHours(d,dur){
   const startMin = t.hour()*60 + t.minute()
   const endMin   = end.hour()*60 + end.minute()
   const openMin  = OPEN.start*60
-  const closeMin = OPEN.end*60
+  const closeMin=OPEN.end*60
   return startMin >= openMin && endMin <= closeMin
 }
 
@@ -387,7 +388,7 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
         response_data: JSON.stringify(resp?.result || {}),
         error_data: null,
         timestamp: new Date().toISOString(),
-        success: true
+        success: 1 // FIX: boolean -> integer
       })
       
       if (booking) {
@@ -406,7 +407,7 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
         response_data: null,
         error_data: JSON.stringify({ message: e?.message, body: e?.body }),
         timestamp: new Date().toISOString(),
-        success: false
+        success: 0 // FIX: boolean -> integer
       })
       
       if (attempt < SQUARE_MAX_RETRIES) {
@@ -1104,7 +1105,7 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
     service_label: sessionData.selectedServiceLabel || "Servicio",
     duration_min: 60,
     start_iso: startEU.tz("UTC").toISOString(),
-    end_iso: startEU.clone().add(60, "minute").tz("UTC").toISOString(),
+    end_iso: startEU.clone().add(60, "minute").toISOString(),
     staff_id: staffId,
     status: "confirmed",
     created_at: new Date().toISOString(),
@@ -1416,7 +1417,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   }
 
   // Guardar conversación en BD
-  const fallbackUsed = aiObj.__fallback_used || false
+  const fallbackUsedBool = !!aiObj.__fallback_used // asegura boolean
   insertAIConversation.run({
     phone,
     message_id: m.key.id,
@@ -1424,8 +1425,10 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     ai_response: JSON.stringify(aiObj),
     timestamp: new Date().toISOString(),
     session_data: JSON.stringify(sessionData),
-    ai_error: aiObj.__ai_error || null,
-    fallback_used: fallbackUsed
+    ai_error: (typeof aiObj.__ai_error === "string" || aiObj.__ai_error == null) 
+      ? (aiObj.__ai_error ?? null) 
+      : JSON.stringify(aiObj.__ai_error), // FIX: asegurar string|null
+    fallback_used: Number(fallbackUsedBool) // FIX: boolean -> integer
   })
   
   saveSession(phone, sessionData)
