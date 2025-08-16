@@ -1,10 +1,5 @@
-// index.js — Gapink Nails · v26.3
-// Fixes:
-// - Interceptar 1/2/3 ANTES de la IA → sin doble confirmación
-// - Si no hay huecos con la preferida, no decir “con Carmen” y mostrar profesional por opción
-// - Al reservar, priorizar la profesional del slot elegido
-// - Evitar entrar en “cancelar” si estamos en medio del flujo de reserva
-// Base: v26.2 (retries IA + fallback local) + horario continuo 09:00–20:00
+// index.js — Gapink Nails · v26.4
+// Anti-fake-confirm + captura de identidad local + intercept 1/2/3 + horario continuo + Square guardrails.
 
 import express from "express"
 import pino from "pino"
@@ -109,6 +104,7 @@ function fmtES(d){
 }
 function enumerateHours(list){ return list.map((d,i)=>({ index:i+1, iso:d.format("YYYY-MM-DDTHH:mm"), pretty:fmtES(d) })) }
 function stableKey(parts){ const raw=Object.values(parts).join("|"); return createHash("sha256").update(raw).digest("hex").slice(0,48) }
+
 function proposeSlots({ fromEU, durationMin=60, n=3 }){
   const out=[]
   let t=ceilToSlotEU(fromEU.clone())
@@ -244,6 +240,24 @@ function servicesForSedeKeyRaw(sedeKey){
   }
   return out
 }
+function findServiceByText(sedeKey, txt){
+  const pool = servicesForSedeKeyRaw(sedeKey)
+  const q = norm(txt)
+  // heurísticas mínimas (2D/3D/pelo a pelo)
+  const score = (lab)=>{
+    const n = norm(lab)
+    let s = 0
+    if (/\b2d\b/.test(q) && /\b2d\b/.test(n)) s+=3
+    if (/\b3d\b/.test(q) && /\b3d\b/.test(n)) s+=3
+    if (/pelo a pelo|peloapelo|clásic/.test(q) && /pelo a pelo|clas/i.test(n)) s+=3
+    if (/pesta/.test(q) && /pesta/.test(n)) s+=1
+    if (/extens/.test(q) && /extens/.test(n)) s+=1
+    return s
+  }
+  let best=null, bestS=-1
+  for (const s of pool){ const sc=score(s.label); if (sc>bestS){ bestS=sc; best=s } }
+  return (bestS>0)? best : null
+}
 
 // ====== Square helpers
 async function getServiceIdAndVersion(envKey){
@@ -293,7 +307,9 @@ async function createBooking({ startEU, locationKey, envServiceKey, durationMin,
         }]
       }
     })
-    return resp?.result?.booking || null
+    const b = resp?.result?.booking || null
+    if (b) console.log("✅ Booking created:", b.id)
+    return b
   }catch(e){
     console.error("createBooking:", e?.message||e, e?.body||"")
     return null
@@ -466,7 +482,25 @@ async function callAIWithRetries(messages, systemPrompt=""){
   return null
 }
 
-// ====== Fallback local
+// ====== Fallback local + parsers
+function extractIdentity(msg){
+  const emailMatch = msg.match(/[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}/)
+  const email = emailMatch ? emailMatch[0] : null
+  // nombre = línea limpia si parece nombre (2+ palabras, letras/espacios)
+  const raw = msg.replace(/\s+/g," ").trim()
+  const onlyLetters = raw.replace(/[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s'-]/g,"")
+  const words = onlyLetters.split(" ").filter(Boolean)
+  const name = (!email && words.length>=2 && onlyLetters.length<=60) ? onlyLetters : null
+  return { name, email }
+}
+function hasCore(s){ return s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime }
+function haveIdentity(s){ return !!(s?.name || s?.email) }
+
+function looksLikeConfirm(text){
+  const t=(text||"").toLowerCase()
+  return /reserva (confirmada|creada|hecha)|confirmad[oa]|he reservado|queda agendada|cita confirmada|cita creada/.test(t)
+}
+
 function buildLocalFallback(userMessage, sessionData){
   const msg = String(userMessage||"").trim()
   const lower = norm(msg)
@@ -476,10 +510,20 @@ function buildLocalFallback(userMessage, sessionData){
   const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
   const bookMatch = /\b(reservar|cita|quiero.*(cita|reservar))\b/i.test(lower)
 
-  const hasCore = (s)=> s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime
-  const haveIdentity = (s)=> !!(s?.name || s?.email)
+  // Captura identidad si estábamos esperando
+  if ((sessionData?.stage||"")==="awaiting_identity"){
+    const id = extractIdentity(msg)
+    if (id.name || id.email){
+      return {
+        message: "¡Gracias! Voy a confirmarlo.",
+        action: haveIdentity({...sessionData, ...id}) && hasCore(sessionData) ? "create_booking" : "need_info",
+        session_updates: { ...id, stage: null },
+        action_params: {}
+      }
+    }
+  }
 
-  // (1) Número con lastHours
+  // 1) Número con lastHours
   if (numMatch && Array.isArray(sessionData?.lastHours) && sessionData.lastHours.length){
     const idx = Number(numMatch[1]) - 1
     const pick = sessionData.lastHours[idx]
@@ -496,9 +540,7 @@ function buildLocalFallback(userMessage, sessionData){
       }
       const okToCreate = hasCore({...sessionData, ...updates}) && haveIdentity(sessionData)
       return {
-        message: okToCreate 
-          ? "Perfecto, voy a confirmar esa hora 👍"
-          : "Genial. Dime tu nombre (o email) para terminar la reserva.",
+        message: okToCreate ? "Perfecto, confirmo esa hora ✨" : "Genial. Dime tu nombre (o email) para terminar la reserva.",
         action: okToCreate ? "create_booking" : "need_info",
         session_updates: updates,
         action_params: {}
@@ -506,7 +548,7 @@ function buildLocalFallback(userMessage, sessionData){
     }
   }
 
-  // (2) Sí / ok
+  // 2) Sí / ok
   if (yesMatch){
     if (hasCore(sessionData) && haveIdentity(sessionData)){
       return { message:"¡Voy a crear la reserva! ✨", action:"create_booking", session_updates:{}, action_params:{} }
@@ -525,22 +567,17 @@ function buildLocalFallback(userMessage, sessionData){
     }
   }
 
-  // (3) Cancelar (no si estás en medio de elegir hora/datos)
+  // 3) Cancelar (no si estamos esperando identidad/hora)
   if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")){
-    return {
-      message:"Vale, dime qué cita quieres cancelar o responde con el número cuando te la liste.",
-      action:"cancel_appointment",
-      session_updates:{},
-      action_params:{}
-    }
+    return { message:"Vale, te muestro tus citas y eliges cuál cancelar.", action:"cancel_appointment", session_updates:{}, action_params:{} }
   }
 
-  // (4) Listado
+  // 4) Listado
   if (listMatch){
     return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
   }
 
-  // (5) Reservar
+  // 5) Reservar
   if (bookMatch){
     if (sessionData?.sede && sessionData?.selectedServiceEnvKey){
       return { message:"Te propongo horas disponibles:", action:"propose_times", session_updates:{ stage:"awaiting_time" }, action_params:{} }
@@ -548,60 +585,30 @@ function buildLocalFallback(userMessage, sessionData){
       const faltan=[]
       if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)")
       if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio")
-      return { 
-        message:`Para proponerte horas dime: ${faltan.join(" y ")}.`,
-        action:"need_info",
-        session_updates:{},
-        action_params:{} 
-      }
+      return { message:`Para proponerte horas dime: ${faltan.join(" y ")}.`, action:"need_info", session_updates:{}, action_params:{} }
     }
   }
 
-  return {
-    message:"¿Quieres reservar, cancelar o ver tus citas? Si es para reservar, dime sede y servicio.",
-    action:"none",
-    session_updates:{},
-    action_params:{}
+  // 6) Intento de identificar servicio 2D/3D/pelo a pelo si ya dijo sede
+  if (sessionData?.sede && !sessionData?.selectedServiceEnvKey){
+    const s = findServiceByText(sessionData.sede, msg)
+    if (s) {
+      return { message:`Perfecto: ${s.label}. Te propongo horas.`, action:"propose_times", session_updates:{ selectedServiceEnvKey:s.key, selectedServiceLabel:s.label }, action_params:{} }
+    }
   }
+
+  return { message:"¿Quieres reservar, cancelar o ver tus citas? Si es para reservar, dime sede y servicio.", action:"none", session_updates:{}, action_params:{} }
 }
 
+// ====== System prompt (abreviado para foco)
 function buildSystemPrompt() {
   const nowEU = dayjs().tz(EURO_TZ);
-  const employees = EMPLOYEES.map(e => ({ 
-    id: e.id, 
-    labels: e.labels, 
-    bookable: e.bookable, 
-    locations: e.allow 
-  }));
+  const employees = EMPLOYEES.map(e => ({ id: e.id, labels: e.labels, bookable: e.bookable, locations: e.allow }));
   const torremolinos_services = servicesForSedeKeyRaw("torremolinos");
   const laluz_services = servicesForSedeKeyRaw("la_luz");
-  return `Eres el asistente de WhatsApp para Gapink Nails:
-
-SEDES:
-- Torremolinos: ${ADDRESS_TORRE}
-- Málaga – La Luz: ${ADDRESS_LUZ}
-
-HORARIOS:
-- Lunes a Viernes: 09:00-20:00 (continuo)
-- Cerrado sábados y domingos
-- Festivos: ${HOLIDAYS_EXTRA.join(", ")}
-
-EMPLEADAS:
-${employees.map(e => `- ID: ${e.id}, Nombres: ${e.labels.join(", ")}, Ubicaciones: ${e.locations.join(", ")}, Reservable: ${e.bookable}`).join("\n")}
-
-SERVICIOS TORREMOLINOS:
-${torremolinos_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
-
-SERVICIOS LA LUZ:
-${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
-
-REGLAS:
-- Si el cliente elige 1/2/3, asume que es selección de hora.
-- Si no hay huecos con la profesional preferida, no digas "con <nombre>"; indica "nuestro equipo".
-- Confirma datos clave solo una vez antes de reservar.
-
-Devuelve SOLO JSON válido:
-{"message":"","action":"","session_updates":{},"action_params":{}}`
+  return `Eres el asistente de WhatsApp para Gapink Nails (L-V 09:00-20:00).
+Devuelve SOLO JSON válido: {"message":"","action":"","session_updates":{},"action_params":{}}
+Si no hay huecos con la profesional preferida, no digas "con <nombre>"; indica "nuestro equipo" y muestra el staff por opción. Confirma solo una vez.`
 }
 
 async function getAIResponse(userMessage, sessionData, phone) {
@@ -620,7 +627,7 @@ async function getAIResponse(userMessage, sessionData, phone) {
 
   const messages = [
     ...conversationHistory,
-    { role: "user", content: `Mensaje: "${userMessage}"\n\nEstado de sesión:\n${JSON.stringify(sessionData, null, 2)}` }
+    { role: "user", content: `Mensaje: "${userMessage}"\n\nEstado:\n${JSON.stringify(sessionData, null, 2)}` }
   ];
 
   const aiText = await callAIWithRetries(messages, systemPrompt)
@@ -671,7 +678,6 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     })
     if (staffSlots.length){ slots = staffSlots; usedPreferred = true }
   }
-
   if (!slots.length) {
     const generic = await searchAvailabilityGeneric({
       locationKey: sessionData.sede,
@@ -681,18 +687,15 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     })
     slots = generic
   }
-
   if (!slots.length) {
     const generalSlots = proposeSlots({ fromEU: baseFrom, durationMin: 60, n: 3 });
     slots = generalSlots.map(d => ({ date: d, staffId: null }))
   }
-
   if (!slots.length) {
     await sendWithPresence(sock, jid, "No encuentro horarios disponibles en los próximos días. ¿Te interesa otra fecha?");
     return;
   }
 
-  // Guardado de mapeos
   const hoursEnum = enumerateHours(slots.map(s => s.date))
   const map = {}
   for (const s of slots) map[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
@@ -708,19 +711,11 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     return `${h.index}) ${h.pretty}${tag}`
   }).join("\n")
 
-  let header
-  if (usedPreferred) {
-    const who = sessionData.preferredStaffLabel || "tu profesional"
-    header = `Horarios disponibles con ${who}:`
-  } else {
-    header = `Horarios disponibles (nuestro equipo):`
-    if (sessionData.preferredStaffLabel) {
-      header += `\nNota: no hay huecos con ${sessionData.preferredStaffLabel} en los próximos días.`
-    }
-  }
+  const header = usedPreferred
+    ? `Horarios disponibles con ${sessionData.preferredStaffLabel || "tu profesional"}:`
+    : `Horarios disponibles (nuestro equipo):` + (sessionData.preferredStaffLabel ? `\nNota: no hay huecos con ${sessionData.preferredStaffLabel} en los próximos días.`:"")
 
-  const message = `${header}\n${lines}\n\nResponde con el número (1, 2 o 3)`
-  await sendWithPresence(sock, jid, message);
+  await sendWithPresence(sock, jid, `${header}\n${lines}\n\nResponde con el número (1, 2 o 3)`)
 }
 
 async function executeCreateBooking(params, sessionData, phone, sock, jid) {
@@ -734,16 +729,8 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
     return;
   }
 
-  // Elección de staff: si los slots NO fueron de la preferida, prioriza el staff del slot
   const iso = startEU.format("YYYY-MM-DDTHH:mm")
-  let staffId = null
-
-  if (sessionData.lastProposeUsedPreferred){
-    staffId = sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null
-  } else {
-    staffId = sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null
-  }
-
+  let staffId = sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null
   if (!staffId) {
     const probe = await searchAvailabilityGeneric({
       locationKey: sessionData.sede,
@@ -771,7 +758,10 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
   })
 
   if (!booking) { await sendWithPresence(sock, jid, "No pude crear la reserva. ¿Prefieres otro horario?"); return; }
-  if (booking.__sim) { await sendWithPresence(sock, jid, "SIMULACIÓN: Reserva creada (DRY_RUN activo)"); return; }
+  if (booking.__sim) {
+    await sendWithPresence(sock, jid, "SIMULACIÓN: Reserva creada (DRY_RUN activo). No se ha tocado Square.")
+    return
+  }
 
   const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
   insertAppt.run({
@@ -846,13 +836,13 @@ app.get("/", (_req,res)=>{
   res.send(`<!doctype html><meta charset="utf-8"><style>
   body{font-family:system-ui;display:grid;place-items:center;min-height:100vh}
   .card{max-width:560px;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08)}
-  </style><div class="card"><h1>Gapink Nails v26.3</h1>
+  </style><div class="card"><h1>Gapink Nails v26.4</h1>
   <p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>
   ${!conectado&&lastQR?`<img src="/qr.png" width="300">`:""}
   <p style="opacity:.7">Modo: ${DRY_RUN?"Simulación (no toca Square)":"Producción"}</p>
   <p style="opacity:.7">Horario: L-V 09:00–20:00</p>
   <p style="opacity:.7">IA: DeepSeek (${AI_MODEL}) · Retries: ${AI_MAX_RETRIES}</p>
-  <p style="color:#e74c3c">🤖 Intercept 1/2/3 + staff por opción + anti-cancel en flujo</p>
+  <p style="color:#e74c3c">🤖 Anti-fake confirm + identidad local</p>
   </div>`)
 })
 
@@ -861,6 +851,8 @@ app.get("/qr.png", async (_req,res)=>{
   const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
   res.set("Content-Type","image/png").send(png)
 })
+
+app.listen(PORT, ()=>{ console.log("🌐 Web", PORT); startBot().catch(console.error) })
 
 // ====== Baileys
 async function loadBaileys(){
@@ -938,6 +930,15 @@ async function startBot(){
             console.log("[DEBUG] Session before:", sessionData)
           }
 
+          // === PRE: si esperamos identidad, intenta capturarla localmente
+          if ((sessionData.stage||"")==="awaiting_identity"){
+            const id = extractIdentity(textRaw)
+            if (id.name || id.email){
+              sessionData = { ...sessionData, ...id, stage:null }
+              saveSession(phone, sessionData)
+            }
+          }
+
           // === PRE-INTERCEPT: selección 1/2/3 ANTES de la IA
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-5])\b/)
@@ -951,10 +952,9 @@ async function startBot(){
               if (staffFromIso){ sessionData.preferredStaffId = staffFromIso; sessionData.preferredStaffLabel = null }
               sessionData.stage = (sessionData.name || sessionData.email) ? null : "awaiting_identity"
               saveSession(phone, sessionData)
-              // Ejecutar directamente sin IA
-              const okToCreate = sessionData.sede && sessionData.selectedServiceEnvKey && sessionData.pendingDateTime && (sessionData.name || sessionData.email)
+              const okToCreate = hasCore(sessionData) && haveIdentity(sessionData)
               const aiObj = okToCreate 
-                ? { message:"Perfecto, confirmo esa hora ✨", action:"create_booking", session_updates:{}, action_params:{} }
+                ? { message:"Confirmo esa hora ✨", action:"create_booking", session_updates:{}, action_params:{} }
                 : { message:"Genial. Dime tu nombre (o email) para terminar la reserva.", action:"need_info", session_updates:{}, action_params:{} }
               await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
               return
@@ -962,7 +962,22 @@ async function startBot(){
           }
 
           // === IA o fallback local
-          const aiObj = await getAIResponse(textRaw, sessionData, phone)
+          let aiObj = await getAIResponse(textRaw, sessionData, phone)
+
+          // === Anti-fake confirm: si IA dice "confirmada" sin action, forzamos create_booking con guardas
+          if (aiObj && looksLikeConfirm(aiObj.message) && aiObj.action !== "create_booking"){
+            if (hasCore(sessionData) && haveIdentity(sessionData)){
+              aiObj = { ...aiObj, action:"create_booking" }
+            } else {
+              const faltan=[]
+              if (!sessionData?.sede) faltan.push("sede")
+              if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio")
+              if (!sessionData?.pendingDateTime) faltan.push("fecha y hora")
+              if (!haveIdentity(sessionData)) faltan.push("nombre o email")
+              aiObj = { message:`Para confirmar de verdad me faltan: ${faltan.join(", ")}.`, action:"need_info", session_updates: aiObj.session_updates||{}, action_params:{} }
+            }
+          }
+
           await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
 
         } catch (error) {
@@ -1019,7 +1034,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Arranque
-app.listen(process.env.PORT||8080, ()=>{ console.log("🌐 Web en puerto", process.env.PORT||8080); startBot().catch(console.error) })
+startBot().catch(console.error)
 
 // Señales
 process.on("uncaughtException", (e)=>console.error("uncaughtException:", e?.stack||e?.message||e))
