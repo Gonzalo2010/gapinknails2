@@ -1,6 +1,6 @@
-// index.js — Gapink Nails · v22
-// Contexto completo + slots reales por profesional + "otro momento" sin inventarse ediciones
-// DeepSeek + Memoria 20min + Square availability + confirmación dura (crear/cancelar/editar)
+// index.js — Gapink Nails · v23
+// Pregunta tipo de servicio + propone 3 horas con Desi (reales) + sin mensajes genéricos ni “...”
+// DeepSeek orquestador + Memoria 20min + Square availability por profesional + confirmación dura
 
 import express from "express"
 import pino from "pino"
@@ -41,14 +41,60 @@ const ADDRESS_TORRE = process.env.ADDRESS_TORREMOLINOS || "Av. de Benyamina 18, 
 const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Luz"
 const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "")
 
-// ====== DeepSeek (Chat Completions compatible)
+// ====== LLM (DeepSeek/OpenAI compatible)
 const LLM_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY || ""
 const LLM_MODEL   = process.env.DEEPSEEK_MODEL   || process.env.OPENAI_MODEL || "deepseek-chat"
 const LLM_URL     = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/v1/chat/completions"
 
-// ====== Prompt del orquestador (igual que v21, pero ahora le pasamos +memoria en el payload)
+// ====== Prompt del orquestador (igual a v22; lo mantenemos)
 const SYSTEM_PROMPT = `[SYSTEM ROLE — ORQUESTADOR DE CITAS GAPINK NAILS] 
-Eres una IA que clasifica y guía el flujo de reservas... (idéntico al de v21, omitido por brevedad en esta cabecera; el cuerpo se mantiene)`
+Eres una IA que clasifica y guía el flujo de reservas de un salón con dos sedes (Torremolinos y Málaga–La Luz). No llamas a APIs ni "haces" reservas: SOLO devuelves JSON con decisiones y un mensaje listo para enviar al cliente. No inventes datos: si falta algo, lo pides. Cuando recibas listas enumeradas (servicios, citas, horas, fechas) DEBES elegir por índice (base 1). Siempre devuelve JSON + un texto "client_message".
+
+Opciones de intención (elige 1):
+1. Concertar cita
+2. Cancelar cita
+3. Editar cita
+4. Solo saluda ("hola")
+5. Quiere información
+
+Constantes de negocio:
+- Sedes: {torremolinos, la_luz}. Pide ubicación si no viene ("¿Torremolinos o Málaga – La Luz?").
+- Horario atención telefónica a mencionar en saludo (opción 4): L–V 10:00–14:00 y 16:00–20:00.
+- Horario "abierto/cerrado" a efectos de info (opción 5): L–V 09:00–20:00.
+- Festivos que apliquen en Torremolinos: 06/01, 28/02, 15/08, 12/10, 01/11, 06/12, 08/12, 25/12 → CERRADO.
+- Zona horaria: Europe/Madrid.
+- Nunca confirmes ni inventes huecos: si la hora exacta no cuadra, PROPON opciones de la lista que te pase el orquestador y elige por índice cuando te lo pidan.
+
+Entradas que te pasará el orquestador:
+- user_message, sede_actual, servicios_enumerados, horas_enumeradas, citas_enumeradas, fechas_enumeradas, confirm_choices
+
+Reglas de comportamiento:
+- Salida SIEMPRE en un único JSON (sin texto fuera) con el esquema de "OUTPUT".
+- Índices 1-based.
+- Usa "requires_confirmation" cuando toque.
+
+OUTPUT — ESQUEMA:
+{
+  "intent": 1|2|3|4|5,
+  "needs_clarification": boolean,
+  "requires_confirmation": boolean,
+  "slots": {
+    "sede": "torremolinos"|"la_luz"|null,
+    "service_index": integer|null,
+    "appointment_index": integer|null,
+    "date_iso": "YYYY-MM-DD"|null,
+    "time_iso": "HH:mm"|null,
+    "datetime_iso": "YYYY-MM-DDTHH:mm"|null,
+    "profesional": string|null,
+    "notes": string|null
+  },
+  "selection": {
+    "time_index": integer|null,
+    "date_index": integer|null,
+    "confirm_index": integer|null
+  },
+  "client_message": "texto listo para enviar"
+}`
 
 async function aiChat(messages, { temperature=0.2, retries=3 } = {}){
   if (!LLM_API_KEY) return ""
@@ -339,7 +385,7 @@ async function enumerateCitasByPhone(phone){
   return items
 }
 
-// === NUEVO: disponibilidad real por staff + servicio vía searchAvailability
+// === Disponibilidad real por staff + servicio vía searchAvailability
 async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId, fromEU, days=14, n=3 }){
   try{
     const sv = await getServiceIdAndVersion(envServiceKey)
@@ -411,6 +457,10 @@ function ensurePunct(text){
   const s=String(text||"").trim()
   if (!s) return s
   return /[.!?…]$/.test(s) ? s : s+"."
+}
+function isGenericReply(txt){
+  const s=txt.toLowerCase().trim()
+  return s==="perfecto, te ayudo con eso." || s==="perfecto, te ayudo con eso" || /te ayudo con eso/i.test(s)
 }
 
 // ====== Mini-web + QR
@@ -624,14 +674,15 @@ async function startBot(){
           }
         }
 
-        // Función: generar 3 horas según contexto (usa staff si lo tenemos)
+        // Función: proponer 3 horas según contexto (usa staff si lo tenemos)
         async function proposeHoursForContext({ baseFromEU, n=3 }){
-          if (s.sede && s.selectedServiceEnvKey && (s.preferredStaffId || s.preferredStaffLabel)){
-            const staffId = s.preferredStaffId || pickStaffForLocation(s.sede, null) // si no hay id exacta, intenta cualquiera válida
-            if (staffId){
+          if (s.sede && (s.selectedServiceEnvKey || (s.serviceCategory==="lash" && s.lastServiceMenu?.length)) && (s.preferredStaffId || s.preferredStaffLabel)){
+            const envKey = s.selectedServiceEnvKey || s.lastServiceMenu[0]?.key // por defecto “pelo a pelo”
+            const staffId = s.preferredStaffId || pickStaffForLocation(s.sede, null)
+            if (envKey && staffId){
               const arr = await searchAvailabilityForStaff({
                 locationKey:s.sede,
-                envServiceKey:s.selectedServiceEnvKey,
+                envServiceKey:envKey,
                 staffId,
                 fromEU: baseFromEU,
                 n
@@ -639,7 +690,7 @@ async function startBot(){
               if (arr.length) return enumerateHours(arr)
             }
           }
-          // Fallback genérico por horario comercial
+          // Fallback genérico por horario comercial (si falta sede/servicio/staff)
           const arr2 = proposeSlots({ fromEU: baseFromEU, durationMin:60, n })
           return enumerateHours(arr2)
         }
@@ -662,7 +713,7 @@ async function startBot(){
         const citas = await enumerateCitasByPhone(phone)
         const confirmChoices = [{index:1,label:"sí"},{index:2,label:"no"}]
 
-        // —— Regla: "otro momento/otra hora" = seguir en INTENT 1 (no editar)
+        // —— Regla: “otro momento/otra hora” = seguir en INTENT 1 (no editar)
         const userWantsAlt = wantsAltTime(textRaw)
 
         // Payload IA con memoria
@@ -697,20 +748,19 @@ async function startBot(){
         )
 
         // Correcciones de flujo:
-        // 1) Si la IA dijo "editar" pero el usuario no pidió editar explícitamente o no hay citas, volvemos a reservar (intent 1)
+        // 1) Si IA dijo “editar” pero el usuario no lo pidió o no hay citas, volvemos a reservar
         if (decision.intent===3 && (!detectEditIntent(textRaw) || citas.length===0)) {
           decision.intent = 1
           decision.requires_confirmation = false
           decision.needs_clarification = false
         }
-        // 2) Si el usuario pidió "otro momento", preparamos nuevas horas con misma pro
-        if (userWantsAlt && s.selectedServiceEnvKey){
+        // 2) Si el usuario pidió “otro momento”, proponemos 3 nuevas horas con misma pro
+        if (userWantsAlt && (s.selectedServiceEnvKey || s.serviceCategory==="lash")){
           const nextBase = nextOpeningFrom(nowEU.add(NOW_MIN_OFFSET_MIN+30,"minute"))
           const more = await proposeHoursForContext({ baseFromEU: nextBase, n:3 })
           setPendingMenu(s,"hours", more); saveSession(phone,s)
           const text = `Sin problema. Te propongo estas horas con ${s.preferredStaffLabel||"nuestro equipo"}: ${more.map(h=>`${h.index}) ${h.pretty}`).join(" · ")}. Responde con 1/2/3.`
           await sendWithPresence(sock, jid, ensurePunct(text))
-          // No ejecutamos nada más en este turno
           return
         }
 
@@ -748,15 +798,61 @@ async function startBot(){
           setPendingMenu(s,"confirm", confirmChoices); saveSession(phone,s)
         }
 
-        // Mensaje al cliente (sin recortar ni auto-emoji)
-        const msgOut = decision.client_message?.trim() || "Perfecto, te ayudo con eso."
+        // ====== OVERRIDE ANTIGENÉRICO:
+        // Si la IA responde genérico o superficial, y ya sabemos que el usuario quiere “pestañas con Desi”,
+        // pedimos tipo de pestañas y (si hay sede) proponemos 3 horas reales con Desi de una.
+        async function craftServiceAndSlotsMessage(){
+          const sedeTxt = s.sede ? locationNice(s.sede) : null
+          const lashMenu = s.lastServiceMenu?.length ? s.lastServiceMenu : (s.sede ? buildLashMenu(s.sede) : [])
+          if (!lashMenu?.length){
+            // Si aún no hay menú (falta sede), pregunta sede + tipo
+            return ensurePunct("¡Genial! Te reservo con Desi para pestañas. ¿Torremolinos o Málaga – La Luz? Luego dime el tipo: 1) Extensiones pelo a pelo · 2) 2D · 3) 3D · 4) Lifting + tinte.")
+          }
+          // Tenemos sede y menú → proponemos 3 horas
+          const base = nextOpeningFrom(nowEU.add(NOW_MIN_OFFSET_MIN,"minute"))
+          const defaultEnvKey = s.selectedServiceEnvKey || lashMenu[0].key
+          const staffId = s.preferredStaffId || pickStaffForLocation(s.sede, null)
+          let slots = []
+          if (staffId && defaultEnvKey){
+            const arr = await searchAvailabilityForStaff({
+              locationKey: s.sede,
+              envServiceKey: defaultEnvKey,
+              staffId,
+              fromEU: base,
+              n:3
+            })
+            slots = enumerateHours(arr)
+          }
+          if (!slots.length){
+            // Fallback si no devuelve disponibilidad
+            slots = await proposeHoursForContext({ baseFromEU: base, n:3 })
+          }
+          setPendingMenu(s,"services", lashMenu); saveSession(phone,s)
+          setPendingMenu(s,"hours", slots); saveSession(phone,s)
+          const serviciosTxt = lashMenu.map(it=>`${it.index}) ${it.label}`).join(" · ")
+          const horasTxt = slots.map(h=>`${h.index}) ${h.pretty}`).join(" · ")
+          return ensurePunct(`Perfecto, cita con Desi en ${sedeTxt}. Elige tipo de pestañas: ${serviciosTxt}. Te dejo 3 horarios con Desi: ${horasTxt}. Responde con el número del tipo y 1/2/3 para la hora.`)
+        }
+
+        let msgOut = decision.client_message?.trim() || ""
+        const shouldOverride = (
+          isGenericReply(msgOut) ||
+          // también si intención=1 y ya hay contexto de Desi+pestañas y aún no hemos pedido tipo
+          (decision.intent===1 && s.serviceCategory==="lash" && (s.preferredStaffId || s.preferredStaffLabel) && !s.selectedServiceEnvKey)
+        )
+
+        if (shouldOverride){
+          msgOut = await craftServiceAndSlotsMessage()
+        }
+        if (!msgOut) msgOut = "Perfecto, te ayudo con eso." // ultra fallback (no debería ocurrir)
+
         await sendWithPresence(sock, jid, ensurePunct(msgOut))
 
         // ====== Acciones finales
 
         async function executeCreateBooking(){
           if (!s.sede){ await sendWithPresence(sock,jid, ensurePunct("¿Te viene mejor Torremolinos o Málaga – La Luz?")); return }
-          if (!s.selectedServiceEnvKey){ await sendWithPresence(sock,jid, ensurePunct("Elige el servicio (responde con el número).")); return }
+          if (!s.selectedServiceEnvKey){ await sendWithPresence(sock,jid, ensurePunct("Elige el tipo de pestañas (responde con el número).")); return }
           if (!s.pendingDateTime){ await sendWithPresence(sock,jid, ensurePunct("Elige una hora (1/2/3) o dime otra.")); return }
 
           const startEU = ceilToSlotEU(s.pendingDateTime.clone())
@@ -853,7 +949,7 @@ Duración: 60 min
               setPendingMenu(s,"appointments",citas); saveSession(phone,s)
               await sendWithPresence(sock,jid, ensurePunct(`¿Cuál quieres mover? ${citas.map(c=>`${c.index}) ${c.pretty} — ${c.sede}`).join(" · ")}`))
             } else {
-              // Sin citas reales → no invento, vuelvo a proponer horas
+              // Sin citas reales → no invento, vuelvo a proponer horas (flujo reserva)
               const more = await proposeHoursForContext({ baseFromEU: baseFrom, n:3 })
               setPendingMenu(s,"hours",more); saveSession(phone,s)
               await sendWithPresence(sock,jid, ensurePunct(`No tienes citas futuras. ¿Agendamos? Opciones: ${more.map(h=>`${h.index}) ${h.pretty}`).join(" · ")}`))
