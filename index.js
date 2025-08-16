@@ -44,9 +44,9 @@ const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Lu
 const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "")
 
 // ====== IA Configuration
-const AI_API_KEY = process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || ""
-const AI_PROVIDER = process.env.AI_PROVIDER || "anthropic" // "anthropic" or "openai"
-const AI_MODEL = process.env.AI_MODEL || (AI_PROVIDER === "anthropic" ? "claude-3-sonnet-20240229" : "gpt-4")
+const AI_API_KEY = process.env.DEEPSEEK_API_KEY || ""
+const AI_PROVIDER = "deepseek"
+const AI_MODEL = process.env.AI_MODEL || "deepseek-chat"
 
 // ====== Utils
 const onlyDigits = s => String(s||"").replace(/\D+/g,"")
@@ -368,51 +368,36 @@ async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId,
 // ====== IA Integration
 async function callAI(messages, systemPrompt = "") {
   try {
-    if (AI_PROVIDER === "anthropic") {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": AI_API_KEY,
-          "anthropic-version": "2023-06-01"
-        },
-        body: JSON.stringify({
-          model: AI_MODEL,
-          max_tokens: 1000,
-          system: systemPrompt,
-          messages: messages
-        })
-      });
+    const allMessages = systemPrompt ? 
+      [{ role: "system", content: systemPrompt }, ...messages] : 
+      messages;
       
-      const data = await response.json();
-      return data.content?.[0]?.text || "Error en respuesta de IA";
-      
-    } else if (AI_PROVIDER === "openai") {
-      const allMessages = systemPrompt ? 
-        [{ role: "system", content: systemPrompt }, ...messages] : 
-        messages;
-        
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${AI_API_KEY}`
-        },
-        body: JSON.stringify({
-          model: AI_MODEL,
-          messages: allMessages,
-          max_tokens: 1000,
-          temperature: 0.7
-        })
-      });
-      
-      const data = await response.json();
-      return data.choices?.[0]?.message?.content || "Error en respuesta de IA";
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${AI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: AI_MODEL,
+        messages: allMessages,
+        max_tokens: 1000,
+        temperature: 0.7,
+        stream: false
+      })
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("DeepSeek API Error:", response.status, errorText);
+      return "Error de conexión con IA. Por favor intenta de nuevo.";
     }
     
-    return "Proveedor de IA no configurado correctamente";
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || "Error en respuesta de IA";
+    
   } catch (error) {
-    console.error("Error calling AI:", error);
+    console.error("Error calling DeepSeek AI:", error);
     return "Error de conexión con IA. Por favor intenta de nuevo.";
   }
 }
@@ -756,7 +741,7 @@ app.get("/", (_req,res)=>{
   <p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>
   ${!conectado&&lastQR?`<img src="/qr.png" width="300">`:""}
   <p style="opacity:.7">Modo: ${DRY_RUN?"Simulación (no toca Square)":"Producción"}</p>
-  <p style="opacity:.7">IA: ${AI_PROVIDER} (${AI_MODEL})</p>
+  <p style="opacity:.7">IA: DeepSeek (${AI_MODEL})</p>
   <p style="color:#e74c3c">🤖 TODO controlado por IA</p>
   </div>`)
 })
@@ -800,7 +785,7 @@ async function startBot(){
 
     sock.ev.on("connection.update", ({connection,qr})=>{
       if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
-      if (connection==="open"){ lastQR=null; conectado=true; RECONNECT_ATTEMPTS=0; RECONNECT_SCHEDULED=false; console.log("✅ WhatsApp listo (IA activa)") }
+      if (connection==="open"){ lastQR=null; conectado=true; RECONNECT_ATTEMPTS=0; RECONNECT_SCHEDULED=false; console.log("✅ WhatsApp listo (DeepSeek IA activa)") }
       if (connection==="close"){ 
         conectado=false; console.log("❌ Conexión cerrada. Reintentando…"); 
         if (!RECONNECT_SCHEDULED){
