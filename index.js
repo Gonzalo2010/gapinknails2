@@ -327,14 +327,30 @@ async function enumerateCitasByPhone(phone){
 async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId, fromEU, days=14, n=3, distinctDays=false }){
   try{
     const sv = await getServiceIdAndVersion(envServiceKey)
-    if (!sv?.id || !staffId) return []
+    if (!sv?.id || !staffId) {
+      console.log("searchAvailabilityForStaff: Missing serviceId or staffId", { serviceId: sv?.id, staffId })
+      return []
+    }
+    
     const startAt = fromEU.tz("UTC").toISOString()
     const endAt = fromEU.clone().add(days,"day").tz("UTC").toISOString()
+    const locationId = locationToId(locationKey)
+    
+    if (BOT_DEBUG) {
+      console.log("searchAvailabilityForStaff params:", { 
+        locationId, 
+        serviceId: sv.id, 
+        staffId, 
+        startAt, 
+        endAt 
+      })
+    }
+    
     const body = {
       query:{
         filter:{
           startAtRange:{ startAt, endAt },
-          locationId: locationToId(locationKey),
+          locationId: locationId,
           segmentFilters:[{
             serviceVariationId: sv.id,
             teamMemberIdFilter:{ any:[ staffId ] }
@@ -342,10 +358,18 @@ async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId,
         }
       }
     }
+    
     const resp = await square.bookingsApi.searchAvailability(body)
-    const avail = resp?.result?.availabilities || []
+    
+    if (!resp?.result?.availabilities) {
+      console.log("searchAvailabilityForStaff: No availabilities in response")
+      return []
+    }
+    
+    const avail = resp.result.availabilities
     const slots=[]
     const seenDays=new Set()
+    
     for (const a of avail){
       if (!a?.startAt) continue
       const d=dayjs.tz(a.startAt, EURO_TZ)
@@ -358,10 +382,24 @@ async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId,
       slots.push(d)
       if (slots.length>=n) break
     }
+    
+    if (BOT_DEBUG) {
+      console.log(`searchAvailabilityForStaff: Found ${slots.length} slots`)
+    }
+    
     return slots
   }catch(e){
-    console.error("searchAvailabilityForStaff:", e?.message||e)
-    return []
+    console.error("searchAvailabilityForStaff error details:", {
+      message: e?.message,
+      status: e?.statusCode,
+      body: e?.body,
+      errors: e?.errors
+    })
+    
+    // Si hay error de disponibilidad, devolver slots genéricos como fallback
+    console.log("Falling back to generic time slots due to availability API error")
+    const fallbackSlots = proposeSlots({ fromEU, durationMin: 60, n })
+    return fallbackSlots.slice(0, n)
   }
 }
 
@@ -581,8 +619,12 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
   
   let availableSlots = [];
   
-  // Si hay preferencia de staff, buscar con esa persona
-  if (sessionData.preferredStaffId) {
+  // Si hay preferencia de staff, intentar buscar con esa persona
+  if (sessionData.preferredStaffId && sessionData.selectedServiceEnvKey) {
+    if (BOT_DEBUG) {
+      console.log("Trying to find availability for preferred staff:", sessionData.preferredStaffId);
+    }
+    
     availableSlots = await searchAvailabilityForStaff({
       locationKey: sessionData.sede,
       envServiceKey: sessionData.selectedServiceEnvKey,
@@ -590,10 +632,17 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
       fromEU: baseFrom,
       n: 3
     });
+    
+    if (BOT_DEBUG) {
+      console.log("Staff availability result:", { slots: availableSlots.length });
+    }
   }
   
-  // Si no hay slots con staff preferido, usar slots generales
+  // Si no hay slots con staff preferido o no hay preferencia, usar slots generales
   if (!availableSlots.length) {
+    if (BOT_DEBUG) {
+      console.log("Using generic time slots");
+    }
     const generalSlots = proposeSlots({ fromEU: baseFrom, durationMin: 60, n: 3 });
     availableSlots = generalSlots;
   }
