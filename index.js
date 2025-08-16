@@ -1,11 +1,6 @@
-// index.js — Gapink Nails · v27.0
-// Novedades v27.0:
-// - Menú de "uñas" sin colados (excluye pestañas/cejas/ojos). Pedicura solo si el usuario la menciona.
-// - Lista de servicios SIEMPRE filtrada por sede si ya se conoce. Si no hay sede → primero pedimos sede y luego mostramos lista.
-// - Limpieza de labels tipo "Luz ..." para no duplicar/confundir.
-// - Intercepto "con {nombre}" → búsqueda real de huecos con esa profesional (servicio+ubicación). Si no hay, propone equipo general.
-// - Coherencia entre horas mostradas y disponibilidad real por staff/servicio.
-// - Mantiene: identidad por teléfono (v26.9), cancelación por teléfono, logs BigInt-safe, TZ estable, menú inteligente de uñas.
+// index.js — Gapink Nails · v27.0.1
+// Fix rápido: quitar \` dentro de ${...} en buildSystemPrompt (y similares) → SyntaxError resuelto.
+// Incluye todos los cambios de v27.0 (menú uñas filtrado, identidad por teléfono, cancelación por número, etc.)
 
 import express from "express"
 import pino from "pino"
@@ -257,7 +252,6 @@ function pickStaffForLocation(locKey, preferId=null){
 
 // ====== Servicios
 function cleanDisplayLabel(label){
-  // quitar prefijos de sede en el propio nombre, p.e. "Luz ..."
   return String(label||"").replace(/^\s*(luz|la\s*luz)\s+/i,"").trim()
 }
 function servicesForSedeKeyRaw(sedeKey){
@@ -279,28 +273,25 @@ function serviceLabelFromEnvKey(envKey){
 }
 function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...servicesForSedeKeyRaw("la_luz")] }
 
-// ====== Clasificación de "uñas" (positivos/negativos)
+// ====== Clasificación de "uñas"
 const POS_NAIL_ANCHORS = [
   "uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente",
   "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte"
 ]
-const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","cejas","ojos","pelo a pelo","eyelash"]
+const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash"]
 
 function shouldIncludePedicure(userMsg){
   return /\b(pedicur|pies|pie)\b/i.test(String(userMsg||""))
 }
 
 function isNailsLabel(labelNorm, allowPedicure){
-  // Excluir explícitos que no son uñas
   if (NEG_NOT_NAILS.some(n=>labelNorm.includes(norm(n)))) return false
   const hasPos = POS_NAIL_ANCHORS.some(p=>labelNorm.includes(norm(p)))
   if (!hasPos) return false
-  // Si menciona pedicura en el label pero el usuario no habló de pedicura → fuera
   const isPedi = /\b(pedicur|pies|pie)\b/.test(labelNorm)
   if (isPedi && !allowPedicure) return false
   return true
 }
-
 function uniqueByLabel(arr){
   const seen=new Set(); const out=[]
   for (const s of arr){
@@ -310,14 +301,12 @@ function uniqueByLabel(arr){
   }
   return out
 }
-
 function nailsServicesForSede(sedeKey, userMsg){
   const allowPedi = shouldIncludePedicure(userMsg)
   const list = servicesForSedeKeyRaw(sedeKey)
   const filtered = list.filter(s=>isNailsLabel(s.norm, allowPedi))
   return uniqueByLabel(filtered)
 }
-
 function scoreServiceRelevance(userMsg, label){
   const u = norm(userMsg), l = norm(label); let score = 0
   if (/\b(uñas|unas)\b/.test(u) && /\b(uñas|unas|manicura)\b/.test(l)) score += 3
@@ -325,7 +314,7 @@ function scoreServiceRelevance(userMsg, label){
   if (/\b(acrilic|acrilico|acrílico)\b/.test(u) && l.includes("acril")) score += 2.5
   if (/\bgel\b/.test(u) && l.includes("gel")) score += 2.5
   if (/\bsemi|semipermanente\b/.test(u) && l.includes("semi")) score += 2
-  if (/\brelleno\b/.test(u) && (l.includes("uña") || l.includes("manicura") || l.includes("gel") || l.includes("acril"))) score += 2 // evita pestañas
+  if (/\brelleno\b/.test(u) && (l.includes("uña") || l.includes("manicura") || l.includes("gel") || l.includes("acril"))) score += 2
   if (/\bretir(ar|o)\b/.test(u) && (l.includes("retir")||l.includes("retiro"))) score += 1.5
   if (/\bpress\b/.test(u) && l.includes("press")) score += 1.2
   const tokens = ["natural","francesa","frances","decoracion","diseño","extra","exprés","express","completa","nivelacion","nivelación"]
@@ -336,13 +325,12 @@ function scoreServiceRelevance(userMsg, label){
   score += Math.min(overlap,3)*0.25
   return score
 }
-
 function resolveEnvKeyFromLabelAndSede(label, sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
   return list.find(s=>s.label.toLowerCase()===String(label||"").toLowerCase())?.key || null
 }
 
-// ====== Square helpers (identidad por teléfono v26.9)
+// ====== Square helpers (identidad por teléfono)
 async function searchCustomersByPhone(phone){
   try{
     const e164=normalizePhoneES(phone); if(!e164) return []
@@ -601,7 +589,6 @@ function buildLocalFallback(userMessage, sessionData){
   if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")) return { message:"Vale, te enseño tus citas para cancelar:", action:"cancel_appointment", session_updates:{}, action_params:{} }
   if (listMatch) return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
 
-  // menú uñas local si hace falta
   if (!sessionData?.selectedServiceEnvKey && /\buñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul/i.test(msg)){
     return { message:"Elige tu servicio de uñas:", action:"choose_service", session_updates:{ stage:"awaiting_service_choice" }, action_params:{ candidates:[] } }
   }
@@ -628,13 +615,13 @@ HORARIOS:
 - L-V 09:00-20:00; S/D cerrado; Festivos: ${HOLIDAYS_EXTRA.join(", ")}
 
 EMPLEADAS:
-${employees.map(e => \`- ID: \${e.id}, Nombres: \${e.labels.join(", ")}, Ubicaciones: \${e.locations.join(", ")}, Reservable: \${e.bookable}\`).join("\n")}
+${employees.map(e => `- ID: ${e.id}, Nombres: ${e.labels.join(", ")}, Ubicaciones: ${e.locations.join(", ")}, Reservable: ${e.bookable}`).join("\n")}
 
 SERVICIOS TORREMOLINOS:
-${torremolinos_services.map(s => \`- \${s.label} (Clave: \${s.key})\`).join("\n")}
+${torremolinos_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 
 SERVICIOS LA LUZ:
-${laluz_services.map(s => \`- \${s.label} (Clave: \${s.key})\`).join("\n")}
+${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 
 REGLAS CLAVE:
 1) Identidad: no pedir nombre/email si el número existe (match único). Pedir solo si no existe o hay duplicados.
@@ -709,13 +696,12 @@ function findStaffByName(inputName, locKey=null){
       const locId = locationToId(locKey)
       if (!(e.allow.includes("ALL") || e.allow.includes(locId))) continue
     }
-    // coincide con cualquiera de sus labels
     if (e.labels.some(l=> norm(l).includes(q) || q.includes(norm(l)) )) return e
   }
   return null
 }
 
-// ====== Menú de uñas (filtrado por sede)
+// ====== Menú de uñas
 function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates){
   const nails = nailsServicesForSede(sedeKey, userMsg)
   const localScores = new Map()
@@ -737,7 +723,6 @@ function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates){
 }
 
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
-  // Si NO hay sede, primero pedir sede — evita listas gigantes y mezcla entre sedes
   if (!sessionData.sede){
     sessionData.pendingCategory = "unas"
     sessionData.stage = "awaiting_sede_for_services"
@@ -820,7 +805,6 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
   if (!staffId) { await sendWithPresence(sock, jid, "No hay profesionales disponibles en esa sede"); return; }
 
-  // Identidad por teléfono
   const { status, customer } = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid) || {}
   if (status === "need_new" || status === "need_pick") return
 
@@ -884,7 +868,7 @@ Referencia: ${result.booking.id}
   clearSession(phone);
 }
 
-// ====== Listar/cancelar por teléfono (igual que v26.9)
+// ====== Listar/cancelar por teléfono
 async function enumerateCitasByPhone(phone){
   const items=[]
   let cid=null
@@ -968,17 +952,16 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.0</h1>
+  <h1>🩷 Gapink Nails Bot v27.0.1</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v27.0:</strong><br>
-    • Lista de uñas filtrada por sede y sin colados<br>
-    • Pedicura solo cuando el cliente la pide<br>
-    • Intercepto “con {nombre}” con disponibilidad real por servicio<br>
+    <strong>🚀 Mejoras v27.0.1:</strong><br>
+    • Corregidos backticks escapados en plantillas (SyntaxError Node 20)<br>
+    • Resto de mejoras v27.0 intactas<br>
   </div>
   </div>`)
 })
@@ -1155,7 +1138,6 @@ async function startBot(){
               sessionData.preferredStaffId = staff.id
               sessionData.preferredStaffLabel = staff.labels[0]
               saveSession(phone, sessionData)
-              // Proponer de nuevo, ahora fijando staff
               await executeProposeTime({}, sessionData, phone, sock, jid)
               return
             } else {
@@ -1199,7 +1181,6 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     })
   }
 
-  // Resolver envKey si ya hay sede + label
   if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
     const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
     if (ek) sessionData.selectedServiceEnvKey = ek
@@ -1229,7 +1210,6 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     case "need_info":
     case "none":
     default:
-      // Si menciona uñas y no hay servicio, forzamos menú (filtrado por sede o pidiéndola)
       if (!sessionData.selectedServiceEnvKey && /\buñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul/i.test(textRaw)){
         await executeChooseService({ candidates: aiObj?.action_params?.candidates || [] }, sessionData, phone, sock, jid, textRaw)
       } else {
@@ -1239,7 +1219,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v27.0`)
+console.log(`🩷 Gapink Nails Bot v27.0.1`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
