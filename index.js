@@ -1,14 +1,9 @@
-// index.js — Gapink Nails · v26.4 (parches booleanos para SQLite)
-// Fixes CRÍTICOS:
-// - IA DeepSeek reforzada en TODOS los procesos
-// - Validación robusta antes de crear citas en Square
-// - Retry automático si falla la creación en Square
-// - Logs detallados de errores de Square
-// - Fallback inteligente si la IA falla
-// - Interceptar 1/2/3 ANTES de la IA → sin doble confirmación
-// - Priorizar profesional del slot elegido
-// - Sistema de respaldo si Square no responde
-// - FIX: booleans a enteros (0/1) para better-sqlite3
+// index.js — Gapink Nails · v26.5 (parches BigInt + logs seguros + hora estable)
+// Cambios v26.5:
+// - FIX: safeJSONStringify para BigInt/circulares en logs (Square responses/errors)
+// - FIX: logs protegidos en try/catch (no rompen el flujo si fallan)
+// - FIX: normalización robusta de pendingDateTime (si ya es dayjs)
+// - Mantiene arreglos previos: booleans -> 0/1 para SQLite
 
 import express from "express"
 import pino from "pino"
@@ -147,6 +142,23 @@ function proposeSlots({ fromEU, durationMin=60, n=3 }){
   return out
 }
 
+// ====== JSON seguro para logs (evita BigInt y circulares) — FIX
+function safeJSONStringify(value){
+  const seen = new WeakSet()
+  try{
+    return JSON.stringify(value, (_k, v)=>{
+      if (typeof v === "bigint") return v.toString()
+      if (typeof v === "object" && v !== null){
+        if (seen.has(v)) return "[Circular]"
+        seen.add(v)
+      }
+      return v
+    })
+  }catch{
+    try { return String(value) } catch { return "[Unserializable]" }
+  }
+}
+
 // ====== DB
 const db=new Database("gapink.db"); db.pragma("journal_mode = WAL")
 db.exec(`
@@ -221,7 +233,7 @@ function loadSession(phone){
 function saveSession(phone,s){
   const c={...s}
   c.lastHours_ms = Array.isArray(s.lastHours)? s.lastHours.map(d=>dayjs.isDayjs(d)?d.valueOf():null).filter(Boolean):[]
-  c.pendingDateTime_ms = s.pendingDateTime? s.pendingDateTime.valueOf(): null
+  c.pendingDateTime_ms = s.pendingDateTime? (dayjs.isDayjs(s.pendingDateTime)? s.pendingDateTime.valueOf() : dayjs(s.pendingDateTime).valueOf()) : null // FIX
   delete c.lastHours; delete c.pendingDateTime
   const j=JSON.stringify(c)
   const up=db.prepare(`UPDATE sessions SET data_json=@j, updated_at=@u WHERE phone=@p`).run({j,u:new Date().toISOString(),p:phone})
@@ -292,8 +304,10 @@ async function getServiceIdAndVersion(envKey){
   if (!id) return null
   if (!ver){
     try{ 
-      const resp=await square.catalogApi.retrieveCatalogObject(id,true); 
-      ver=resp?.result?.object?.version?Number(resp.result.object.version):1 
+      const resp=await square.catalogApi.retrieveCatalogObject(id,true)
+      // Puede venir como BigInt; lo normalizamos a Number seguro
+      const vRaw = resp?.result?.object?.version
+      ver = vRaw != null ? Number(vRaw) : 1 // FIX
     } catch(e) { 
       console.warn("No se pudo obtener versión del servicio", envKey, e.message)
       ver=1 
@@ -380,16 +394,20 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
       const resp = await square.bookingsApi.createBooking(requestData)
       const booking = resp?.result?.booking || null
       
-      // Log exitoso
-      insertSquareLog.run({
-        phone: phone || 'unknown',
-        action: 'create_booking',
-        request_data: JSON.stringify(requestData),
-        response_data: JSON.stringify(resp?.result || {}),
-        error_data: null,
-        timestamp: new Date().toISOString(),
-        success: 1 // FIX: boolean -> integer
-      })
+      // Log exitoso — protegido + BIGINT safe  // FIX
+      try{
+        insertSquareLog.run({
+          phone: phone || 'unknown',
+          action: 'create_booking',
+          request_data: safeJSONStringify(requestData),
+          response_data: safeJSONStringify(resp?.result || {}),
+          error_data: null,
+          timestamp: new Date().toISOString(),
+          success: 1
+        })
+      }catch(logErr){
+        console.warn("Log insert (success) falló, ignorado:", logErr?.message||logErr)
+      }
       
       if (booking) {
         console.log(`✅ Reserva creada exitosamente: ${booking.id}`)
@@ -399,16 +417,20 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
       lastError = e
       console.error(`❌ Intento ${attempt}/${SQUARE_MAX_RETRIES} falló:`, e?.message||e)
       
-      // Log del error
-      insertSquareLog.run({
-        phone: phone || 'unknown',
-        action: 'create_booking',
-        request_data: JSON.stringify({ attempt, envServiceKey, locationKey }),
-        response_data: null,
-        error_data: JSON.stringify({ message: e?.message, body: e?.body }),
-        timestamp: new Date().toISOString(),
-        success: 0 // FIX: boolean -> integer
-      })
+      // Log de error — protegido + BIGINT safe  // FIX
+      try{
+        insertSquareLog.run({
+          phone: phone || 'unknown',
+          action: 'create_booking',
+          request_data: safeJSONStringify({ attempt, envServiceKey, locationKey, startISO }),
+          response_data: null,
+          error_data: safeJSONStringify({ message: e?.message, body: e?.body }),
+          timestamp: new Date().toISOString(),
+          success: 0
+        })
+      }catch(logErr){
+        console.warn("Log insert (error) falló, ignorado:", logErr?.message||logErr)
+      }
       
       if (attempt < SQUARE_MAX_RETRIES) {
         await sleep(2000 * attempt) // Backoff progresivo más largo
@@ -622,7 +644,7 @@ async function callAIWithRetries(messages, systemPrompt=""){
   return null
 }
 
-// ====== Fallback local MEJORADO
+// ====== Fallback local MEJORADO (sin cambios relevantes)
 function buildLocalFallback(userMessage, sessionData){
   console.log("🔄 Usando fallback local por fallo de IA")
   const msg = String(userMessage||"").trim()
@@ -636,7 +658,6 @@ function buildLocalFallback(userMessage, sessionData){
   const hasCore = (s)=> s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime
   const haveIdentity = (s)=> !!(s?.name || s?.email)
 
-  // (1) Número con lastHours
   if (numMatch && Array.isArray(sessionData?.lastHours) && sessionData.lastHours.length){
     const idx = Number(numMatch[1]) - 1
     const pick = sessionData.lastHours[idx]
@@ -663,7 +684,6 @@ function buildLocalFallback(userMessage, sessionData){
     }
   }
 
-  // (2) Sí / ok
   if (yesMatch){
     if (hasCore(sessionData) && haveIdentity(sessionData)){
       return { message:"¡Voy a crear la reserva! ✨", action:"create_booking", session_updates:{}, action_params:{} }
@@ -682,7 +702,6 @@ function buildLocalFallback(userMessage, sessionData){
     }
   }
 
-  // (3) Cancelar (no si estás en medio de elegir hora/datos)
   if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")){
     return {
       message:"Vale, dime qué cita quieres cancelar o responde con el número cuando te la liste.",
@@ -692,12 +711,10 @@ function buildLocalFallback(userMessage, sessionData){
     }
   }
 
-  // (4) Listado
   if (listMatch){
     return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
   }
 
-  // (5) Reservar
   if (bookMatch){
     if (sessionData?.sede && sessionData?.selectedServiceEnvKey){
       return { message:"Te propongo horas disponibles:", action:"propose_times", session_updates:{ stage:"awaiting_time" }, action_params:{} }
@@ -807,7 +824,7 @@ ESTADO ACTUAL DE LA SESIÓN:
 - Sede: ${sessionData?.sede || 'no seleccionada'}
 - Servicio: ${sessionData?.selectedServiceLabel || 'no seleccionado'} (${sessionData?.selectedServiceEnvKey || 'no_key'})
 - Profesional preferida: ${sessionData?.preferredStaffLabel || 'ninguna'}
-- Fecha/hora pendiente: ${sessionData?.pendingDateTime ? fmtES(dayjs.tz(sessionData.pendingDateTime, EURO_TZ)) : 'no seleccionada'}
+- Fecha/hora pendiente: ${sessionData?.pendingDateTime ? fmtES(dayjs.isDayjs(sessionData.pendingDateTime) ? sessionData.pendingDateTime : dayjs.tz(sessionData.pendingDateTime, EURO_TZ)) : 'no seleccionada'}  // FIX
 - Nombre: ${sessionData?.name || 'no proporcionado'}
 - Email: ${sessionData?.email || 'no proporcionado'}
 - Etapa: ${sessionData?.stage || 'inicial'}
@@ -833,7 +850,6 @@ INSTRUCCIÓN: Procesa este mensaje y devuelve ÚNICAMENTE el JSON de respuesta.`
     return buildLocalFallback(userMessage, sessionData)
   }
 
-  // Limpiar y parsear respuesta de IA
   const cleaned = aiText
     .replace(/```json\s*/gi, "")
     .replace(/```\s*/g, "")
@@ -882,7 +898,6 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
   let slots = []
   let usedPreferred = false
 
-  // Intentar con profesional preferida primero
   if (sessionData.preferredStaffId) {
     console.log(`🔍 Buscando disponibilidad con profesional preferida: ${sessionData.preferredStaffId}`)
     const staffSlots = await searchAvailabilityForStaff({
@@ -901,7 +916,6 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     }
   }
 
-  // Si no hay slots con la preferida, buscar genérico
   if (!slots.length) {
     console.log(`🔍 Buscando disponibilidad genérica...`)
     const generic = await searchAvailabilityGeneric({
@@ -914,7 +928,6 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     console.log(`✅ Encontrados ${generic.length} slots genéricos`)
   }
 
-  // Fallback a slots propuestos localmente
   if (!slots.length) {
     console.log(`🔍 Usando slots propuestos localmente...`)
     const generalSlots = proposeSlots({ fromEU: baseFrom, durationMin: 60, n: 3 });
@@ -927,7 +940,6 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     return;
   }
 
-  // Guardado de mapeos
   const hoursEnum = enumerateHours(slots.map(s => s.date))
   const map = {}
   for (const s of slots) map[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
@@ -962,7 +974,6 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
 async function executeCreateBooking(params, sessionData, phone, sock, jid) {
   console.log("🎯 Iniciando creación de reserva...")
   
-  // Validaciones exhaustivas
   if (!sessionData.sede) { 
     await sendWithPresence(sock, jid, "Falta seleccionar la sede (Torremolinos o La Luz)"); 
     return; 
@@ -980,7 +991,11 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
     return;
   }
 
-  const startEU = dayjs.tz(sessionData.pendingDateTime, EURO_TZ);
+  // FIX: si ya es dayjs, respétalo; si es ISO/ms, normaliza
+  const startEU = dayjs.isDayjs(sessionData.pendingDateTime) 
+    ? sessionData.pendingDateTime.clone().tz(EURO_TZ) 
+    : dayjs.tz(sessionData.pendingDateTime, EURO_TZ)
+
   if (!insideBusinessHours(startEU, 60)) {
     await sendWithPresence(sock, jid, "Esa hora está fuera del horario de atención (L-V 09:00–20:00)");
     return;
@@ -992,7 +1007,6 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
   - Fecha: ${fmtES(startEU)}
   - Cliente: ${sessionData.name || sessionData.email}`)
 
-  // Elección de staff: priorizar el staff del slot elegido
   const iso = startEU.format("YYYY-MM-DDTHH:mm")
   let staffId = null
 
@@ -1004,7 +1018,6 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
     console.log(`👩‍💼 Usando staff del slot: ${staffId}`)
   }
 
-  // Búsqueda adicional si no hay staff
   if (!staffId) {
     console.log(`🔍 Buscando staff disponible para esa hora...`)
     const probe = await searchAvailabilityGeneric({
@@ -1021,7 +1034,6 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
     }
   }
   
-  // Fallback final
   if (!staffId) {
     staffId = pickStaffForLocation(sessionData.sede, null)
     console.log(`🎲 Staff fallback: ${staffId}`)
@@ -1032,7 +1044,6 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
     return; 
   }
 
-  // Crear/buscar cliente con retries
   console.log(`👤 Creando/buscando cliente...`)
   const customer = await findOrCreateCustomerWithRetry({ 
     name: sessionData.name, 
@@ -1047,7 +1058,6 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
   
   console.log(`✅ Cliente: ${customer.id}`)
 
-  // Crear reserva con retries
   console.log(`📅 Creando reserva en Square...`)
   const result = await createBookingWithRetry({
     startEU,
@@ -1061,8 +1071,6 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
 
   if (!result.success) { 
     console.error(`❌ Error creando reserva:`, result.error)
-    
-    // Guardar el intento fallido en BD
     const aptId = `apt_failed_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
     insertAppt.run({
       id: aptId,
@@ -1093,7 +1101,6 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
     return; 
   }
 
-  // Guardar en BD local
   const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
   insertAppt.run({
     id: aptId,
@@ -1105,7 +1112,7 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
     service_label: sessionData.selectedServiceLabel || "Servicio",
     duration_min: 60,
     start_iso: startEU.tz("UTC").toISOString(),
-    end_iso: startEU.clone().add(60, "minute").toISOString(),
+    end_iso: startEU.clone().add(60, "minute").tz("UTC").toISOString(), // FIX: guardar en UTC consistente
     staff_id: staffId,
     status: "confirmed",
     created_at: new Date().toISOString(),
@@ -1196,7 +1203,7 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v26.4</h1>
+  <h1>🩷 Gapink Nails Bot v26.5</h1>
   
   <div class="status ${conectado ? 'success' : 'error'}">
     Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}
@@ -1222,13 +1229,10 @@ app.get("/", (_req,res)=>{
   <p><strong>Ubicaciones:</strong> ${LOC_TORRE ? 'Torremolinos ✅' : 'Torremolinos ❌'} | ${LOC_LUZ ? 'La Luz ✅' : 'La Luz ❌'}</p>
   
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v26.4:</strong><br>
-    • IA DeepSeek reforzada en todos los procesos<br>
-    • Retry automático para Square API<br>
-    • Validación exhaustiva antes de crear citas<br>
-    • Logs detallados de errores<br>
-    • Interceptación 1/2/3 pre-IA<br>
-    • Sistema de respaldo robusto
+    <strong>🚀 Mejoras v26.5:</strong><br>
+    • Logs a prueba de BigInt y circulares<br>
+    • Logs no bloquean reservas<br>
+    • Hora consolidada sin desfaces<br>
   </div>
   </div>`)
 })
@@ -1331,7 +1335,6 @@ async function startBot(){
             stage: null
           }
           
-          // Evitar procesar el mismo mensaje dos veces
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
           
@@ -1340,7 +1343,7 @@ async function startBot(){
             console.log("[DEBUG] Session before:", sessionData)
           }
 
-          // === PRE-INTERCEPT: selección 1/2/3 ANTES de la IA ===
+          // PRE-INTERCEPT 1/2/3
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-5])\b/)
           
@@ -1362,32 +1365,37 @@ async function startBot(){
               sessionData.stage = (sessionData.name || sessionData.email) ? null : "awaiting_identity"
               saveSession(phone, sessionData)
               
-              // Ejecutar directamente sin IA
               const okToCreate = sessionData.sede && sessionData.selectedServiceEnvKey && 
                                sessionData.pendingDateTime && (sessionData.name || sessionData.email)
               
               const aiObj = okToCreate 
-                ? { 
-                    message:"Perfecto, confirmo tu cita ✨", 
-                    action:"create_booking", 
-                    session_updates:{}, 
-                    action_params:{} 
-                  }
-                : { 
-                    message:"Genial. Dime tu nombre completo para finalizar la reserva.", 
-                    action:"need_info", 
-                    session_updates:{}, 
-                    action_params:{} 
-                  }
+                ? { message:"Perfecto, confirmo tu cita ✨", action:"create_booking", session_updates:{}, action_params:{} }
+                : { message:"Genial. Dime tu nombre completo para finalizar la reserva.", action:"need_info", session_updates:{}, action_params:{} }
               
               await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
               return
             }
           }
 
-          // === PROCESAR CON IA O FALLBACK ===
+          // IA normal
           console.log(`🤖 Procesando con IA...`)
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
+          
+          // Guardar conversación — usar safe stringify por si acaso  // FIX
+          const fallbackUsedBool = !!aiObj.__fallback_used
+          insertAIConversation.run({
+            phone,
+            message_id: m.key.id,
+            user_message: textRaw,
+            ai_response: safeJSONStringify(aiObj),               // FIX
+            timestamp: new Date().toISOString(),
+            session_data: safeJSONStringify(sessionData),         // FIX
+            ai_error: (typeof aiObj.__ai_error === "string" || aiObj.__ai_error == null) 
+              ? (aiObj.__ai_error ?? null) 
+              : safeJSONStringify(aiObj.__ai_error),             // FIX
+            fallback_used: Number(fallbackUsedBool)
+          })
+
           await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
 
         } catch (error) {
@@ -1398,7 +1406,6 @@ async function startBot(){
     })
   }catch(e){ 
     console.error("❌ Error startBot:", e?.message||e) 
-    // Reintentar después de un delay
     setTimeout(() => startBot().catch(console.error), 5000)
   }
 }
@@ -1406,7 +1413,6 @@ async function startBot(){
 async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   if (BOT_DEBUG) console.log("[DEBUG] AI response:", aiObj)
 
-  // Aplicar actualizaciones de sesión
   if (aiObj.session_updates) {
     Object.keys(aiObj.session_updates).forEach(key => {
       if (aiObj.session_updates[key] !== null && aiObj.session_updates[key] !== undefined) {
@@ -1416,24 +1422,8 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     })
   }
 
-  // Guardar conversación en BD
-  const fallbackUsedBool = !!aiObj.__fallback_used // asegura boolean
-  insertAIConversation.run({
-    phone,
-    message_id: m.key.id,
-    user_message: textRaw,
-    ai_response: JSON.stringify(aiObj),
-    timestamp: new Date().toISOString(),
-    session_data: JSON.stringify(sessionData),
-    ai_error: (typeof aiObj.__ai_error === "string" || aiObj.__ai_error == null) 
-      ? (aiObj.__ai_error ?? null) 
-      : JSON.stringify(aiObj.__ai_error), // FIX: asegurar string|null
-    fallback_used: Number(fallbackUsedBool) // FIX: boolean -> integer
-  })
-  
   saveSession(phone, sessionData)
 
-  // Ejecutar acción correspondiente
   console.log(`🎬 Ejecutando acción: ${aiObj.action}`)
   
   switch (aiObj.action) {
@@ -1464,7 +1454,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 // ====== Arranque del servidor
 console.log(`
 🩷 ===================================
-   GAPINK NAILS BOT v26.4
+   GAPINK NAILS BOT v26.5
 🩷 ===================================
 
 🔧 Configuración:
@@ -1480,14 +1470,10 @@ console.log(`
    • Torremolinos: ${LOC_TORRE ? '✅' : '❌'}
    • La Luz: ${LOC_LUZ ? '✅' : '❌'}
 
-🚀 Mejoras v26.4:
-   • IA reforzada con timeout y retries
-   • Retry automático para Square API
-   • Validación exhaustiva pre-reserva
-   • Logs detallados de errores
-   • Interceptación 1/2/3 optimizada
-   • Sistema de respaldo robusto
-
+🚀 Mejoras v26.5:
+   • Logs a prueba de BigInt
+   • Logs no bloquean reservas
+   • Hora estable sin desfaces
 🩷 ===================================
 `)
 
@@ -1500,19 +1486,14 @@ app.listen(PORT, ()=>{
 // ====== Manejo de señales
 process.on("uncaughtException", (e)=>{
   console.error("💥 uncaughtException:", e?.stack||e?.message||e)
-  // No hacer exit, dejar que continue
 })
-
 process.on("unhandledRejection", (e)=>{
   console.error("💥 unhandledRejection:", e)
-  // No hacer exit, dejar que continue
 })
-
 process.on("SIGTERM", ()=>{ 
   console.log("🛑 SIGTERM recibido, cerrando gracefully..."); 
   process.exit(0) 
 })
-
 process.on("SIGINT", ()=>{ 
   console.log("🛑 SIGINT recibido, cerrando gracefully..."); 
   process.exit(0) 
