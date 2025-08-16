@@ -1,5 +1,10 @@
-// index.js — Gapink Nails · v13.3
-// “IA robusta • 2 locales • preferencia de técnica estricta • cancelación • Square-safe”
+// index.js — Gapink Nails · v13.2
+// “IA robusta • 2 locales • elección de técnica • Square-safe • sesión estable”
+//
+// Cambios clave v13.2:
+//  - lastOptions se persiste como lastOptions_ms y se rehidrata a dayjs (adiós .format/.clone undefined)
+//  - selectedStartEU se rehace a dayjs si llega como string/number
+//  - coerción defensiva de arrays de opciones antes de usarlas
 
 import express from "express"
 import pino from "pino"
@@ -34,10 +39,11 @@ const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
 const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,01/11,06/12,08/12,25/12")
   .split(",").map(s => s.trim()).filter(Boolean)
 
-// ====== OpenAI (IA para extracción ultra-cauta de email)
+// ====== OpenAI (IA para extracción ultra-cauta de nombre/email)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini"
 const OPENAI_API_URL = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
+
 async function aiChat(messages, { temperature=0.2 } = {}) {
   if (!OPENAI_API_KEY) return ""
   try {
@@ -85,10 +91,6 @@ function normalizePhoneES(raw){
 
 const YES_RE = /\b(s[ií]|ok|vale|okey|okay|va|genial|de acuerdo|confirmo|perfecto|si claro|sí claro|yes)\b/i
 const NO_RE  = /\b(no|otra|cambia|cambiar|cancel|cancela|anula|mejor mas tarde|mejor más tarde)\b/i
-
-// Cancel/Reschedule intents
-const CANCEL_RE = /\b(cancel(a(r|me|la)?|ar|la)|anul(a(r|me|la)?)|borra(r|me|la)?|quitar (la )?cita|delete appointment)\b/i
-const RESCH_RE  = /\b(cambia(r|me|la)?|mover|reprogram(a(r|me|la)?)|aplaza(r)?)\b/i
 
 // Detección local
 function detectLocation(text){
@@ -175,15 +177,16 @@ const insertAppt = db.prepare(`INSERT INTO appointments
 (id, customer_name, customer_phone, customer_square_id, location_key, service_key, service_name, duration_min, start_iso, end_iso, staff_id, status, created_at, square_booking_id)
 VALUES (@id,@customer_name,@customer_phone,@customer_square_id,@location_key,@service_key,@service_name,@duration_min,@start_iso,@end_iso,@staff_id,@status,@created_at,@square_booking_id)`)
 const updateApptStatus = db.prepare(`UPDATE appointments SET status=@status, square_booking_id=@square_booking_id WHERE id=@id`)
-const markCancelled = db.prepare(`UPDATE appointments SET status='cancelled' WHERE id=@id`)
-const getUpcomingByPhone = db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso ASC LIMIT 1`)
 
 function loadSession(phone){
   const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
   if (!row?.data_json) return null
   const json = JSON.parse(row.data_json)
+
+  // Rehidratación robusta
   if (json.startEU_ms) json.startEU = dayjs.tz(json.startEU_ms, EURO_TZ)
   if (json.selectedStartEU_ms) json.selectedStartEU = dayjs.tz(json.selectedStartEU_ms, EURO_TZ)
+  // lastOptions: si vienen como ms -> dayjs; si vienen como strings ISO (versiones previas), también
   if (Array.isArray(json.lastOptions_ms) && json.lastOptions_ms.length){
     json.lastOptions = json.lastOptions_ms.map(ms => dayjs.tz(ms, EURO_TZ))
   } else if (Array.isArray(json.lastOptions) && json.lastOptions.length){
@@ -195,10 +198,12 @@ function loadSession(phone){
 }
 function saveSession(phone, data){
   const d={...data}
+  // Persistimos en milisegundos y NO guardamos objetos dayjs crudos
   d.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null
   d.selectedStartEU_ms = data.selectedStartEU?.valueOf?.() ?? data.selectedStartEU_ms ?? null
   d.lastOptions_ms = Array.isArray(data.lastOptions) ? data.lastOptions.map(o => toDayjsEU(o)?.valueOf?.() ?? null).filter(Boolean) : []
   delete d.startEU; delete d.selectedStartEU; delete d.lastOptions
+
   const j = JSON.stringify(d)
   const upd = db.prepare(`UPDATE sessions SET data_json=@data_json, updated_at=@updated_at WHERE phone=@phone`)
   const res = upd.run({ phone, data_json:j, updated_at:new Date().toISOString() })
@@ -232,10 +237,10 @@ function parseEmployees(){
   return out
 }
 const EMPLOYEES = parseEmployees()
-const ID2LABEL = Object.fromEntries(EMPLOYEES.map(e => [e.id, (e.labels[0]||"")]))
 
 function detectPreferredStaff(text, locKey){
   const t = norm(text)
+  const locId = locationToId(locKey||"torre")
   let cand = null
   for (const e of EMPLOYEES){
     if (e.labels.some(lbl => t.includes(lbl))){
@@ -243,7 +248,6 @@ function detectPreferredStaff(text, locKey){
     }
   }
   if (!cand) return null
-  const locId = locationToId(locKey||"torre")
   if (!cand.bookable || !(cand.allow.includes("ALL") || cand.allow.includes(locId))) {
     return { id: null, preferId: cand.id, preferLabel: (cand.labels[0]||"") }
   }
@@ -258,11 +262,6 @@ function pickStaffForLocation(locKey, preferId=null){
   }
   const found = EMPLOYEES.find(e=>e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
   return found?.id || null
-}
-function preferredValidForLoc(preferId, locKey){
-  const locId = locationToId(locKey)
-  const e = EMPLOYEES.find(x=>x.id===preferId)
-  return !!(e && e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
 }
 
 // ====== Servicios
@@ -370,15 +369,25 @@ async function createSquareBooking({ startEU, serviceKey, locationKey, customerI
     return resp?.result?.booking || null
   }catch(e){ console.error("createSquareBooking:", e?.message||e); return null }
 }
-async function cancelSquareBooking(bookingId){
+
+// ====== Clientes Square
+function isValidEmail(e){ return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e||"").trim()) }
+async function squareFindCustomerByPhone(phoneRaw){
   try{
-    const get = await square.bookingsApi.retrieveBooking(bookingId)
-    const version = get?.result?.booking?.version
-    if (!version) return false
-    const body = { idempotencyKey:`cancel_${bookingId}_${Date.now()}`, bookingVersion: version }
-    const r = await square.bookingsApi.cancelBooking(bookingId, body)
-    return !!r?.result?.booking?.id
-  }catch(e){ console.error("cancelSquareBooking:", e?.message||e); return false }
+    const e164=normalizePhoneES(phoneRaw); if(!e164) return null
+    const resp=await square.customersApi.searchCustomers({ query:{ filter:{ phoneNumber:{ exact:e164 } } } })
+    return (resp?.result?.customers||[])[0]||null
+  }catch{ return null }
+}
+async function squareCreateCustomer({ givenName, emailAddress, phoneNumber }){
+  try{
+    if (!isValidEmail(emailAddress)) return null
+    const resp=await square.customersApi.createCustomer({
+      idempotencyKey:`cust_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+      givenName, emailAddress, phoneNumber
+    })
+    return resp?.result?.customer||null
+  }catch(e){ console.error("squareCreateCustomer:", e?.message||e); return null }
 }
 
 // ====== Propuestas de hora (no availability)
@@ -595,7 +604,6 @@ async function startBot(){
         locationKey:null, serviceKey:null, durationMin:null,
         lastOptions:[], pendingConfirm:false,
         selectedStartEU:null, preferredStaffId:null, preferredStaffLabel:null,
-        awaitingStaffChoice:false, suggestedFallbackId:null,
         name:null, email:null, awaitingName:false, awaitingEmail:false
       }
 
@@ -605,29 +613,7 @@ async function startBot(){
         s.greeted=true; saveSession(phone,s)
       }
 
-      // ===== INTENTOS DE CANCELAR / REPROGRAMAR (prioridad ALTA)
-      if (CANCEL_RE.test(low)){
-        const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
-        if (upc?.square_booking_id){
-          const ok = await cancelSquareBooking(upc.square_booking_id)
-          if (ok){ markCancelled.run({ id: upc.id }); clearSession(phone)
-            await sock.sendMessage(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` })
-            return
-          }
-        }
-        if (upc){ markCancelled.run({ id: upc.id }); clearSession(phone)
-          await sock.sendMessage(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` })
-          return
-        }
-        await sock.sendMessage(from,{ text:"No veo ninguna cita futura para cancelar ahora mismo." })
-        return
-      }
-      if (RESCH_RE.test(low)){
-        await sock.sendMessage(from,{ text:"Dime la nueva *fecha y hora* (ej.: “lunes 10:00”) y te la cambio." })
-        // (la lógica de reprogramar completa se puede añadir si la usáis mucho)
-      }
-
-      // ===== Fuera de horario ⇒ aviso 1 vez/día (sin bloquear acciones)
+      // ===== Fuera de horario ⇒ aviso 1 vez/día
       const nowEU = dayjs().tz(EURO_TZ)
       const isOpenNow = insideBusinessHours(nowEU.clone(), 15)
       const todayKey = nowEU.format("YYYY-MM-DD")
@@ -730,41 +716,6 @@ ${list}
         saveSession(phone,s); return
       }
 
-      // ===== Si pidió técnica concreta, comprueba validez en ese local (modo *estricto*)
-      if (s.preferredStaffId && !preferredValidForLoc(s.preferredStaffId, s.locationKey)){
-        const fallbackId = pickStaffForLocation(s.locationKey, null)
-        const fallbackName = ID2LABEL[fallbackId] || "otra técnica"
-        await sock.sendMessage(from,{ text:
-`*${s.preferredStaffLabel}* no tiene agenda en *${locationNice(s.locationKey)}*.
-¿Te reservo con *${fallbackName}* en ese salón, o prefieres cambiar a *${locationNice(s.locationKey==="luz"?"torre":"luz")}*?` })
-        s.awaitingStaffChoice = true
-        s.suggestedFallbackId = fallbackId
-        saveSession(phone,s); return
-      }
-
-      // ===== Resolver elección de staff si venimos del prompt anterior
-      if (s.awaitingStaffChoice){
-        if (detectLocation(text)){ // ha dicho cambiar de sede
-          s.locationKey = detectLocation(text)
-          s.awaitingStaffChoice = false
-          s.suggestedFallbackId = null
-          saveSession(phone,s)
-          await sock.sendMessage(from,{ text:`Ok, cambiamos a *${locationNice(s.locationKey)}*. Te propongo horas nuevas si hace falta.` })
-        } else if (YES_RE.test(text)) { // acepta fallback
-          s.preferredStaffId = s.suggestedFallbackId
-          s.awaitingStaffChoice = false
-          s.suggestedFallbackId = null
-          saveSession(phone,s)
-        } else if (NO_RE.test(text)) {
-          await sock.sendMessage(from,{ text:`Dime si prefieres otra profesional o cambia de salón (Málaga – La Luz / Torremolinos).` })
-          return
-        } else {
-          // No claro: seguimos pidiendo
-          await sock.sendMessage(from,{ text:`¿Confirmo con *${ID2LABEL[s.suggestedFallbackId] || "otra técnica"}* en *${locationNice(s.locationKey)}*? (Responde “sí” o di otra opción).` })
-          return
-        }
-      }
-
       // ===== Cierre: nombre/email/cliente/booking
       let customer = await squareFindCustomerByPhone(phone)
       if (!customer){
@@ -795,8 +746,8 @@ ${list}
         }
       }
 
-      // Staff final (respeta preferencia si válida; si no había preferencia, elige cualquiera del salón)
-      let teamId = s.preferredStaffId ? pickStaffForLocation(s.locationKey, s.preferredStaffId) : pickStaffForLocation(s.locationKey, null)
+      // Staff final
+      const teamId = pickStaffForLocation(s.locationKey, s.preferredStaffId)
       if (!teamId){
         await sock.sendMessage(from,{ text:"Ahora mismo no puedo asignar profesional para ese salón. ¿Te da igual con quién?" })
         return
@@ -832,7 +783,7 @@ ${list}
       await sock.sendMessage(from,{ text:
 `Reserva confirmada 🎉
 Salón: ${locationNice(s.locationKey)} (${locationToAddress(s.locationKey)})
-Servicio: ${SVC[s.serviceKey].name}${s.preferredStaffId?`\nProfesional: ${ID2LABEL[s.preferredStaffId] || "asignación"}`:""}
+Servicio: ${SVC[s.serviceKey].name}${s.preferredStaffLabel?`\nProfesional: ${s.preferredStaffLabel} (si está disponible)`:``}
 Fecha: ${fmtES(startEU)}
 Duración: ${s.durationMin} min
 Pago en persona.` })
