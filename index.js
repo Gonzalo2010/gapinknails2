@@ -1,7 +1,6 @@
-// index.js — Gapink Nails · v26.0
-// Cambio clave: si Square devuelve 400 por staff sin servicio, buscamos disponibilidad GENÉRICA
-// (sin filtrar por staff), guardamos el teamMemberId por slot y lo usamos al reservar.
-// TODO pasa por IA, pero ejecución (propose/reserve/cancel) es robusta frente a errores de Square.
+// index.js — Gapink Nails · v26.1
+// Horario continuo L-V 09:00–20:00 (sin corte). Disponibilidad robusta (Square → genérica → fallback local).
+// IA propone; ejecución segura: propone/crea/cancela sin romperse si Square da 400 por staff/servicio.
 
 import express from "express"
 import pino from "pino"
@@ -22,11 +21,10 @@ if (!globalThis.crypto) globalThis.crypto = webcrypto
 dayjs.extend(utc); dayjs.extend(tz); dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
 
-// ====== Config horario
-const WORK_DAYS = [1,2,3,4,5]
+// ====== Config horario (continuo)
+const WORK_DAYS = [1,2,3,4,5]                 // L-V
 const SLOT_MIN = 30
-const MORNING = { start:10, end:14 }
-const AFTERNOON = { start:16, end:20 }
+const OPEN = { start: 9, end: 20 }            // 09:00–20:00
 const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
 const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,01/11,06/12,08/12,25/12")
   .split(",").map(s=>s.trim()).filter(Boolean)
@@ -67,25 +65,54 @@ function locationToId(key){ return key==="la_luz" ? LOC_LUZ : LOC_TORRE }
 function idToLocKey(id){ return id===LOC_LUZ ? "la_luz" : id===LOC_TORRE ? "torremolinos" : null }
 function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torremolinos" }
 
-// ====== Horario helpers
-function isHolidayEU(d){ const dd=String(d.date()).padStart(2,"0"), mm=String(d.month()+1).padStart(2,"0"); return HOLIDAYS_EXTRA.includes(`${dd}/${mm}`) }
-function insideBlock(d,b){ return d.hour()>=b.start && d.hour()<b.end }
-function insideBusinessHours(d,dur){
-  const t=d.clone(); if (!WORK_DAYS.includes(t.day())) return false; if (isHolidayEU(t)) return false
-  const end=t.clone().add(dur,"minute")
-  return (insideBlock(t,MORNING)&&insideBlock(end,MORNING)&&t.isSame(end,"day")) || (insideBlock(t,AFTERNOON)&&insideBlock(end,AFTERNOON)&&t.isSame(end,"day"))
+// ====== Horario helpers (continuo)
+function isHolidayEU(d){
+  const dd=String(d.date()).padStart(2,"0"), mm=String(d.month()+1).padStart(2,"0")
+  return HOLIDAYS_EXTRA.includes(`${dd}/${mm}`)
 }
+
+function insideBusinessHours(d,dur){
+  const t=d.clone()
+  if (!WORK_DAYS.includes(t.day())) return false
+  if (isHolidayEU(t)) return false
+  const end=t.clone().add(dur,"minute")
+  if (!t.isSame(end,"day")) return false
+  const startMin = t.hour()*60 + t.minute()
+  const endMin   = end.hour()*60 + end.minute()
+  const openMin  = OPEN.start*60
+  const closeMin = OPEN.end*60
+  return startMin >= openMin && endMin <= closeMin
+}
+
 function nextOpeningFrom(d){
   let t=d.clone()
-  if (t.hour()>=AFTERNOON.end) t=t.add(1,"day").hour(MORNING.start).minute(0).second(0).millisecond(0)
-  else if (t.hour()>=MORNING.end && t.hour()<AFTERNOON.start) t=t.hour(AFTERNOON.start).minute(0).second(0).millisecond(0)
-  else if (t.hour()<MORNING.start) t=t.hour(MORNING.start).minute(0).second(0).millisecond(0)
-  while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) t=t.add(1,"day").hour(MORNING.start).minute(0).second(0).millisecond(0)
+  const nowMin = t.hour()*60 + t.minute()
+  const openMin= OPEN.start*60
+  const closeMin=OPEN.end*60
+  // si antes de abrir -> poner a apertura
+  if (nowMin < openMin) t = t.hour(OPEN.start).minute(0).second(0).millisecond(0)
+  // si ya cerró -> siguiente día laborable a apertura
+  if (nowMin >= closeMin) t = t.add(1,"day").hour(OPEN.start).minute(0).second(0).millisecond(0)
+  // asegurar día laborable/no festivo
+  while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) {
+    t = t.add(1,"day").hour(OPEN.start).minute(0).second(0).millisecond(0)
+  }
   return t
 }
-function ceilToSlotEU(t){ const m=t.minute(), rem=m%SLOT_MIN; return rem===0 ? t.second(0).millisecond(0) : t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0) }
-function fmtES(d){ const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]; const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ); return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")} ${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}` }
+
+function ceilToSlotEU(t){
+  const m=t.minute(), rem=m%SLOT_MIN
+  return rem===0 ? t.second(0).millisecond(0) : t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)
+}
+
+function fmtES(d){
+  const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]
+  const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ)
+  return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")} ${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}`
+}
+
 function enumerateHours(list){ return list.map((d,i)=>({ index:i+1, iso:d.format("YYYY-MM-DDTHH:mm"), pretty:fmtES(d) })) }
+
 function stableKey(parts){ const raw=Object.values(parts).join("|"); return createHash("sha256").update(raw).digest("hex").slice(0,48) }
 
 function proposeSlots({ fromEU, durationMin=60, n=3 }){
@@ -97,10 +124,17 @@ function proposeSlots({ fromEU, durationMin=60, n=3 }){
       out.push(t.clone())
       t=t.add(SLOT_MIN,"minute")
     } else {
-      if (t.hour()>=AFTERNOON.end) t=t.add(1,"day").hour(MORNING.start).minute(0)
-      else if (t.hour()>=MORNING.end && t.hour()<AFTERNOON.start) t=t.hour(AFTERNOON.start).minute(0)
-      else t=t.add(SLOT_MIN,"minute")
-      while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) t=t.add(1,"day").hour(MORNING.start).minute(0)
+      // si estamos fuera de horario, saltar a la próxima apertura del mismo día o siguiente
+      const nowMin = t.hour()*60 + t.minute()
+      const closeMin = OPEN.end*60
+      if (nowMin >= closeMin){
+        t = t.add(1,"day").hour(OPEN.start).minute(0).second(0).millisecond(0)
+      } else {
+        t = t.add(SLOT_MIN,"minute")
+      }
+      while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) {
+        t = t.add(1,"day").hour(OPEN.start).minute(0).second(0).millisecond(0)
+      }
     }
   }
   return out
@@ -324,7 +358,7 @@ async function enumerateCitasByPhone(phone){
   return items
 }
 
-// ====== DISPONIBILIDAD
+// ====== DISPONIBILIDAD (Square → genérica → fallback)
 async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId, fromEU, days=14, n=3, distinctDays=false }){
   try{
     const sv = await getServiceIdAndVersion(envServiceKey)
@@ -357,13 +391,11 @@ async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId,
         if (seenDays.has(key)) continue
         seenDays.add(key)
       }
-      // devolvemos como objetos (date, staffId)
       slots.push({ date:d, staffId })
       if (slots.length>=n) break
     }
     return slots
   }catch(e){
-    // Caso típico: el staff no tiene ese service variation
     if (BOT_DEBUG) {
       console.error("searchAvailabilityForStaff error details:", {
         message: e?.message,
@@ -372,7 +404,6 @@ async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId,
         errors: e?.errors
       })
     }
-    // Devolver vacío para que el caller intente la genérica
     return []
   }
 }
@@ -402,7 +433,6 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
       const d = dayjs.tz(a.startAt, EURO_TZ)
       if (!insideBusinessHours(d,60)) continue
       let tm = null
-      // Square devuelve los segmentos con el teamMemberId; intentamos varias formas
       const segs = Array.isArray(a.appointmentSegments) ? a.appointmentSegments
                  : Array.isArray(a.segments) ? a.segments
                  : []
@@ -417,9 +447,7 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
     }
     return slots
   }catch(e){
-    if (BOT_DEBUG) {
-      console.error("searchAvailabilityGeneric error:", e?.message||e, e?.body||"")
-    }
+    if (BOT_DEBUG) console.error("searchAvailabilityGeneric error:", e?.message||e, e?.body||"")
     return []
   }
 }
@@ -430,7 +458,6 @@ async function callAI(messages, systemPrompt = "") {
     const allMessages = systemPrompt ? 
       [{ role: "system", content: systemPrompt }, ...messages] : 
       messages;
-      
     const response = await fetch("https://api.deepseek.com/chat/completions", {
       method: "POST",
       headers: {
@@ -445,16 +472,13 @@ async function callAI(messages, systemPrompt = "") {
         stream: false
       })
     });
-    
     if (!response.ok) {
       const errorText = await response.text();
       console.error("DeepSeek API Error:", response.status, errorText);
       return "Error de conexión con IA. Por favor intenta de nuevo.";
     }
-    
     const data = await response.json();
     return data.choices?.[0]?.message?.content || "Error en respuesta de IA";
-    
   } catch (error) {
     console.error("Error calling DeepSeek AI:", error);
     return "Error de conexión con IA. Por favor intenta de nuevo.";
@@ -469,10 +493,8 @@ function buildSystemPrompt() {
     bookable: e.bookable, 
     locations: e.allow 
   }));
-  
   const torremolinos_services = servicesForSedeKeyRaw("torremolinos");
   const laluz_services = servicesForSedeKeyRaw("la_luz");
-  
   return `Eres el asistente de WhatsApp para Gapink Nails, un salón de belleza con dos sedes:
 
 SEDES:
@@ -480,7 +502,7 @@ SEDES:
 - Málaga – La Luz: ${ADDRESS_LUZ}
 
 HORARIOS:
-- Lunes a Viernes: 10:00-14:00 y 16:00-20:00
+- Lunes a Viernes: 09:00-20:00 (continuo)
 - Cerrado sábados y domingos
 - Festivos especiales: ${HOLIDAYS_EXTRA.join(", ")}
 
@@ -532,8 +554,6 @@ Sé natural, amable y eficiente. Siempre confirma los datos clave antes de crear
 
 async function getAIResponse(userMessage, sessionData, phone) {
   const systemPrompt = buildSystemPrompt();
-  
-  // Obtener conversación reciente para contexto
   const recentMessages = db.prepare(`
     SELECT user_message, ai_response 
     FROM ai_conversations 
@@ -541,12 +561,10 @@ async function getAIResponse(userMessage, sessionData, phone) {
     ORDER BY timestamp DESC 
     LIMIT 5
   `).all(phone);
-  
   const conversationHistory = recentMessages.reverse().map(msg => [
     { role: "user", content: msg.user_message },
     { role: "assistant", content: msg.ai_response }
   ]).flat();
-  
   const messages = [
     ...conversationHistory,
     { 
@@ -557,17 +575,11 @@ Estado actual de sesión:
 ${JSON.stringify(sessionData, null, 2)}` 
     }
   ];
-  
   const aiResponse = await callAI(messages, systemPrompt);
-  
   try {
     let cleanedResponse = aiResponse;
-    if (cleanedResponse.includes('```json')) {
-      cleanedResponse = cleanedResponse.replace(/```json\s*/g, '').replace(/\s*```/g, '');
-    }
-    if (cleanedResponse.includes('```')) {
-      cleanedResponse = cleanedResponse.replace(/```\s*/g, '').replace(/\s*```/g, '');
-    }
+    if (cleanedResponse.includes('```json')) cleanedResponse = cleanedResponse.replace(/```json\s*/g, '').replace(/\s*```/g, '');
+    if (cleanedResponse.includes('```')) cleanedResponse = cleanedResponse.replace(/```\s*/g, '').replace(/\s*```/g, '');
     cleanedResponse = cleanedResponse.trim();
     if (BOT_DEBUG) {
       console.log("[DEBUG] Raw AI response:", aiResponse);
@@ -611,17 +623,14 @@ async function sendWithPresence(sock, jid, text){
   return sock.sendMessage(jid, { text })
 }
 
-// ====== Funciones de ejecución de acciones
+// ====== Acciones
 async function executeProposeTime(params, sessionData, phone, sock, jid) {
   const nowEU = dayjs().tz(EURO_TZ);
   const baseFrom = nextOpeningFrom(nowEU.add(NOW_MIN_OFFSET_MIN, "minute"));
-  
   if (!sessionData.sede || !sessionData.selectedServiceEnvKey) {
     await sendWithPresence(sock, jid, "Necesito que me digas la sede y el servicio primero.");
     return;
   }
-
-  // 1) Intentar con staff preferido (si existe)
   let slots = []
   if (sessionData.preferredStaffId) {
     if (BOT_DEBUG) console.log("Buscando disponibilidad por staff preferido:", sessionData.preferredStaffId)
@@ -632,10 +641,8 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
       fromEU: baseFrom,
       n: 3
     })
-    slots = staffSlots // [{date, staffId}]
+    slots = staffSlots
   }
-
-  // 2) Si no hay, intentar disponibilidad genérica en Square (sin staff)
   if (!slots.length) {
     if (BOT_DEBUG) console.log("Buscando disponibilidad genérica en Square")
     const generic = await searchAvailabilityGeneric({
@@ -646,27 +653,21 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     })
     slots = generic
   }
-
-  // 3) Fallback: proponer slots locales (sin staff asignado)
   if (!slots.length) {
     if (BOT_DEBUG) console.log("Usando fallback local de horas")
     const generalSlots = proposeSlots({ fromEU: baseFrom, durationMin: 60, n: 3 });
     slots = generalSlots.map(d => ({ date: d, staffId: null }))
   }
-
   if (!slots.length) {
     await sendWithPresence(sock, jid, "No encuentro horarios disponibles en los próximos días. ¿Te interesa otra fecha?");
     return;
   }
-
-  // Guardar slots y mapear ISO->staff para que la IA pueda elegir 1/2/3 y luego reservar con el staff correcto.
   const hoursEnum = enumerateHours(slots.map(s => s.date))
   const map = {}
   for (const s of slots) map[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
   sessionData.lastHours = slots.map(s => s.date)
   sessionData.lastStaffByIso = map
   saveSession(phone, sessionData)
-
   const staffText = sessionData.preferredStaffLabel || "nuestro equipo"
   const message = `Horarios disponibles con ${staffText}:\n${hoursEnum.map(h => `${h.index}) ${h.pretty}`).join("\n")}\n\nResponde con el número (1, 2 o 3)`
   await sendWithPresence(sock, jid, message);
@@ -678,12 +679,19 @@ async function executeCreateBooking(params, sessionData, phone, sock, jid) {
   if (!sessionData.pendingDateTime) { await sendWithPresence(sock, jid, "Falta seleccionar la fecha y hora"); return; }
 
   const startEU = dayjs.tz(sessionData.pendingDateTime, EURO_TZ);
+
+  if (BOT_DEBUG) {
+    console.log("[DEBUG] Validando horario:", {
+      start: startEU.format(),
+      inside: insideBusinessHours(startEU, 60)
+    })
+  }
+
   if (!insideBusinessHours(startEU, 60)) {
-    await sendWithPresence(sock, jid, "Esa hora está fuera del horario de atención (L-V 10-14, 16-20)");
+    await sendWithPresence(sock, jid, "Esa hora está fuera del horario de atención (L-V 09:00–20:00)");
     return;
   }
 
-  // Resolver staff: 1) preferido, 2) del slot ofrecido por Square, 3) buscar genérico ese mismo minuto, 4) pick de sede
   let staffId = sessionData.preferredStaffId || null
   if (!staffId && sessionData.lastStaffByIso) {
     const iso = startEU.format("YYYY-MM-DDTHH:mm")
@@ -791,12 +799,13 @@ app.get("/", (_req,res)=>{
   res.send(`<!doctype html><meta charset="utf-8"><style>
   body{font-family:system-ui;display:grid;place-items:center;min-height:100vh}
   .card{max-width:560px;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08)}
-  </style><div class="card"><h1>Gapink Nails v26.0</h1>
+  </style><div class="card"><h1>Gapink Nails v26.1</h1>
   <p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>
   ${!conectado&&lastQR?`<img src="/qr.png" width="300">`:""}
   <p style="opacity:.7">Modo: ${DRY_RUN?"Simulación (no toca Square)":"Producción"}</p>
+  <p style="opacity:.7">Horario: L-V 09:00–20:00</p>
   <p style="opacity:.7">IA: DeepSeek (${AI_MODEL})</p>
-  <p style="color:#e74c3c">🤖 Lógica robusta de disponibilidad (Square → genérica → fallback local)</p>
+  <p style="color:#e74c3c">🤖 Disponibilidad: Square → genérica → fallback local</p>
   </div>`)
 })
 
@@ -873,22 +882,16 @@ async function startBot(){
             name: null,
             email: null,
             last_msg_id: null,
-            // Nuevos campos usados por la lógica de disponibilidad
             lastStaffByIso: {}
           }
-          
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
-          
           if (BOT_DEBUG) {
             console.log("[DEBUG] User message:", textRaw)
             console.log("[DEBUG] Session before AI:", sessionData)
           }
-          
           const aiResponse = await getAIResponse(textRaw, sessionData, phone)
-          
           if (BOT_DEBUG) console.log("[DEBUG] AI Response:", aiResponse)
-          
           if (aiResponse.session_updates) {
             Object.keys(aiResponse.session_updates).forEach(key => {
               if (aiResponse.session_updates[key] !== null) {
@@ -896,7 +899,6 @@ async function startBot(){
               }
             })
           }
-          
           insertAIConversation.run({
             phone,
             message_id: m.key.id,
@@ -905,9 +907,7 @@ async function startBot(){
             timestamp: new Date().toISOString(),
             session_data: JSON.stringify(sessionData)
           })
-          
           saveSession(phone, sessionData)
-          
           switch (aiResponse.action) {
             case "propose_times":
               await executeProposeTime(aiResponse.action_params, sessionData, phone, sock, jid)
@@ -927,7 +927,6 @@ async function startBot(){
               await sendWithPresence(sock, jid, aiResponse.message)
               break
           }
-          
         } catch (error) {
           console.error("Error processing message:", error)
           await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
