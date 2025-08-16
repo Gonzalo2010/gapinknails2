@@ -1,5 +1,8 @@
-// index.js — Gapink Nails · v26.4
-// Anti-fake-confirm + captura de identidad local + intercept 1/2/3 + horario continuo + Square guardrails.
+// index.js — Gapink Nails · v26.5
+// Guardarraíles anti-sedes fantasía (Madrid), hard rules de ubicación, y todo lo de v26.x
+// - Nunca mencionar sedes que no sean Torremolinos o Málaga – La Luz
+// - Si la IA o el usuario mencionan Madrid u otras, pedimos elegir entre las dos sedes reales
+// - Detección local de "Carmen" y "pestañas" -> pedir sede + tipo
 
 import express from "express"
 import pino from "pino"
@@ -28,6 +31,15 @@ const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
 const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,01/11,06/12,08/12,25/12")
   .split(",").map(s=>s.trim()).filter(Boolean)
 
+// ====== SEDES permitidas (anti-hallucination)
+const SEDES = [
+  { key:"torremolinos", nice:"Torremolinos" },
+  { key:"la_luz",      nice:"Málaga – La Luz" }
+]
+const SEDES_NICE_LIST = SEDES.map(s=>s.nice).join(" o ")
+const ALLOWED_SEDE_KEYS = new Set(SEDES.map(s=>s.key))
+const FORBIDDEN_LOC_WORDS = ["madrid","centro","norte","sur","este","oeste","sevilla","valencia","barcelona"] // amplía si hace falta
+
 // ====== Flags
 const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
 
@@ -52,6 +64,7 @@ const sleep = ms => new Promise(r=>setTimeout(r, ms))
 const onlyDigits = s => String(s||"").replace(/\D+/g,"")
 const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = s => rm(s).toLowerCase().replace(/[+.,;:()/_-]/g," ").replace(/[^\p{Letter}\p{Number}\s]/gu," ").replace(/\s+/g," ").trim()
+
 function normalizePhoneES(raw){
   const d=onlyDigits(raw); if(!d) return null
   if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
@@ -227,6 +240,11 @@ function pickStaffForLocation(locKey, preferId=null){
   const found = EMPLOYEES.find(isAllowed)
   return found?.id || null
 }
+function findStaffIdByName(name){
+  const q=norm(name||"")
+  const e = EMPLOYEES.find(x => x.labels.some(l => norm(l).includes(q)))
+  return e?.id || null
+}
 
 // ====== Servicios
 function servicesForSedeKeyRaw(sedeKey){
@@ -243,13 +261,13 @@ function servicesForSedeKeyRaw(sedeKey){
 function findServiceByText(sedeKey, txt){
   const pool = servicesForSedeKeyRaw(sedeKey)
   const q = norm(txt)
-  // heurísticas mínimas (2D/3D/pelo a pelo)
   const score = (lab)=>{
     const n = norm(lab)
     let s = 0
     if (/\b2d\b/.test(q) && /\b2d\b/.test(n)) s+=3
     if (/\b3d\b/.test(q) && /\b3d\b/.test(n)) s+=3
-    if (/pelo a pelo|peloapelo|clásic/.test(q) && /pelo a pelo|clas/i.test(n)) s+=3
+    if (/pelo a pelo|peloapelo|clásic|clasica|clasico/.test(q) && /pelo a pelo|clas/i.test(n)) s+=3
+    if (/lifting/.test(q) && /lifting/.test(n)) s+=3
     if (/pesta/.test(q) && /pesta/.test(n)) s+=1
     if (/extens/.test(q) && /extens/.test(n)) s+=1
     return s
@@ -482,11 +500,44 @@ async function callAIWithRetries(messages, systemPrompt=""){
   return null
 }
 
+// ====== Anti-sedes fantasía & validaciones
+function mentionsForbiddenLocations(text){
+  const t=norm(text||"")
+  return FORBIDDEN_LOC_WORDS.filter(w => t.includes(w))
+}
+function sanitizeSedeKey(key){
+  return ALLOWED_SEDE_KEYS.has(key||"") ? key : null
+}
+function enforceSedeGuardsOnAI(aiObj, sessionData, userText){
+  const out = { ...aiObj }
+  // 1) Si session_updates trae sede inválida → anular
+  if (out.session_updates && "sede" in out.session_updates){
+    out.session_updates.sede = sanitizeSedeKey(out.session_updates.sede)
+  }
+  // 2) Si el mensaje de la IA menciona lugares prohibidos → reescribir
+  const bad = mentionsForbiddenLocations(out.message||"").length > 0
+  const userAskedBad = mentionsForbiddenLocations(userText||"").length > 0
+  if (bad || userAskedBad){
+    out.action = (sessionData?.sede && sessionData?.selectedServiceEnvKey) ? "propose_times" : "need_info"
+    const faltaSede = !sessionData?.sede
+    const faltaServ = !sessionData?.selectedServiceEnvKey
+    if (faltaSede && faltaServ){
+      out.message = `Tenemos sedes en ${SEDES_NICE_LIST}. ¿Cuál prefieres? Y dime el servicio de pestañas (2D, 3D, pelo a pelo o lifting).`
+    } else if (faltaSede){
+      out.message = `Tenemos sedes en ${SEDES_NICE_LIST}. ¿Cuál prefieres?`
+    } else if (faltaServ){
+      out.message = `Dime el servicio de pestañas que quieres: 2D, 3D, pelo a pelo o lifting.`
+    } else {
+      out.message = `Perfecto. Te propongo horas disponibles.`
+    }
+  }
+  return out
+}
+
 // ====== Fallback local + parsers
 function extractIdentity(msg){
   const emailMatch = msg.match(/[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}/)
   const email = emailMatch ? emailMatch[0] : null
-  // nombre = línea limpia si parece nombre (2+ palabras, letras/espacios)
   const raw = msg.replace(/\s+/g," ").trim()
   const onlyLetters = raw.replace(/[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s'-]/g,"")
   const words = onlyLetters.split(" ").filter(Boolean)
@@ -495,7 +546,6 @@ function extractIdentity(msg){
 }
 function hasCore(s){ return s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime }
 function haveIdentity(s){ return !!(s?.name || s?.email) }
-
 function looksLikeConfirm(text){
   const t=(text||"").toLowerCase()
   return /reserva (confirmada|creada|hecha)|confirmad[oa]|he reservado|queda agendada|cita confirmada|cita creada/.test(t)
@@ -510,7 +560,18 @@ function buildLocalFallback(userMessage, sessionData){
   const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
   const bookMatch = /\b(reservar|cita|quiero.*(cita|reservar))\b/i.test(lower)
 
-  // Captura identidad si estábamos esperando
+  // antipajas: si menciona Madrid, redirigimos a sedes reales
+  if (mentionsForbiddenLocations(msg).length){
+    return { message:`No tenemos sede allí. Elige entre ${SEDES_NICE_LIST}.`, action:"need_info", session_updates:{}, action_params:{} }
+  }
+
+  // preferencia Carmen
+  if (/carmen/i.test(msg) && !sessionData?.preferredStaffId){
+    const id = findStaffIdByName("carmen")
+    if (id) sessionData.preferredStaffId = id
+  }
+
+  // captura identidad si esperábamos
   if ((sessionData?.stage||"")==="awaiting_identity"){
     const id = extractIdentity(msg)
     if (id.name || id.email){
@@ -523,7 +584,7 @@ function buildLocalFallback(userMessage, sessionData){
     }
   }
 
-  // 1) Número con lastHours
+  // 1) número con lastHours
   if (numMatch && Array.isArray(sessionData?.lastHours) && sessionData.lastHours.length){
     const idx = Number(numMatch[1]) - 1
     const pick = sessionData.lastHours[idx]
@@ -558,12 +619,7 @@ function buildLocalFallback(userMessage, sessionData){
       if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio")
       if (!sessionData?.pendingDateTime) faltan.push("fecha y hora")
       if (!haveIdentity(sessionData)) faltan.push("nombre o email")
-      return { 
-        message:`Me faltan: ${faltan.join(", ")}.`,
-        action:"need_info",
-        session_updates:{},
-        action_params:{} 
-      }
+      return { message:`Me faltan: ${faltan.join(", ")}.`, action:"need_info", session_updates:{}, action_params:{} }
     }
   }
 
@@ -577,19 +633,23 @@ function buildLocalFallback(userMessage, sessionData){
     return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
   }
 
-  // 5) Reservar
+  // 5) Reservar: si dice “pestañas” y no hay servicio → pedir tipo
+  if (/pestañ|pestanas/i.test(msg) && sessionData?.sede && !sessionData?.selectedServiceEnvKey){
+    return { message:"¿Qué servicio de pestañas quieres: 2D, 3D, pelo a pelo o lifting?", action:"need_info", session_updates:{}, action_params:{} }
+  }
+
   if (bookMatch){
     if (sessionData?.sede && sessionData?.selectedServiceEnvKey){
       return { message:"Te propongo horas disponibles:", action:"propose_times", session_updates:{ stage:"awaiting_time" }, action_params:{} }
     } else {
-      const faltan=[]
-      if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)")
-      if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio")
-      return { message:`Para proponerte horas dime: ${faltan.join(" y ")}.`, action:"need_info", session_updates:{}, action_params:{} }
+      const partes=[]
+      if (!sessionData?.sede) partes.push(`sede (${SEDES_NICE_LIST})`)
+      if (!sessionData?.selectedServiceEnvKey) partes.push("servicio (2D, 3D, pelo a pelo o lifting)")
+      return { message:`Para proponerte horas dime: ${partes.join(" y ")}.`, action:"need_info", session_updates:{}, action_params:{} }
     }
   }
 
-  // 6) Intento de identificar servicio 2D/3D/pelo a pelo si ya dijo sede
+  // 6) Si ya hay sede, intentar inferir servicio por texto
   if (sessionData?.sede && !sessionData?.selectedServiceEnvKey){
     const s = findServiceByText(sessionData.sede, msg)
     if (s) {
@@ -597,18 +657,50 @@ function buildLocalFallback(userMessage, sessionData){
     }
   }
 
-  return { message:"¿Quieres reservar, cancelar o ver tus citas? Si es para reservar, dime sede y servicio.", action:"none", session_updates:{}, action_params:{} }
+  // 7) Si no hay sede y pide “con Carmen”, pedir sede válida
+  if (/carmen/i.test(msg) && !sessionData?.sede){
+    return { message:`¿En qué sede quieres reservar con Carmen: ${SEDES_NICE_LIST}?`, action:"need_info", session_updates:{}, action_params:{} }
+  }
+
+  return { message:`¿Quieres reservar, cancelar o ver tus citas? Si es para reservar, dime la sede (${SEDES_NICE_LIST}) y el servicio (2D, 3D, pelo a pelo o lifting).`, action:"none", session_updates:{}, action_params:{} }
 }
 
-// ====== System prompt (abreviado para foco)
+// ====== System prompt (hard rules anti-sedes fantasía)
 function buildSystemPrompt() {
   const nowEU = dayjs().tz(EURO_TZ);
   const employees = EMPLOYEES.map(e => ({ id: e.id, labels: e.labels, bookable: e.bookable, locations: e.allow }));
   const torremolinos_services = servicesForSedeKeyRaw("torremolinos");
   const laluz_services = servicesForSedeKeyRaw("la_luz");
-  return `Eres el asistente de WhatsApp para Gapink Nails (L-V 09:00-20:00).
-Devuelve SOLO JSON válido: {"message":"","action":"","session_updates":{},"action_params":{}}
-Si no hay huecos con la profesional preferida, no digas "con <nombre>"; indica "nuestro equipo" y muestra el staff por opción. Confirma solo una vez.`
+  return `Eres el asistente de WhatsApp para Gapink Nails.
+
+SEDES PERMITIDAS (y ÚNICAS):
+- Torremolinos: ${ADDRESS_TORRE}
+- Málaga – La Luz: ${ADDRESS_LUZ}
+PROHIBIDO mencionar cualquier otra ciudad o sede (p.ej., Madrid, Centro, Norte, etc.).
+
+HORARIO:
+- Lunes a Viernes: 09:00–20:00 (continuo)
+- Sábados y domingos: cerrado
+- Festivos: ${HOLIDAYS_EXTRA.join(", ")}
+
+REGLAS DURO:
+- NUNCA inventes otras sedes. Si el cliente pide una sede inexistente, responde: "No tenemos sede allí; elige Torremolinos o Málaga – La Luz."
+- Si no hay huecos con la profesional pedida, no digas "con <nombre>"; usa "nuestro equipo" y muestra la profesional en cada opción.
+- Confirma solo una vez y SOLO tras tener sede + servicio + fecha/hora + nombre o email.
+
+Respuesta SIEMPRE en JSON válido (sin fences):
+{"message":"","action":"none|propose_times|create_booking|list_appointments|cancel_appointment|need_info","session_updates":{},"action_params":{}}
+
+Empleadas:
+${employees.map(e => `- ID: ${e.id}, Nombres: ${e.labels.join(", ")}`).join("\n")}
+
+Servicios Torremolinos:
+${torremolinos_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
+
+Servicios Málaga – La Luz:
+${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
+
+Fecha/Hora actual: ${fmtES(nowEU)}`
 }
 
 async function getAIResponse(userMessage, sessionData, phone) {
@@ -634,11 +726,11 @@ async function getAIResponse(userMessage, sessionData, phone) {
   if (!aiText || /^error de conexión/i.test(aiText.trim())) return buildLocalFallback(userMessage, sessionData)
 
   const cleaned = aiText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim()
-  try {
-    return JSON.parse(cleaned)
-  } catch {
-    return buildLocalFallback(userMessage, sessionData)
-  }
+  let obj
+  try { obj = JSON.parse(cleaned) } catch { return buildLocalFallback(userMessage, sessionData) }
+  // ENFORCE hard rules de sedes sobre la respuesta de IA
+  obj = enforceSedeGuardsOnAI(obj, sessionData, userMessage)
+  return obj
 }
 
 // ====== Bot principal
@@ -661,7 +753,7 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
   const nowEU = dayjs().tz(EURO_TZ);
   const baseFrom = nextOpeningFrom(nowEU.add(NOW_MIN_OFFSET_MIN, "minute"));
   if (!sessionData.sede || !sessionData.selectedServiceEnvKey) {
-    await sendWithPresence(sock, jid, "Necesito que me digas la sede y el servicio primero.");
+    await sendWithPresence(sock, jid, `Necesito la sede (${SEDES_NICE_LIST}) y el servicio (2D, 3D, pelo a pelo o lifting) primero.`);
     return;
   }
 
@@ -719,7 +811,7 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
 }
 
 async function executeCreateBooking(params, sessionData, phone, sock, jid) {
-  if (!sessionData.sede) { await sendWithPresence(sock, jid, "Falta seleccionar la sede (Torremolinos o La Luz)"); return; }
+  if (!sessionData.sede) { await sendWithPresence(sock, jid, `Falta seleccionar la sede (${SEDES_NICE_LIST})`); return; }
   if (!sessionData.selectedServiceEnvKey) { await sendWithPresence(sock, jid, "Falta seleccionar el servicio"); return; }
   if (!sessionData.pendingDateTime) { await sendWithPresence(sock, jid, "Falta seleccionar la fecha y hora"); return; }
 
@@ -836,13 +928,12 @@ app.get("/", (_req,res)=>{
   res.send(`<!doctype html><meta charset="utf-8"><style>
   body{font-family:system-ui;display:grid;place-items:center;min-height:100vh}
   .card{max-width:560px;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08)}
-  </style><div class="card"><h1>Gapink Nails v26.4</h1>
+  </style><div class="card"><h1>Gapink Nails v26.5</h1>
   <p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>
   ${!conectado&&lastQR?`<img src="/qr.png" width="300">`:""}
   <p style="opacity:.7">Modo: ${DRY_RUN?"Simulación (no toca Square)":"Producción"}</p>
   <p style="opacity:.7">Horario: L-V 09:00–20:00</p>
-  <p style="opacity:.7">IA: DeepSeek (${AI_MODEL}) · Retries: ${AI_MAX_RETRIES}</p>
-  <p style="color:#e74c3c">🤖 Anti-fake confirm + identidad local</p>
+  <p style="opacity:.7">Guardarraíles: sedes solo Torremolinos / Málaga – La Luz</p>
   </div>`)
 })
 
@@ -930,7 +1021,13 @@ async function startBot(){
             console.log("[DEBUG] Session before:", sessionData)
           }
 
-          // === PRE: si esperamos identidad, intenta capturarla localmente
+          // PRE: si dice Carmen, set preferencia si existe
+          if (/carmen/i.test(textRaw) && !sessionData.preferredStaffId){
+            const id = findStaffIdByName("carmen")
+            if (id){ sessionData.preferredStaffId = id; saveSession(phone, sessionData) }
+          }
+
+          // PRE: si esperaba identidad, intenta capturarla localmente
           if ((sessionData.stage||"")==="awaiting_identity"){
             const id = extractIdentity(textRaw)
             if (id.name || id.email){
@@ -939,7 +1036,7 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT: selección 1/2/3 ANTES de la IA
+          // PRE-INTERCEPT: selección 1/2/3 ANTES de la IA
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-5])\b/)
           if (numMatch && Array.isArray(sessionData.lastHours) && sessionData.lastHours.length){
@@ -961,10 +1058,10 @@ async function startBot(){
             }
           }
 
-          // === IA o fallback local
+          // IA o fallback local
           let aiObj = await getAIResponse(textRaw, sessionData, phone)
 
-          // === Anti-fake confirm: si IA dice "confirmada" sin action, forzamos create_booking con guardas
+          // Anti-fake confirm
           if (aiObj && looksLikeConfirm(aiObj.message) && aiObj.action !== "create_booking"){
             if (hasCore(sessionData) && haveIdentity(sessionData)){
               aiObj = { ...aiObj, action:"create_booking" }
@@ -994,10 +1091,15 @@ async function startBot(){
 async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   if (BOT_DEBUG) console.log("[DEBUG] AI (obj):", aiObj)
 
-  if (aiObj.session_updates) {
-    Object.keys(aiObj.session_updates).forEach(key => {
-      if (aiObj.session_updates[key] !== null && aiObj.session_updates[key] !== undefined) {
-        sessionData[key] = aiObj.session_updates[key]
+  // última línea de defensa anti-sedes fantasía sobre el objeto ya listo
+  const safeObj = enforceSedeGuardsOnAI(aiObj, sessionData, textRaw)
+
+  if (safeObj.session_updates) {
+    Object.keys(safeObj.session_updates).forEach(key => {
+      if (safeObj.session_updates[key] !== null && safeObj.session_updates[key] !== undefined) {
+        // sede debe ser válida
+        if (key==="sede") safeObj.session_updates[key] = sanitizeSedeKey(safeObj.session_updates[key])
+        sessionData[key] = safeObj.session_updates[key]
       }
     })
   }
@@ -1006,29 +1108,29 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     phone,
     message_id: m.key.id,
     user_message: textRaw,
-    ai_response: JSON.stringify(aiObj),
+    ai_response: JSON.stringify(safeObj),
     timestamp: new Date().toISOString(),
     session_data: JSON.stringify(sessionData)
   })
   saveSession(phone, sessionData)
 
-  switch (aiObj.action) {
+  switch (safeObj.action) {
     case "propose_times":
-      await executeProposeTime(aiObj.action_params, sessionData, phone, sock, jid)
+      await executeProposeTime(safeObj.action_params, sessionData, phone, sock, jid)
       break
     case "create_booking":
-      await executeCreateBooking(aiObj.action_params, sessionData, phone, sock, jid)
+      await executeCreateBooking(safeObj.action_params, sessionData, phone, sock, jid)
       break
     case "list_appointments":
-      await executeListAppointments(aiObj.action_params, sessionData, phone, sock, jid)
+      await executeListAppointments(safeObj.action_params, sessionData, phone, sock, jid)
       break
     case "cancel_appointment":
-      await executeCancelAppointment(aiObj.action_params, sessionData, phone, sock, jid)
+      await executeCancelAppointment(safeObj.action_params, sessionData, phone, sock, jid)
       break
     case "need_info":
     case "none":
     default:
-      await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por fa?")
+      await sendWithPresence(sock, jid, safeObj.message || "¿Puedes repetirlo, por fa?")
       break
   }
 }
