@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v23
+// index.js — Gapink Nails · v23.1
 // Pregunta tipo de servicio + propone 3 horas con Desi (reales) + sin mensajes genéricos ni “...”
 // DeepSeek orquestador + Memoria 20min + Square availability por profesional + confirmación dura
 
@@ -46,7 +46,7 @@ const LLM_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY |
 const LLM_MODEL   = process.env.DEEPSEEK_MODEL   || process.env.OPENAI_MODEL || "deepseek-chat"
 const LLM_URL     = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/v1/chat/completions"
 
-// ====== Prompt del orquestador (igual a v22; lo mantenemos)
+// ====== Prompt del orquestador
 const SYSTEM_PROMPT = `[SYSTEM ROLE — ORQUESTADOR DE CITAS GAPINK NAILS] 
 Eres una IA que clasifica y guía el flujo de reservas de un salón con dos sedes (Torremolinos y Málaga–La Luz). No llamas a APIs ni "haces" reservas: SOLO devuelves JSON con decisiones y un mensaje listo para enviar al cliente. No inventes datos: si falta algo, lo pides. Cuando recibas listas enumeradas (servicios, citas, horas, fechas) DEBES elegir por índice (base 1). Siempre devuelve JSON + un texto "client_message".
 
@@ -165,6 +165,25 @@ function ceilToSlotEU(t){ const m=t.minute(), rem=m%SLOT_MIN; return rem===0 ? t
 function fmtES(d){ const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]; const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ); return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")} ${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}` }
 function enumerateHours(list){ return list.map((d,i)=>({ index:i+1, iso:d.format("YYYY-MM-DDTHH:mm"), pretty:fmtES(d) })) }
 function stableKey(parts){ const raw=Object.values(parts).join("|"); return createHash("sha256").update(raw).digest("hex").slice(0,48) }
+
+// >>>> FALTABA: generador de slots por horario comercial (fallback)
+function proposeSlots({ fromEU, durationMin=60, n=3 }){
+  const out=[]
+  let t=ceilToSlotEU(fromEU.clone())
+  t=nextOpeningFrom(t)
+  while (out.length<n){
+    if (insideBusinessHours(t,durationMin)){
+      out.push(t.clone())
+      t=t.add(SLOT_MIN,"minute")
+    } else {
+      if (t.hour()>=AFTERNOON.end) t=t.add(1,"day").hour(MORNING.start).minute(0)
+      else if (t.hour()>=MORNING.end && t.hour()<AFTERNOON.start) t=t.hour(AFTERNOON.start).minute(0)
+      else t=t.add(SLOT_MIN,"minute")
+      while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) t=t.add(1,"day").hour(MORNING.start).minute(0)
+    }
+  }
+  return out
+}
 
 // ====== DB
 const db=new Database("gapink.db"); db.pragma("journal_mode = WAL")
@@ -798,17 +817,13 @@ async function startBot(){
           setPendingMenu(s,"confirm", confirmChoices); saveSession(phone,s)
         }
 
-        // ====== OVERRIDE ANTIGENÉRICO:
-        // Si la IA responde genérico o superficial, y ya sabemos que el usuario quiere “pestañas con Desi”,
-        // pedimos tipo de pestañas y (si hay sede) proponemos 3 horas reales con Desi de una.
+        // ====== OVERRIDE ANTIGENÉRICO
         async function craftServiceAndSlotsMessage(){
           const sedeTxt = s.sede ? locationNice(s.sede) : null
           const lashMenu = s.lastServiceMenu?.length ? s.lastServiceMenu : (s.sede ? buildLashMenu(s.sede) : [])
           if (!lashMenu?.length){
-            // Si aún no hay menú (falta sede), pregunta sede + tipo
             return ensurePunct("¡Genial! Te reservo con Desi para pestañas. ¿Torremolinos o Málaga – La Luz? Luego dime el tipo: 1) Extensiones pelo a pelo · 2) 2D · 3) 3D · 4) Lifting + tinte.")
           }
-          // Tenemos sede y menú → proponemos 3 horas
           const base = nextOpeningFrom(nowEU.add(NOW_MIN_OFFSET_MIN,"minute"))
           const defaultEnvKey = s.selectedServiceEnvKey || lashMenu[0].key
           const staffId = s.preferredStaffId || pickStaffForLocation(s.sede, null)
@@ -824,7 +839,6 @@ async function startBot(){
             slots = enumerateHours(arr)
           }
           if (!slots.length){
-            // Fallback si no devuelve disponibilidad
             slots = await proposeHoursForContext({ baseFromEU: base, n:3 })
           }
           setPendingMenu(s,"services", lashMenu); saveSession(phone,s)
@@ -837,14 +851,13 @@ async function startBot(){
         let msgOut = decision.client_message?.trim() || ""
         const shouldOverride = (
           isGenericReply(msgOut) ||
-          // también si intención=1 y ya hay contexto de Desi+pestañas y aún no hemos pedido tipo
           (decision.intent===1 && s.serviceCategory==="lash" && (s.preferredStaffId || s.preferredStaffLabel) && !s.selectedServiceEnvKey)
         )
 
         if (shouldOverride){
           msgOut = await craftServiceAndSlotsMessage()
         }
-        if (!msgOut) msgOut = "Perfecto, te ayudo con eso." // ultra fallback (no debería ocurrir)
+        if (!msgOut) msgOut = "Perfecto, te ayudo con eso."
 
         await sendWithPresence(sock, jid, ensurePunct(msgOut))
 
@@ -949,7 +962,6 @@ Duración: 60 min
               setPendingMenu(s,"appointments",citas); saveSession(phone,s)
               await sendWithPresence(sock,jid, ensurePunct(`¿Cuál quieres mover? ${citas.map(c=>`${c.index}) ${c.pretty} — ${c.sede}`).join(" · ")}`))
             } else {
-              // Sin citas reales → no invento, vuelvo a proponer horas (flujo reserva)
               const more = await proposeHoursForContext({ baseFromEU: baseFrom, n:3 })
               setPendingMenu(s,"hours",more); saveSession(phone,s)
               await sendWithPresence(sock,jid, ensurePunct(`No tienes citas futuras. ¿Agendamos? Opciones: ${more.map(h=>`${h.index}) ${h.pretty}`).join(" · ")}`))
