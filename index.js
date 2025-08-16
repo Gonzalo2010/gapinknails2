@@ -444,7 +444,7 @@ Tu trabajo es:
 5. Ejecutar acciones cuando tengas toda la información
 
 FORMATO DE RESPUESTA:
-Debes responder SIEMPRE en formato JSON con esta estructura:
+Debes responder SIEMPRE en formato JSON válido (sin bloques de código markdown). Tu respuesta debe ser ÚNICAMENTE el JSON, sin ```json ni otros decoradores:
 {
   "message": "Mensaje para el cliente",
   "action": "none|propose_times|create_booking|list_appointments|cancel_appointment|need_info",
@@ -505,10 +505,42 @@ ${JSON.stringify(sessionData, null, 2)}`
   const aiResponse = await callAI(messages, systemPrompt);
   
   try {
-    return JSON.parse(aiResponse);
+    // Limpiar la respuesta de bloques de código markdown
+    let cleanedResponse = aiResponse;
+    
+    // Remover bloques de código markdown (```json ... ```)
+    if (cleanedResponse.includes('```json')) {
+      cleanedResponse = cleanedResponse.replace(/```json\s*/g, '').replace(/\s*```/g, '');
+    }
+    
+    // Remover bloques de código simples (``` ... ```)
+    if (cleanedResponse.includes('```')) {
+      cleanedResponse = cleanedResponse.replace(/```\s*/g, '').replace(/\s*```/g, '');
+    }
+    
+    // Limpiar espacios adicionales al inicio y final
+    cleanedResponse = cleanedResponse.trim();
+    
+    if (BOT_DEBUG) {
+      console.log("[DEBUG] Raw AI response:", aiResponse);
+      console.log("[DEBUG] Cleaned response:", cleanedResponse);
+    }
+    
+    return JSON.parse(cleanedResponse);
   } catch (error) {
     console.error("Error parsing AI response:", error);
     console.error("Raw AI response:", aiResponse);
+    
+    // Fallback: intentar extraer JSON manualmente
+    try {
+      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (fallbackError) {
+      console.error("Fallback JSON parsing also failed:", fallbackError);
+    }
+    
     return {
       message: "Disculpa, hubo un error procesando tu mensaje. ¿Puedes repetir?",
       action: "none",
