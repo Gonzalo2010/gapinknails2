@@ -1,703 +1,845 @@
-// index.js
-// ------------------------------
-// Gapink Nails – WhatsApp Bot + IA + Square
-// ------------------------------
-import 'dotenv/config'
-import fs from 'fs'
-import path from 'path'
-import crypto from 'crypto'
-import {
-  makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  Browsers
-} from '@whiskeysockets/baileys'
+// index.js — Gapink Nails · v13.3
+// “IA robusta • 2 locales • preferencia de técnica estricta • cancelación • Square-safe”
 
-import dayjsBase from 'dayjs'
-import tz from 'dayjs/plugin/timezone.js'
-import utc from 'dayjs/plugin/utc.js'
-import customParse from 'dayjs/plugin/customParseFormat.js'
+import express from "express"
+import pino from "pino"
+import qrcode from "qrcode"
+import qrcodeTerminal from "qrcode-terminal"
+import "dotenv/config"
+import fs from "fs"
+import Database from "better-sqlite3"
+import dayjs from "dayjs"
+import utc from "dayjs/plugin/utc.js"
+import tz from "dayjs/plugin/timezone.js"
+import "dayjs/locale/es.js"
+import { webcrypto, createHash } from "crypto"
+import { createRequire } from "module"
+import { Client, Environment } from "square"
 
-dayjsBase.extend(utc)
-dayjsBase.extend(tz)
-dayjsBase.extend(customParse)
+if (!globalThis.crypto) globalThis.crypto = webcrypto
+dayjs.extend(utc); dayjs.extend(tz)
+dayjs.locale("es")
 
-const dayjs = (d) => dayjsBase.tz(d, 'Europe/Madrid')
+// ====== Zona/horario negocio (España)
+const EURO_TZ = "Europe/Madrid"
 
-// ------------------------------
-// ENV
-// ------------------------------
-const {
-  OPENAI_API_KEY,
-  SQUARE_ACCESS_TOKEN,
-  SQUARE_API_VER = '2023-12-13',
-  // Locales
-  SQUARE_LOCATION_ID_TORREMOLINOS = process.env.SQUARE_LOCATION_ID_TORREMOLINOS || 'LSMNAJFSY1EGS',
-  SQUARE_LOCATION_ID_LA_LUZ = process.env.SQUARE_LOCATION_ID_LA_LUZ || 'LF5NK1R8RDMRV',
-  ADDRESS_TORREMOLINOS = 'Av. de Benyamina 18, Torremolinos',
-  ADDRESS_LA_LUZ = 'Málaga – Barrio de La Luz',
-  HOLIDAYS_EXTRA = '06/01,28/02,15/08,12/10,01/11,06/12,08/12,25/12',
-  BOT_STEER_BALANCE = 'on',
-  BOT_STEER_WINDOW_DAYS = 7,
-  BOT_SEARCH_WINDOW_DAYS = 14,
-  BOT_MAX_SAME_DAY_DEVIATION_MIN = 60,
-  BOT_NOW_OFFSET_MIN = 30
-} = process.env
+// Horario partido L–V: 10–14 y 16–20 (S/D cerrado)
+const WORK_DAYS = [1,2,3,4,5]
+const SLOT_MIN = 30
+const MORNING = { start: 10, end: 14 }
+const AFTERNOON = { start: 16, end: 20 }
+const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
 
-if (!SQUARE_ACCESS_TOKEN) {
-  console.warn('⚠️ Falta SQUARE_ACCESS_TOKEN en .env')
-}
-if (!OPENAI_API_KEY) {
-  console.warn('⚠️ Falta OPENAI_API_KEY en .env (la IA seguirá pero solo con reglas)')
-}
+// Festivos dd/mm (local + nacionales)
+const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,01/11,06/12,08/12,25/12")
+  .split(",").map(s => s.trim()).filter(Boolean)
 
-// ------------------------------
-// CATÁLOGO (IDs desde .env)
-// Admite claves normales (SQ_SVC_...) y con prefijo _luz_
-// ------------------------------
-function readServicesFromEnv () {
-  const map = {}
-  for (const [k, v] of Object.entries(process.env)) {
-    if (!/^SQ_SVC_/.test(k)) continue
-    const [id, version] = String(v).split('|')
-    map[k] = { id, version: version || '' }
-  }
-  return map
-}
-const SVC_IDS = readServicesFromEnv()
-
-// Duraciones por defecto (min). Puedes ajustar aquí libremente:
-const SVC_DUR = {
-  LIFITNG_DE_PESTANAS_Y_TINTE: 75,
-  EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO: 120,
-  EXTENSIONES_PESTANAS_NUEVAS_2D: 120,
-  EXTENSIONES_PESTANAS_NUEVAS_3D: 135,
-  RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO: 90,
-  RELLENO_PESTANAS_2D: 95,
-  RELLENO_PESTANAS_3D: 100,
-  QUITAR_EXTENSIONES_PESTANAS: 30,
-
-  MANICURA_SEMIPERMANENTE: 60,
-  MANICURA_SEMIPERMANENTE_QUITAR: 25,
-  MANICURA_CON_ESMALTE_NORMAL: 45,
-  PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE: 75
-}
-
-// Mapa canónico KEY -> env key real
-const KEY_TO_ENV = {
-  // Lashes
-  LIFITNG_DE_PESTANAS_Y_TINTE: 'SQ_SVC_LIFITNG_DE_PESTANAS_Y_TINTE',
-  EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO: 'SQ_SVC_EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO',
-  EXTENSIONES_PESTANAS_NUEVAS_2D: 'SQ_SVC_EXTENSIONES_PESTANAS_NUEVAS_2D',
-  EXTENSIONES_PESTANAS_NUEVAS_3D: 'SQ_SVC_EXTENSIONES_PESTANAS_NUEVAS_3D',
-  RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO: 'SQ_SVC_RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO',
-  RELLENO_PESTANAS_2D: 'SQ_SVC_RELLENO_PESTANAS_2D',
-  RELLENO_PESTANAS_3D: 'SQ_SVC_RELLENO_PESTANAS_3D',
-  QUITAR_EXTENSIONES_PESTANAS: 'SQ_SVC_QUITAR_EXTENSIONES_PESTANAS',
-  // Uñas / pies (ejemplos más usados)
-  MANICURA_SEMIPERMANENTE: 'SQ_SVC_MANICURA_SEMIPERMANENTE',
-  MANICURA_SEMIPERMANENTE_QUITAR: 'SQ_SVC_MANICURA_SEMIPERMANENTE_QUITAR',
-  MANICURA_CON_ESMALTE_NORMAL: 'SQ_SVC_MANICURA_CON_ESMALTE_NORMAL',
-  PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE: 'SQ_SVC_PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE'
-}
-
-// Empleadas conocidas (desde env que pegaste)
-const STAFF_NAME_TO_ID = {
-  'carmen belen': 'TM4mRkFCodl_mDWf',
-  'ganna': 'TMW_ctTgpIyIOeLa',
-  'rocio': 'TMdIMb5NTeGacSTN',
-  'rocio chica': 'TMhJsD5RnV9hmEcG',
-  'maria': 'TMhpeTVah4qtuUtP',
-  'anais': 'TMtlbg7yOf7o0sf0',
-  'anaira': 'TMtlbg7yOf7o0sf0',
-  'desi': 'TMXSDoPYYoscyMVH', // NO_BOOKABLE en tu dump: la API podría no aceptar; se intentará y si no, sin staff
-  'daniela': 'TMTzygZYYb2JNC3z'
-}
-
-// ------------------------------
-// WhatsApp – helpers
-// ------------------------------
-const SESSIONS = new Map() // por número
-
-function getS (jid) {
-  if (!SESSIONS.has(jid)) {
-    SESSIONS.set(jid, {
-      step: 'INIT',
-      history: [],
-      // recogida
-      locationKey: null, // TORRE / LUZ
-      locationId: null,
-      serviceKey: null,
-      durationMin: 60,
-      staffName: null,
-      staffId: null,
-      offersISO: [], // ISO strings
-      selectedISO: null,
-      name: null,
-      phone: null
-    })
-  }
-  return SESSIONS.get(jid)
-}
-
-function norm (s) {
-  return String(s || '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-// ------------------------------
-// Horario y festivos
-// ------------------------------
-const EXTRA_HOLIDAYS = (HOLIDAYS_EXTRA || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean) // en formato dd/mm
-
-function isHoliday (d = dayjs()) {
-  const tag = d.format('DD/MM')
-  return EXTRA_HOLIDAYS.includes(tag)
-}
-function isOpenNow () {
-  const now = dayjs()
-  if (isHoliday(now)) return false
-  const wd = now.day() // 0 Sun .. 6 Sat
-  if (wd === 0 || wd === 6) return false
-  const hm = now.format('HH:mm')
-  return (hm >= '10:00' && hm < '14:00') || (hm >= '16:00' && hm < '20:00')
-}
-function openingMsg () {
-  return `Solo atenderemos por WhatsApp y llamadas en horario de lunes a viernes de 10 a 14:00 y de 16:00 a 20:00`
-}
-
-// ------------------------------
-// OpenAI – súper cauto
-// ------------------------------
-async function aiChat (messages) {
-  if (!OPENAI_API_KEY) return ''
-  const r = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.1,
-      messages
-    })
-  })
-  if (!r.ok) {
-    console.warn('AI HTTP', await r.text())
-    return ''
-  }
-  const j = await r.json()
-  return j.choices?.[0]?.message?.content || ''
-}
-
-function isValidEmail (s) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || '').trim())
-}
-
-// ------------------------------
-// Detección de local
-// ------------------------------
-function detectLocation (text) {
-  const t = norm(text)
-  if (/\b(torre|torremolinos|beni?amina|benyamina)\b/.test(t)) {
-    return { key: 'TORRE', id: SQUARE_LOCATION_ID_TORREMOLINOS, label: `Torremolinos (${ADDRESS_TORREMOLINOS})` }
-  }
-  if (/\b(luz|malaga|málaga|barrio de la luz|centro|la luz)\b/.test(t)) {
-    return { key: 'LUZ', id: SQUARE_LOCATION_ID_LA_LUZ, label: `Málaga – La Luz (${ADDRESS_LA_LUZ})` }
-  }
-  return null
-}
-
-// ------------------------------
-// Detección de servicio (reglas + historial + IA)
-// ------------------------------
-function detectService (text) {
-  const t = norm(text)
-
-  // Lashes – quitar/retirar
-  if (/\b(quitar(me)?|retirar(me)?|sacar(me)?)\b.*\b(extensi(?:on|ones)|pestanas?|pestañas?)\b/.test(t)) { return 'QUITAR_EXTENSIONES_PESTANAS' }
-
-  // Lashes – lifting + tinte
-  if ((/\blifting\b/.test(t) || /\blift\b/.test(t)) && (/\btinte\b/.test(t) || /\btint[ae]\b/.test(t))) { return 'LIFITNG_DE_PESTANAS_Y_TINTE' }
-
-  // Lashes – nuevas
-  if (/\b(extensi(?:on|ones)|pestanas?)\b.*\b(2d)\b/.test(t)) return 'EXTENSIONES_PESTANAS_NUEVAS_2D'
-  if (/\b(extensi(?:on|ones)|pestanas?)\b.*\b(3d)\b/.test(t)) return 'EXTENSIONES_PESTANAS_NUEVAS_3D'
-  if (/\b(extensi(?:on|ones)|pestanas?)\b.*\b(pelo a pelo|clasicas|clásicas|classic)\b/.test(t)) {
-    return 'EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO'
-  }
-  // Rellenos
-  if (/\brellen[oa]s?\b.*\b(2d)\b/.test(t)) return 'RELLENO_PESTANAS_2D'
-  if (/\brellen[oa]s?\b.*\b(3d)\b/.test(t)) return 'RELLENO_PESTANAS_3D'
-  if (/\brellen[oa]s?\b.*\b(pelo a pelo|clasicas|clásicas)\b/.test(t)) return 'RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO'
-
-  // Uñas rápidas
-  if (/\bmanicur[ae]\b.*\bsemi\b/.test(t) || /\bsemiperm(?:anente)?\b/.test(t)) return 'MANICURA_SEMIPERMANENTE'
-  if (/\bmanicur[ae]\b.*\bquitar\b/.test(t)) return 'MANICURA_SEMIPERMANENTE_QUITAR'
-  if (/\bmanicur[ae]\b.*\bnormal\b/.test(t)) return 'MANICURA_CON_ESMALTE_NORMAL'
-  if (/\bpedicur[ae]\b.*\bsemi\b/.test(t)) return 'PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE'
-
-  return null
-}
-
-function detectServiceFromHistory (historyArr = []) {
-  const t = norm((historyArr || []).slice(-8).join(' ␟ '))
-  if (/\bpestan(?:as|as)\b/.test(t) && /\b(quitar(me)?|retirar(me)?|sacar(me)?)\b/.test(t)) {
-    return 'QUITAR_EXTENSIONES_PESTANAS'
-  }
-  return null
-}
-
-async function aiDetectService (historyArr = []) {
-  if (!OPENAI_API_KEY) return null
-  const last = (historyArr || []).slice(-8).join('\n')
-  const allowed = Object.keys(KEY_TO_ENV)
-  const sys = `Eres un clasificador muy cauto. Devuelves SOLO JSON: {"service_key": "<KEY|empty>"}.
-- KEY debe ser exactamente una de: ${allowed.join(', ')}.
-- Si no estás 100% segura, responde {"service_key": ""}.`
-  const out = await aiChat([
-    { role: 'system', content: sys },
-    { role: 'user', content: `Últimos mensajes (cliente):\n${last}` }
-  ])
+// ====== OpenAI (IA para extracción ultra-cauta de email)
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""
+const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini"
+const OPENAI_API_URL = process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions"
+async function aiChat(messages, { temperature=0.2 } = {}) {
+  if (!OPENAI_API_KEY) return ""
   try {
-    const j = JSON.parse(out || '{}')
-    return allowed.includes(j?.service_key) ? j.service_key : null
-  } catch { return null }
+    const r = await fetch(OPENAI_API_URL, {
+      method: "POST",
+      headers: { "Content-Type":"application/json", "Authorization":`Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature })
+    })
+    if (!r.ok) throw new Error(`OpenAI ${r.status}`)
+    const j = await r.json()
+    return (j?.choices?.[0]?.message?.content || "").trim()
+  } catch { return "" }
 }
 
-// ------------------------------
-// Square helpers
-// ------------------------------
-const SQ_HEADERS = {
-  'Authorization': `Bearer ${SQUARE_ACCESS_TOKEN}`,
-  'Content-Type': 'application/json',
-  'Square-Version': SQUARE_API_VER
+// ====== Square
+const square = new Client({
+  accessToken: process.env.SQUARE_ACCESS_TOKEN,
+  environment: (process.env.SQUARE_ENV==="production") ? Environment.Production : Environment.Sandbox
+})
+
+// IDs de local
+const LOC_TORRE = (process.env.SQUARE_LOCATION_ID || "").trim()
+const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "").trim()
+
+// Textos de dirección
+const ADDRESS_TORRE = process.env.ADDRESS_TORREMOLINOS || "Av. de Benyamina 18, Torremolinos"
+const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Luz"
+
+// ====== Helpers
+const onlyDigits = s => String(s||"").replace(/\D+/g,"")
+const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu, "")
+const norm = s => rm(s).toLowerCase()
+  .replace(/[+.,;:()/_-]/g, " ")
+  .replace(/[^\p{Letter}\p{Number}\s]/gu, " ")
+  .replace(/\s+/g, " ").trim()
+
+function normalizePhoneES(raw){
+  const d=onlyDigits(raw); if(!d) return null
+  if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
+  if (d.startsWith("34") && d.length===11) return `+${d}`
+  if (d.length===9) return `+34${d}`
+  if (d.startsWith("00")) return `+${d.slice(2)}`
+  return `+${d}`
 }
 
-function getServiceVariationId (serviceKey, locationKey) {
-  // si en .env usas prefijo _luz_, respétalo
-  let envKey = KEY_TO_ENV[serviceKey]
-  if (!envKey) return null
-  if (locationKey === 'LUZ') {
-    // intenta variante con _luz_ si existe
-    const luzKey = envKey.replace('SQ_SVC_', 'SQ_SVC_luz_')
-    if (SVC_IDS[luzKey]) envKey = luzKey
+const YES_RE = /\b(s[ií]|ok|vale|okey|okay|va|genial|de acuerdo|confirmo|perfecto|si claro|sí claro|yes)\b/i
+const NO_RE  = /\b(no|otra|cambia|cambiar|cancel|cancela|anula|mejor mas tarde|mejor más tarde)\b/i
+
+// Cancel/Reschedule intents
+const CANCEL_RE = /\b(cancel(a(r|me|la)?|ar|la)|anul(a(r|me|la)?)|borra(r|me|la)?|quitar (la )?cita|delete appointment)\b/i
+const RESCH_RE  = /\b(cambia(r|me|la)?|mover|reprogram(a(r|me|la)?)|aplaza(r)?)\b/i
+
+// Detección local
+function detectLocation(text){
+  const t=norm(text)
+  if (/\b(luz|malaga|málaga)\b/.test(t)) return "luz"
+  if (/\b(torre|torremolinos)\b/.test(t)) return "torre"
+  return null
+}
+function locationToId(key){ return key==="luz" ? LOC_LUZ : LOC_TORRE }
+function locationToAddress(key){ return key==="luz" ? ADDRESS_LUZ : ADDRESS_TORRE }
+function locationNice(key){ return key==="luz" ? "Málaga – La Luz" : "Torremolinos" }
+
+// Festivos y horario
+function isHolidayEU(d){
+  const dd = String(d.date()).padStart(2,"0")
+  const mm = String(d.month()+1).padStart(2,"0")
+  return HOLIDAYS_EXTRA.includes(`${dd}/${mm}`)
+}
+function insideBusinessBlock(d, block){ return d.hour()>=block.start && d.hour()<block.end }
+function insideBusinessHours(d, durMin){
+  const t=d.clone()
+  if (!WORK_DAYS.includes(t.day())) return false
+  if (isHolidayEU(t)) return false
+  const end=t.clone().add(durMin,"minute")
+  const inMorning = insideBusinessBlock(t, MORNING) && insideBusinessBlock(end, MORNING) && t.isSame(end,"day")
+  const inAfternoon = insideBusinessBlock(t, AFTERNOON) && insideBusinessBlock(end, AFTERNOON) && t.isSame(end,"day")
+  return inMorning || inAfternoon
+}
+function ceilToSlotEU(t){
+  const m=t.minute(), rem=m%SLOT_MIN
+  return rem===0 ? t.second(0).millisecond(0) : t.add(SLOT_MIN-rem,"minute").second(0).millisecond(0)
+}
+function nextOpeningFrom(d){
+  let t=d.clone()
+  if (t.hour()>=AFTERNOON.end) t = t.add(1,"day").hour(MORNING.start).minute(0).second(0).millisecond(0)
+  else if (t.hour()>=MORNING.end && t.hour()<AFTERNOON.start) t = t.hour(AFTERNOON.start).minute(0).second(0).millisecond(0)
+  else if (t.hour()<MORNING.start) t = t.hour(MORNING.start).minute(0).second(0).millisecond(0)
+  while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) {
+    t=t.add(1,"day").hour(MORNING.start).minute(0).second(0).millisecond(0)
   }
-  const entry = SVC_IDS[envKey]
-  return entry?.id || null
+  return t
 }
 
-async function squareCreateCustomer ({ givenName, familyName, phoneNumber, emailAddress }) {
-  const body = {
-    idempotency_key: crypto.randomUUID(),
-    given_name: givenName || undefined,
-    family_name: familyName || undefined,
-    phone_number: phoneNumber || undefined,
-    email_address: emailAddress || undefined
-  }
-  const r = await fetch('https://connect.squareup.com/v2/customers', {
-    method: 'POST',
-    headers: SQ_HEADERS,
-    body: JSON.stringify(body)
-  })
-  if (!r.ok) throw new Error(`createCustomer: ${r.status} ${await r.text()}`)
-  const j = await r.json()
-  return j.customer?.id
+// Coerciones robustas a dayjs
+function toDayjsEU(x){
+  if (!x) return null
+  if (dayjs.isDayjs(x)) return x.tz(EURO_TZ)
+  if (typeof x === "number") return dayjs.tz(x, EURO_TZ)
+  if (typeof x === "string") return dayjs.tz(x, EURO_TZ)
+  return null
+}
+function coerceOffers(arr){
+  if (!Array.isArray(arr) || !arr.length) return []
+  return arr.map(o => toDayjsEU(o)).filter(d => d && d.isValid())
 }
 
-async function squareSearchAvailability ({
-  locationId,
-  serviceVariationId,
-  teamMemberId,
-  startAt,
-  endAt,
-  max = 10
-}) {
-  // Intento 100% API; si devuelve 400, devolvemos [] y dejamos fallback
-  const body = {
-    query: {
-      filter: {
-        location_id: locationId,
-        start_at_range: { start_at: startAt, end_at: endAt },
-        segment_filters: [
-          {
-            service_variation_id: serviceVariationId,
-            team_member_id_filter: teamMemberId ? { any: [teamMemberId] } : undefined
-          }
-        ]
-      }
-    },
-    limit: max
-  }
-  const r = await fetch('https://connect.squareup.com/v2/bookings/availability/search', {
-    method: 'POST',
-    headers: SQ_HEADERS,
-    body: JSON.stringify(body)
-  })
-  if (!r.ok) {
-    const txt = await r.text()
-    console.warn('searchAvailability:', r.status, txt)
-    return []
-  }
-  const j = await r.json()
-  const slots = j.availabilities || []
-  return slots.map(a => a.start_at)
-}
+// ====== DB mínima
+const db=new Database("gapink.db");db.pragma("journal_mode = WAL")
+db.exec(`
+CREATE TABLE IF NOT EXISTS appointments (
+  id TEXT PRIMARY KEY,
+  customer_name TEXT,
+  customer_phone TEXT,
+  customer_square_id TEXT,
+  location_key TEXT,
+  service_key TEXT,
+  service_name TEXT,
+  duration_min INTEGER,
+  start_iso TEXT,
+  end_iso TEXT,
+  staff_id TEXT,
+  status TEXT,
+  created_at TEXT,
+  square_booking_id TEXT
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  phone TEXT PRIMARY KEY,
+  data_json TEXT,
+  updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_apt_loc_time ON appointments(location_key, start_iso);
+`)
+const insertAppt = db.prepare(`INSERT INTO appointments
+(id, customer_name, customer_phone, customer_square_id, location_key, service_key, service_name, duration_min, start_iso, end_iso, staff_id, status, created_at, square_booking_id)
+VALUES (@id,@customer_name,@customer_phone,@customer_square_id,@location_key,@service_key,@service_name,@duration_min,@start_iso,@end_iso,@staff_id,@status,@created_at,@square_booking_id)`)
+const updateApptStatus = db.prepare(`UPDATE appointments SET status=@status, square_booking_id=@square_booking_id WHERE id=@id`)
+const markCancelled = db.prepare(`UPDATE appointments SET status='cancelled' WHERE id=@id`)
+const getUpcomingByPhone = db.prepare(`SELECT * FROM appointments WHERE customer_phone=@phone AND status='confirmed' AND start_iso > @now ORDER BY start_iso ASC LIMIT 1`)
 
-async function squareCreateBooking ({
-  locationId, customerId, serviceVariationId, teamMemberId, startAt, durationMin
-}) {
-  const body = {
-    idempotency_key: crypto.randomUUID(),
-    booking: {
-      location_id: locationId,
-      start_at: startAt,
-      customer_id: customerId,
-      appointment_segments: [
-        {
-          duration_minutes: Number(durationMin) || 60,
-          service_variation_id: serviceVariationId,
-          team_member_id: teamMemberId || undefined
-        }
-      ]
+function loadSession(phone){
+  const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
+  if (!row?.data_json) return null
+  const json = JSON.parse(row.data_json)
+  if (json.startEU_ms) json.startEU = dayjs.tz(json.startEU_ms, EURO_TZ)
+  if (json.selectedStartEU_ms) json.selectedStartEU = dayjs.tz(json.selectedStartEU_ms, EURO_TZ)
+  if (Array.isArray(json.lastOptions_ms) && json.lastOptions_ms.length){
+    json.lastOptions = json.lastOptions_ms.map(ms => dayjs.tz(ms, EURO_TZ))
+  } else if (Array.isArray(json.lastOptions) && json.lastOptions.length){
+    json.lastOptions = coerceOffers(json.lastOptions)
+  } else {
+    json.lastOptions = []
+  }
+  return json
+}
+function saveSession(phone, data){
+  const d={...data}
+  d.startEU_ms = data.startEU?.valueOf?.() ?? data.startEU_ms ?? null
+  d.selectedStartEU_ms = data.selectedStartEU?.valueOf?.() ?? data.selectedStartEU_ms ?? null
+  d.lastOptions_ms = Array.isArray(data.lastOptions) ? data.lastOptions.map(o => toDayjsEU(o)?.valueOf?.() ?? null).filter(Boolean) : []
+  delete d.startEU; delete d.selectedStartEU; delete d.lastOptions
+  const j = JSON.stringify(d)
+  const upd = db.prepare(`UPDATE sessions SET data_json=@data_json, updated_at=@updated_at WHERE phone=@phone`)
+  const res = upd.run({ phone, data_json:j, updated_at:new Date().toISOString() })
+  if (res.changes===0) {
+    db.prepare(`INSERT INTO sessions (phone, data_json, updated_at) VALUES (@phone,@data_json,@updated_at)`)
+      .run({ phone, data_json:j, updated_at:new Date().toISOString() })
+  }
+}
+function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
+
+// ====== Empleadas (dinámico por .env “ID|BOOKABLE|LOCS”), con etiquetas de nombre
+function deriveLabelsFromEnvKey(envKey){
+  const raw = envKey.replace(/^SQ_EMP_/, "")
+  const toks = raw.split("_").map(t=>norm(t)).filter(t=>t && t!=="sq" && t!=="emp")
+  const uniq = Array.from(new Set(toks))
+  const labels = [...uniq]
+  if (uniq.length>1) labels.push(uniq.join(" "))
+  return labels
+}
+function parseEmployees(){
+  const out=[]
+  for (const [k,v] of Object.entries(process.env)) {
+    if (!k.startsWith("SQ_EMP_")) continue
+    const [id, book, locs] = String(v||"").split("|")
+    if (!id) continue
+    const bookable = (book||"").toUpperCase()==="BOOKABLE"
+    const allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
+    const labels = deriveLabelsFromEnvKey(k)
+    out.push({ envKey:k, id, bookable, allow, labels })
+  }
+  return out
+}
+const EMPLOYEES = parseEmployees()
+const ID2LABEL = Object.fromEntries(EMPLOYEES.map(e => [e.id, (e.labels[0]||"")]))
+
+function detectPreferredStaff(text, locKey){
+  const t = norm(text)
+  let cand = null
+  for (const e of EMPLOYEES){
+    if (e.labels.some(lbl => t.includes(lbl))){
+      cand = e; break
     }
   }
-  const r = await fetch('https://connect.squareup.com/v2/bookings', {
-    method: 'POST',
-    headers: SQ_HEADERS,
-    body: JSON.stringify(body)
-  })
-  if (!r.ok) throw new Error(`createBooking: ${r.status} ${await r.text()}`)
-  const j = await r.json()
-  return j.booking
-}
-
-// ------------------------------
-// Slots fallback (cuando Square 400)
-// ------------------------------
-function ceilToNextSlot (d) {
-  const m = d.minute()
-  const add = (m % 30 === 0) ? 0 : (30 - (m % 30))
-  return d.add(add, 'minute').second(0).millisecond(0)
-}
-function generateOffers ({ days = 3, durationMin = 60 }) {
-  const res = []
-  let cur = ceilToNextSlot(dayjs().add(Number(BOT_NOW_OFFSET_MIN) || 0, 'minute'))
-  const end = dayjs().add(days, 'day').endOf('day')
-
-  while (cur.isBefore(end)) {
-    const wd = cur.day()
-    const hm = cur.format('HH:mm')
-    const isOpen = (wd >= 1 && wd <= 5) &&
-      ((hm >= '10:00' && hm < '14:00') || (hm >= '16:00' && hm < '20:00')) &&
-      !isHoliday(cur)
-
-    if (isOpen) res.push(cur.toISOString())
-    cur = cur.add(30, 'minute')
+  if (!cand) return null
+  const locId = locationToId(locKey||"torre")
+  if (!cand.bookable || !(cand.allow.includes("ALL") || cand.allow.includes(locId))) {
+    return { id: null, preferId: cand.id, preferLabel: (cand.labels[0]||"") }
   }
-  return res.slice(0, 12)
+  return { id: cand.id, preferId: cand.id, preferLabel: (cand.labels[0]||"") }
 }
 
-// Emparejar “a las 10” con ofertas ISO
-function parseTimeAgainstOffers (text, offersISO, preferDay = null) {
+function pickStaffForLocation(locKey, preferId=null){
+  const locId = locationToId(locKey)
+  if (preferId){
+    const e = EMPLOYEES.find(x=>x.id===preferId)
+    if (e && e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId))) return e.id
+  }
+  const found = EMPLOYEES.find(e=>e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
+  return found?.id || null
+}
+function preferredValidForLoc(preferId, locKey){
+  const locId = locationToId(locKey)
+  const e = EMPLOYEES.find(x=>x.id===preferId)
+  return !!(e && e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
+}
+
+// ====== Servicios
+const SVC = {
+  // pestañas
+  LIFITNG_DE_PESTANAS_Y_TINTE: { name:"Lifting de pestañas y tinte", dur:60 },
+  EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO: { name:"Extensiones nuevas pelo a pelo", dur:120 },
+  EXTENSIONES_PESTANAS_NUEVAS_2D: { name:"Extensiones nuevas 2D", dur:120 },
+  EXTENSIONES_PESTANAS_NUEVAS_3D: { name:"Extensiones nuevas 3D", dur:120 },
+  RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO: { name:"Relleno pestañas pelo a pelo", dur:90 },
+  RELLENO_PESTANAS_2D: { name:"Relleno pestañas 2D", dur:90 },
+  RELLENO_PESTANAS_3D: { name:"Relleno pestañas 3D", dur:90 },
+  QUITAR_EXTENSIONES_PESTANAS: { name:"Quitar extensiones de pestañas", dur:30 },
+
+  // uñas rápidas
+  MANICURA_SEMIPERMANENTE: { name:"Manicura semipermanente", dur:30 },
+  MANICURA_SEMIPERMANENTE_QUITAR: { name:"Manicura semipermanente + quitar", dur:40 },
+  MANICURA_CON_ESMALTE_NORMAL: { name:"Manicura con esmalte normal", dur:30 },
+  PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE: { name:"Pedicura spa (semipermanente)", dur:60 },
+}
+const SERVICE_KEYS = Object.keys(SVC)
+
+const SVC_SYNON = [
+  // pestañas
+  ["lifting tinte", "LIFITNG_DE_PESTANAS_Y_TINTE", ["lifting + tinte","lifting y tinte","lash lift","lifting pestañas"]],
+  ["pelo a pelo", "EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO", ["clasicas","clásicas","classic"]],
+  ["extensiones 2d", "EXTENSIONES_PESTANAS_NUEVAS_2D", ["2 d"]],
+  ["extensiones 3d", "EXTENSIONES_PESTANAS_NUEVAS_3D", ["3 d"]],
+  ["relleno pelo a pelo", "RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO", []],
+  ["relleno 2d", "RELLENO_PESTANAS_2D", []],
+  ["relleno 3d", "RELLENO_PESTANAS_3D", []],
+  ["quitar extensiones", "QUITAR_EXTENSIONES_PESTANAS", ["retirar extensiones","retirar pestañas","quitar pestañas"]],
+  // uñas
+  ["manicura semipermanente", "MANICURA_SEMIPERMANENTE", ["semi"]],
+  ["manicura semipermanente quitar", "MANICURA_SEMIPERMANENTE_QUITAR", ["retirar semi","remove gel"]],
+  ["manicura normal", "MANICURA_CON_ESMALTE_NORMAL", []],
+  ["pedicura semipermanente", "PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE", []],
+]
+
+function detectService(text){
+  const t=norm(text)
+  if (/\blifting\b/.test(t) && (/\btinte\b/.test(t) || /lash\s*lift/.test(t))) {
+    return "LIFITNG_DE_PESTANAS_Y_TINTE"
+  }
+  for (const [label,key,extra] of SVC_SYNON) {
+    if (t.includes(norm(label)) || (extra||[]).some(x => t.includes(norm(x)))) return key
+  }
+  // fuzzy simple
+  const tokens=t.split(/\s+/).filter(Boolean)
+  let best=null, scoreBest=0
+  for (const k of SERVICE_KEYS) {
+    const words = norm(SVC[k].name).split(/\s+/)
+    let score=0; for(const tok of tokens){ if (words.includes(tok)) score++ }
+    if (score>scoreBest){ scoreBest=score; best=k }
+  }
+  return scoreBest>=2 ? best : null
+}
+
+// Env de servicio por local
+function svcEnvName(key, locKey){
+  return locKey==="luz" ? `SQ_SVC_luz_${key}` : `SQ_SVC_${key}`
+}
+function pickServiceEnvPair(key, locKey){
+  const envName = svcEnvName(key, locKey)
+  const raw = process.env[envName]
+  if (!raw) return null
+  const [id, versionStr] = String(raw).split("|")
+  return { id, version: versionStr ? Number(versionStr) : undefined, duration: SVC[key]?.dur ?? 60, name: SVC[key]?.name || key }
+}
+async function getServiceVariationVersion(id){
+  try{
+    const resp = await square.catalogApi.retrieveCatalogObject(id, true)
+    return resp?.result?.object?.version
+  }catch{ return undefined }
+}
+function stableKey(parts){
+  const raw = Object.values(parts).join("|")
+  return createHash("sha256").update(raw).digest("hex").slice(0,48)
+}
+
+// ====== Bookings Square
+async function createSquareBooking({ startEU, serviceKey, locationKey, customerId, teamMemberId }){
+  try{
+    const pair = pickServiceEnvPair(serviceKey, locationKey)
+    if (!pair?.id || !locationToId(locationKey) || !teamMemberId) return null
+    const version = pair.version || await getServiceVariationVersion(pair.id)
+    if (!version) return null
+    const startISO = startEU.tz("UTC").toISOString()
+    const idempotencyKey = stableKey({loc:locationToId(locationKey), sv:pair.id, startISO, customerId, teamMemberId})
+    const body = {
+      idempotencyKey,
+      booking: {
+        locationId: locationToId(locationKey),
+        startAt: startISO,
+        customerId,
+        appointmentSegments: [{
+          teamMemberId,
+          serviceVariationId: pair.id,
+          serviceVariationVersion: Number(version),
+          durationMinutes: pair.duration
+        }]
+      }
+    }
+    const resp = await square.bookingsApi.createBooking(body)
+    return resp?.result?.booking || null
+  }catch(e){ console.error("createSquareBooking:", e?.message||e); return null }
+}
+async function cancelSquareBooking(bookingId){
+  try{
+    const get = await square.bookingsApi.retrieveBooking(bookingId)
+    const version = get?.result?.booking?.version
+    if (!version) return false
+    const body = { idempotencyKey:`cancel_${bookingId}_${Date.now()}`, bookingVersion: version }
+    const r = await square.bookingsApi.cancelBooking(bookingId, body)
+    return !!r?.result?.booking?.id
+  }catch(e){ console.error("cancelSquareBooking:", e?.message||e); return false }
+}
+
+// ====== Propuestas de hora (no availability)
+function fmtES(d){
+  const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]
+  const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ)
+  const DD=String(t.date()).padStart(2,"0")
+  const MM=String(t.month()+1).padStart(2,"0")
+  const HH=String(t.hour()).padStart(2,"0")
+  const mm=String(t.minute()).padStart(2,"0")
+  return `${dias[t.day()]} ${DD}/${MM} ${HH}:${mm}`
+}
+function proposeSlots({ fromEU, durationMin, n=3 }){
+  const out=[]
+  let t = ceilToSlotEU(fromEU.clone())
+  t = nextOpeningFrom(t)
+  while (out.length<n){
+    const end=t.clone().add(durationMin,"minute")
+    if (insideBusinessHours(t,durationMin)){
+      out.push(t.clone())
+      t = t.add(SLOT_MIN,"minute")
+    } else {
+      if (t.hour()>=AFTERNOON.end) t = t.add(1,"day").hour(MORNING.start).minute(0)
+      else if (t.hour()>=MORNING.end && t.hour()<AFTERNOON.start) t = t.hour(AFTERNOON.start).minute(0)
+      else t=t.add(SLOT_MIN,"minute")
+      while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) {
+        t=t.add(1,"day").hour(MORNING.start).minute(0)
+      }
+    }
+  }
+  return out
+}
+
+// ====== Parser de fecha/hora simple
+const DOW = { domingo:0,lunes:1,martes:2,miércoles:3,miercoles:3,jueves:4,viernes:5,sábado:6,sabado:6 }
+const WHEN = { hoy:0, today:0, mañana:1, manana:1, tomorrow:1 }
+function parseDateTimeEU(text){
   const t = norm(text)
-  const m = t.match(/\b(?:a\s+las?\s+)?(\d{1,2})(?:[:.\s](\d{2}))?\b/)
-  if (!m) return null
-  const hh = String(m[1]).padStart(2, '0')
-  const mm = String(m[2] || '00').padStart(2, '0')
-  const target = `${hh}:${mm}`
-  // Buscar primero el mismo día si preferDay está
-  let list = offersISO
-  if (preferDay) {
-    list = offersISO.filter(x => dayjs(x).format('YYYY-MM-DD') === preferDay)
-      .concat(offersISO.filter(x => dayjs(x).format('YYYY-MM-DD') !== preferDay))
+  const m = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\s+(\d{1,2})(?::(\d{2}))?\b/)
+  if (m){
+    let dd=+m[1], mm=+m[2], yy=m[3]?+m[3]:dayjs().tz(EURO_TZ).year()
+    if (yy<100) yy+=2000
+    const hh=+m[4], mi=m[5]?+m[5]:0
+    let dt=dayjs.tz(`${yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")} ${String(hh).padStart(2,"0")}:${String(mi).padStart(2,"0")}`, EURO_TZ)
+    const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
+    if (dt.isBefore(guard)) dt = guard
+    return dt
   }
-  const hit = list.find(iso => dayjs(iso).format('HH:mm') === target)
+  const hm = t.match(/\b(\d{1,2})(?::(\d{2}))?\b/)
+  const w = Object.keys(WHEN).find(k=>t.includes(k))
+  if (w && hm){
+    const base = dayjs().tz(EURO_TZ).add(WHEN[w],"day").startOf("day")
+    let dt = base.hour(+hm[1]).minute(hm[2]?+hm[2]:0)
+    const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
+    if (dt.isBefore(guard)) dt = guard
+    return dt
+  }
+  for (const [name, dow] of Object.entries(DOW)){
+    if (t.includes(name) && hm){
+      const now = dayjs().tz(EURO_TZ)
+      let dd = now.startOf("day")
+      let delta = (dow - dd.day() + 7) % 7
+      if (delta===0 && now.hour()>=AFTERNOON.end) delta=7
+      dd = dd.add(delta,"day")
+      let dt = dd.hour(+hm[1]).minute(hm[2]?+hm[2]:0)
+      const guard = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
+      if (dt.isBefore(guard)) dt = guard
+      return dt
+    }
+  }
+  return null
+}
+
+// ====== Selección por “el primero / el segundo / 10:00 / 1”
+function parseChoiceIndex(text){
+  const t = norm(text)
+  if (/\b(primero|primera|1ro|1ª|1a|1º)\b/.test(t)) return 0
+  if (/\b(segundo|segunda|2do|2ª|2a|2º)\b/.test(t)) return 1
+  if (/\b(tercero|tercera|3ro|3ª|3a|3º)\b/.test(t)) return 2
+  const n = t.match(/\b([123])\b/); if (n) return Number(n[1])-1
+  return null
+}
+function parseTimeAgainstOffers(text, offers){
+  const list = coerceOffers(offers)
+  if (!list.length) return null
+  const t = norm(text)
+  const hm = t.match(/\b(\d{1,2})(?::(\d{2}))?\b/)
+  if (!hm) return null
+  const hh = +hm[1], mi = hm[2]?+hm[2]:0
+  const target = `${String(hh).padStart(2,"0")}:${String(mi).padStart(2,"0")}`
+  const hit = list.find(o => o.format("HH:mm")===target)
   return hit || null
 }
 
-// ------------------------------
-// Textos
-// ------------------------------
-const WELCOME =
-  `Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.\n\n` +
-  `${openingMsg()}\n\n` +
-  `Si quieres reservar una cita puedes hacerlo a través de este link:\n\n` +
-  `https://gapinknails.square.site/\n\n` +
-  `Y si quieres modificarla puedes hacerlo a través del link del sms que llega con su cita.\n\n` +
-  `Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.\nGracias 😘`
+// ====== Mensajes tipo
+const WELCOME_MSG =
+`Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.
 
-const QUESTION_LOCATION = '¿En qué salón te viene mejor, **Málaga – La Luz** o **Torremolinos**?'
-const QUESTION_LASH =
-  `¿Qué servicio de **pestañas** necesitas?\n` +
-  `* Lifting + tinte\n` +
-  `* Extensiones nuevas: pelo a pelo (clásicas) / 2D / 3D\n` +
-  `* Relleno: pelo a pelo / 2D / 3D\n` +
-  `* Quitar extensiones\n\n` +
-  `Escribe por ejemplo: "Extensiones 2D", "Relleno pelo a pelo" o "Lifting + tinte".`
+Solo atenderemos por WhatsApp y llamadas en horario de lunes a viernes de 10 a 14:00 y de 16:00 a 20:00
 
-function offersToText (offersISO, label, service) {
-  if (!offersISO?.length) return 'No tengo huecos en ese rango ahora mismo.'
-  const lines = offersISO.slice(0, 3).map(iso =>
-    `* ${dayjs(iso).format('dddd DD/MM HH:mm')}`
-  )
-  return `Tengo estos huecos para **${service}** en **${label}**:\n${lines.join('\n')}\n\n` +
-    `¿Te viene bien el primero? Si prefieres otro día/hora, dímelo.`
-}
+Si quieres reservar una cita puedes hacerlo a través de este link:
 
-// ------------------------------
-// WhatsApp – start
-// ------------------------------
-async function startBot () {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth')
-  const { version } = await fetchLatestBaileysVersion()
+https://gapinknails.square.site/
 
-  const sock = makeWASocket({
-    version,
-    browser: Browsers.macOS('Safari'),
-    auth: state,
-    printQRInTerminal: true,
-    syncFullHistory: false
-  })
+Y si quieres modificarla puedes hacerlo a través del link del sms que llega con su cita.
 
-  sock.ev.on('creds.update', saveCreds)
+Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.
+Gracias 😘`
 
-  sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-    if (connection === 'close') {
-      const mustReconnect =
-        (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
-      console.log(mustReconnect ? '❌ Conexión cerrada. Reintentando…' : '🔴 Sesión cerrada.')
-      if (mustReconnect) startBot()
-    } else if (connection === 'open') {
-      console.log('✅ WhatsApp listo')
-    }
-  })
+const OOH_MSG = (link) =>
+`Ahora estamos fuera de horario. Si necesitas una cita, dímela y te la gestiono igual 😉 (o usa ${link}).`
 
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages?.[0]
-    if (!msg || msg.key.fromMe) return
+const ASK_LOC_AND_SVC =
+"¿En qué salón te viene mejor, Málaga – La Luz o Torremolinos?\n\n¿Qué servicio necesitas? (ej.: “manicura semipermanente”, “Extensiones 2D”, “Lifting + tinte”)."
 
-    const jid = msg.key.remoteJid
-    const text = msg.message?.conversation ||
-      msg.message?.extendedTextMessage?.text ||
-      msg.message?.ephemeralMessage?.message?.conversation ||
-      ''
-    if (!text) return
+const ASK_LASH = (haveLoc)=>
+`${haveLoc ? "" : "¿En qué salón te viene mejor, *Málaga – La Luz* o *Torremolinos*?\n\n"}¿Qué servicio de *pestañas* necesitas?
+• *Lifting + tinte*
+• *Extensiones nuevas*: pelo a pelo (clásicas) / 2D / 3D
+• *Relleno*: pelo a pelo / 2D / 3D
+• *Quitar* extensiones
 
-    const s = getS(jid)
-    s.history.push(text)
-    if (s.history.length > 20) s.history = s.history.slice(-20)
+Escribe por ejemplo: "Extensiones 2D", "Relleno pelo a pelo" o "Lifting + tinte".`
 
-    // 1) Mensaje inicial / fuera de horario
-    if (s.step === 'INIT') {
-      await sock.sendMessage(jid, { text: WELCOME })
-      s.step = 'ASK_LOCATION_OR_SERVICE'
-      // no paramos: seguimos a ver si ya dio pistas en el mismo mensaje
-    }
+// ====== Mini-web
+const app=express()
+const PORT=process.env.PORT||8080
+let lastQR=null, conectado=false, sock=null
 
-    // Cancelar
-    if (/cancel(ar|a|acion|ación)/i.test(text)) {
-      await sock.sendMessage(jid, { text: `Para cancelar o mover tu cita, usa el enlace del SMS de confirmación. Si no lo tienes, dime **nombre completo** y **fecha** de la cita y lo gestionamos.` })
-      return
-    }
-
-    // Detecta local si no lo tenemos
-    if (!s.locationId) {
-      const loc = detectLocation(text)
-      if (loc) {
-        s.locationKey = loc.key
-        s.locationId = loc.id
-        s.locationLabel = loc.label
-      }
-    }
-
-    // Detecta servicio si no lo tenemos
-    if (!s.serviceKey) {
-      let svc = detectService(text)
-      if (!svc) svc = detectServiceFromHistory(s.history)
-      if (!svc) svc = await aiDetectService(s.history)
-      if (svc) {
-        s.serviceKey = svc
-        s.durationMin = SVC_DUR[svc] || 60
-      }
-    }
-
-    // Staff solicitado (ej. "con desi")
-    const low = norm(text)
-    const staffMatch = low.match(/\bcon\s+([a-z\u00f1]+(?:\s+[a-z\u00f1]+)?)\b/)
-    if (staffMatch) {
-      const name = staffMatch[1]
-      s.staffName = name
-      s.staffId = STAFF_NAME_TO_ID[name] || null
-    }
-
-    // Preguntas pendientes
-    if (!s.locationId) {
-      await sock.sendMessage(jid, { text: QUESTION_LOCATION })
-      return
-    }
-
-    if (!s.serviceKey) {
-      // Si habló de pestañas explícitamente, muestra menú de pestañas
-      if (/\bpestan(?:as|as)\b/i.test(text)) {
-        await sock.sendMessage(jid, { text: QUESTION_LASH })
-      } else {
-        await sock.sendMessage(jid, {
-          text: `¿Qué servicio necesitas? (ej.: “manicura semipermanente”, “Extensiones 2D”, “Lifting + tinte”).`
-        })
-      }
-      return
-    }
-
-    // 2) Ya tengo local + servicio -> ofrece huecos
-    if (!s.offersISO?.length) {
-      const serviceVariationId = getServiceVariationId(s.serviceKey, s.locationKey)
-      let offersISO = []
-      if (serviceVariationId) {
-        const start = dayjs().toISOString()
-        const end = dayjs().add(Number(BOT_SEARCH_WINDOW_DAYS) || 14, 'day').toISOString()
-        offersISO = await squareSearchAvailability({
-          locationId: s.locationId,
-          serviceVariationId,
-          teamMemberId: s.staffId || undefined,
-          startAt: start,
-          endAt: end,
-          max: 10
-        })
-      }
-      if (!offersISO.length) {
-        // fallback local
-        offersISO = generateOffers({ days: 5, durationMin: s.durationMin })
-      }
-      s.offersISO = offersISO
-      if (!offersISO.length) {
-        await sock.sendMessage(jid, { text: `Ahora mismo no tengo huecos visibles. ¿Te viene bien decirme **un día y hora** aproximados y lo miro?` })
-        return
-      }
-      await sock.sendMessage(jid, { text: offersToText(offersISO, s.locationLabel, prettyService(s.serviceKey)) })
-      s.step = 'ASK_TIME_CONFIRM'
-      return
-    }
-
-    // 3) Esperamos confirmación de hora
-    if (s.step === 'ASK_TIME_CONFIRM') {
-      // “el primero”
-      if (/\b(primer[oa]?|el primero|vale|ok|me vale|perfecto)\b/i.test(text)) {
-        s.selectedISO = s.offersISO[0]
-      } else {
-        // “a las 10”
-        const preferDay = dayjs(s.offersISO[0]).format('YYYY-MM-DD')
-        s.selectedISO = parseTimeAgainstOffers(text, s.offersISO, preferDay)
-      }
-
-      if (!s.selectedISO) {
-        await sock.sendMessage(jid, { text: `Dime la hora exacta de las opciones (por ejemplo: “a las ${dayjs(s.offersISO[0]).format('HH:mm')}”).` })
-        return
-      }
-
-      s.step = 'ASK_NAME'
-      await sock.sendMessage(jid, { text: `Para cerrar, dime tu **nombre y apellidos**.` })
-      return
-    }
-
-    if (s.step === 'ASK_NAME') {
-      const name = text.trim()
-      if (name.split(' ').length < 2) {
-        await sock.sendMessage(jid, { text: `Por favor, dime **nombre y apellidos**.` })
-        return
-      }
-      s.name = name
-      s.step = 'BOOKING'
-    }
-
-    if (s.step === 'BOOKING') {
-      // Crear cliente y reserva en Square
-      try {
-        const [given, ...rest] = s.name.split(' ')
-        const family = rest.join(' ')
-        const serviceVariationId = getServiceVariationId(s.serviceKey, s.locationKey)
-        const customerId = await squareCreateCustomer({
-          givenName: given,
-          familyName: family,
-          phoneNumber: jid.split('@')[0]
-        })
-
-        const booking = await squareCreateBooking({
-          locationId: s.locationId,
-          customerId,
-          serviceVariationId,
-          teamMemberId: s.staffId || undefined,
-          startAt: s.selectedISO,
-          durationMin: s.durationMin
-        })
-
-        await sock.sendMessage(jid, {
-          text:
-`Reserva confirmada 🎉
-Salón: ${s.locationLabel}
-Servicio: ${prettyService(s.serviceKey)}
-Profesional: ${s.staffName ? `${s.staffName} (si está disponible)` : 'cualquiera'}
-Fecha: ${dayjs(s.selectedISO).format('dddd DD/MM HH:mm')}
-Duración: ${s.durationMin} min
-Pago en persona.
-
-Si quieres modificarla, usa el link del SMS que te llegará.`
-        })
-
-        // reset básico
-        SESSIONS.delete(jid)
-      } catch (e) {
-        console.error(e)
-        await sock.sendMessage(jid, { text: `No he podido confirmar la reserva ahora mismo. ¿Te viene bien que te pase **otros huecos** o prefieres reservar desde:\nhttps://gapinknails.square.site/` })
-      }
-      return
-    }
-
-    // Si no coincidió nada, mensaje de ayuda
-    if (!s.selectedISO) {
-      await sock.sendMessage(jid, { text: `¿Necesitas **pestañas** (Lifting, extensiones nuevas, relleno o quitar), **uñas** o **pedicura**? Dime además si prefieres **Málaga – La Luz** o **Torremolinos**.` })
-    }
-  })
-}
-
-function prettyService (key) {
-  const map = {
-    LIFITNG_DE_PESTANAS_Y_TINTE: 'Lifting + tinte',
-    EXTENSIONES_DE_PESTANAS_NUEVAS_PELO_A_PELO: 'Extensiones nuevas pelo a pelo',
-    EXTENSIONES_PESTANAS_NUEVAS_2D: 'Extensiones nuevas 2D',
-    EXTENSIONES_PESTANAS_NUEVAS_3D: 'Extensiones nuevas 3D',
-    RELLENO_EXTENSIONES_PESTANAS_PELO_A_PELO: 'Relleno pelo a pelo',
-    RELLENO_PESTANAS_2D: 'Relleno 2D',
-    RELLENO_PESTANAS_3D: 'Relleno 3D',
-    QUITAR_EXTENSIONES_PESTANAS: 'Quitar extensiones de pestañas',
-    MANICURA_SEMIPERMANENTE: 'Manicura semipermanente',
-    MANICURA_SEMIPERMANENTE_QUITAR: 'Quitar semipermanente',
-    MANICURA_CON_ESMALTE_NORMAL: 'Manicura con esmalte normal',
-    PEDICURA_SPA_CON_ESMALTE_SEMIPERMANENTE: 'Pedicura SPA semipermanente'
-  }
-  return map[key] || key.replace(/_/g, ' ').toLowerCase()
-}
-
-// ------------------------------
-// http tiny server (salud)
-// ------------------------------
-import http from 'http'
-http.createServer((_, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
-  res.end('Gapink WhatsApp bot OK\n')
-}).listen(8080, () => console.log('🌐 Web 8080'))
-
-// Arrancar
-startBot().catch(err => {
-  console.error(err)
-  process.exit(1)
+app.get("/", (_req,res)=>{
+  res.send(`<!doctype html><meta charset="utf-8"><style>
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh}
+  .card{max-width:560px;padding:24px;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08)}
+  </style><div class="card"><h1>Gapink Nails</h1>
+  <p>Estado: ${conectado?"✅ Conectado":"❌ Desconectado"}</p>
+  ${!conectado&&lastQR?`<img src="/qr.png" width="300">`:""}
+  </div>`)
 })
+app.get("/qr.png", async (_req,res)=>{
+  if(!lastQR) return res.status(404).send("No QR")
+  const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
+  res.set("Content-Type","image/png").send(png)
+})
+
+app.listen(PORT, ()=>{ console.log("🌐 Web", PORT); startBot().catch(console.error) })
+
+// ====== Carga ROBUSTA de Baileys (ESM/CJS)
+async function loadBaileys(){
+  const require = createRequire(import.meta.url)
+  let mod = null
+  try { mod = require("@whiskeysockets/baileys") } catch {}
+  if (!mod) {
+    try { mod = await import("@whiskeysockets/baileys") } catch {}
+  }
+  if (!mod) throw new Error("No se pudo cargar @whiskeysockets/baileys")
+
+  const makeWASocket =
+    mod.makeWASocket ||
+    mod.default?.makeWASocket ||
+    (typeof mod.default === "function" ? mod.default : undefined)
+
+  const useMultiFileAuthState =
+    mod.useMultiFileAuthState ||
+    mod.default?.useMultiFileAuthState
+
+  const fetchLatestBaileysVersion =
+    mod.fetchLatestBaileysVersion ||
+    mod.default?.fetchLatestBaileysVersion ||
+    (async()=>({ version:[2,3000,0] }))
+
+  const Browsers =
+    mod.Browsers ||
+    mod.default?.Browsers || { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
+
+  if (typeof makeWASocket !== "function" || typeof useMultiFileAuthState !== "function") {
+    throw new Error("Baileys incompatible. Instala @whiskeysockets/baileys ^6.x")
+  }
+  return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
+}
+
+async function startBot(){
+  try{
+    const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
+    if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info")
+    const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
+
+    sock = makeWASocket({
+      logger: pino({ level:"silent" }),
+      printQRInTerminal: false,
+      auth: state,
+      version,
+      browser: Browsers.macOS("Desktop"),
+      syncFullHistory: false
+    })
+
+    sock.ev.on("connection.update", ({connection, qr})=>{
+      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
+      if (connection==="open"){ lastQR=null; conectado=true; console.log("✅ WhatsApp listo") }
+      if (connection==="close"){ conectado=false; console.log("❌ Conexión cerrada. Reintentando…"); setTimeout(()=>startBot().catch(console.error), 2500) }
+    })
+    sock.ev.on("creds.update", saveCreds)
+
+    sock.ev.on("messages.upsert", async ({messages})=>{
+      const m=messages?.[0]; if (!m?.message || m.key.fromMe) return
+      const from = m.key.remoteJid
+      const phone = normalizePhoneES((from||"").split("@")[0]||"") || (from||"").split("@")[0]
+      const body  = m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || ""
+      const text  = (body||"").trim()
+      const low   = norm(text)
+
+      let s = loadSession(phone) || {
+        greeted:false, lastOOHDay:null,
+        locationKey:null, serviceKey:null, durationMin:null,
+        lastOptions:[], pendingConfirm:false,
+        selectedStartEU:null, preferredStaffId:null, preferredStaffLabel:null,
+        awaitingStaffChoice:false, suggestedFallbackId:null,
+        name:null, email:null, awaitingName:false, awaitingEmail:false
+      }
+
+      // ===== Bienvenida (una vez)
+      if (!s.greeted){
+        await sock.sendMessage(from, { text: WELCOME_MSG })
+        s.greeted=true; saveSession(phone,s)
+      }
+
+      // ===== INTENTOS DE CANCELAR / REPROGRAMAR (prioridad ALTA)
+      if (CANCEL_RE.test(low)){
+        const upc = getUpcomingByPhone.get({ phone, now: dayjs().utc().toISOString() })
+        if (upc?.square_booking_id){
+          const ok = await cancelSquareBooking(upc.square_booking_id)
+          if (ok){ markCancelled.run({ id: upc.id }); clearSession(phone)
+            await sock.sendMessage(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` })
+            return
+          }
+        }
+        if (upc){ markCancelled.run({ id: upc.id }); clearSession(phone)
+          await sock.sendMessage(from,{ text:`He cancelado tu cita del ${fmtES(dayjs(upc.start_iso))}.` })
+          return
+        }
+        await sock.sendMessage(from,{ text:"No veo ninguna cita futura para cancelar ahora mismo." })
+        return
+      }
+      if (RESCH_RE.test(low)){
+        await sock.sendMessage(from,{ text:"Dime la nueva *fecha y hora* (ej.: “lunes 10:00”) y te la cambio." })
+        // (la lógica de reprogramar completa se puede añadir si la usáis mucho)
+      }
+
+      // ===== Fuera de horario ⇒ aviso 1 vez/día (sin bloquear acciones)
+      const nowEU = dayjs().tz(EURO_TZ)
+      const isOpenNow = insideBusinessHours(nowEU.clone(), 15)
+      const todayKey = nowEU.format("YYYY-MM-DD")
+      if (!isOpenNow && s.lastOOHDay !== todayKey){
+        await sock.sendMessage(from, { text: OOH_MSG("https://gapinknails.square.site/") })
+        s.lastOOHDay = todayKey; saveSession(phone,s)
+      }
+
+      // ===== Si estamos esperando NOMBRE/EMAIL, captura directa y sigue al cierre
+      if (s.awaitingName){
+        const candidate = text.replace(/\s+/g," ").trim()
+        if (candidate.length>=3){
+          s.name = candidate; s.awaitingName=false; saveSession(phone,s)
+        } else {
+          await sock.sendMessage(from,{ text:"Dime tu *nombre y apellidos* (por ejemplo: Ana López)." })
+          return
+        }
+      } else if (s.awaitingEmail){
+        if (isValidEmail(text)){
+          s.email = text.trim(); s.awaitingEmail=false; saveSession(phone,s)
+        } else {
+          await sock.sendMessage(from,{ text:"Necesito un email válido (ej.: nombre@correo.com)." })
+          return
+        }
+      }
+
+      // ===== Captura LOCAL + SERVICIO + PREFERENCIA DE STAFF
+      const locTxt = detectLocation(text); if (locTxt) s.locationKey = locTxt
+      const svcTxt = detectService(text);  if (svcTxt) { s.serviceKey = svcTxt; s.durationMin = SVC[svcTxt]?.dur || 60 }
+      const staffPref = detectPreferredStaff(text, s.locationKey || "torre")
+      if (staffPref){
+        s.preferredStaffId = staffPref.preferId || s.preferredStaffId
+        s.preferredStaffLabel = staffPref.preferLabel || s.preferredStaffLabel
+      }
+
+      // ===== Menú pestañas si hace falta
+      const mentionsLash = /\bpesta(?:n|ñ)as\b/.test(low) || /lash/.test(low) || /lifting/.test(low)
+      if (mentionsLash && !s.serviceKey){
+        await sock.sendMessage(from, { text: ASK_LASH(!!s.locationKey) })
+        saveSession(phone,s); return
+      }
+
+      // ===== Falta info base
+      if (!s.locationKey && !s.serviceKey){
+        await sock.sendMessage(from, { text: ASK_LOC_AND_SVC })
+        saveSession(phone,s); return
+      }
+      if (!s.locationKey && s.serviceKey){
+        await sock.sendMessage(from, { text:"¿En qué salón te viene mejor, Málaga – La Luz o Torremolinos?" })
+        saveSession(phone,s); return
+      }
+      if (s.locationKey && !s.serviceKey){
+        const msg = mentionsLash ? ASK_LASH(true) : "¿Qué servicio necesitas? (ej.: “manicura semipermanente”, “Extensiones 2D”, “Lifting + tinte”)."
+        await sock.sendMessage(from, { text: msg })
+        saveSession(phone,s); return
+      }
+
+      // ===== Rehidratar opciones/selección por si tocaron disco
+      s.lastOptions = coerceOffers(s.lastOptions)
+      if (s.selectedStartEU && !dayjs.isDayjs(s.selectedStartEU)) {
+        s.selectedStartEU = toDayjsEU(s.selectedStartEU)
+      }
+
+      // ===== Si ya dimos opciones: entiende “el primero / a las 10 / 1 / con desi”
+      let picked = null
+      if (s.lastOptions?.length){
+        const idx = parseChoiceIndex(text)
+        if (idx!=null && s.lastOptions[idx]) picked = s.lastOptions[idx]
+        if (!picked) picked = parseTimeAgainstOffers(text, s.lastOptions)
+        const saysYes = YES_RE.test(text)
+        if (!picked && saysYes) picked = s.lastOptions[0]
+        if (picked){
+          s.selectedStartEU = picked
+          saveSession(phone,s)
+        }
+      }
+
+      // ===== Intento de parsing directo (ej. “lunes 10:00”)
+      if (!s.selectedStartEU){
+        const parsed = parseDateTimeEU(text)
+        if (parsed){
+          s.selectedStartEU = ceilToSlotEU(parsed)
+          saveSession(phone,s)
+        }
+      }
+
+      // ===== Proponer si aún no hay selección
+      if (!s.selectedStartEU){
+        const base = dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute")
+        const fromEU = nextOpeningFrom(base)
+        const opts = proposeSlots({ fromEU, durationMin: s.durationMin, n: 3 })
+        s.lastOptions = opts
+        s.pendingConfirm = true
+        const list = opts.map(x=>`• ${fmtES(x)}`).join("\n")
+        await sock.sendMessage(from, { text:
+`Tengo estos huecos para *${SVC[s.serviceKey].name}* en *${locationNice(s.locationKey)}*:
+${list}
+
+¿Te viene bien el primero? Si prefieres otro día/hora, dímelo.${s.preferredStaffLabel?`\nSi puedo, te lo asigno con *${s.preferredStaffLabel}*.`:""}` })
+        saveSession(phone,s); return
+      }
+
+      // ===== Si pidió técnica concreta, comprueba validez en ese local (modo *estricto*)
+      if (s.preferredStaffId && !preferredValidForLoc(s.preferredStaffId, s.locationKey)){
+        const fallbackId = pickStaffForLocation(s.locationKey, null)
+        const fallbackName = ID2LABEL[fallbackId] || "otra técnica"
+        await sock.sendMessage(from,{ text:
+`*${s.preferredStaffLabel}* no tiene agenda en *${locationNice(s.locationKey)}*.
+¿Te reservo con *${fallbackName}* en ese salón, o prefieres cambiar a *${locationNice(s.locationKey==="luz"?"torre":"luz")}*?` })
+        s.awaitingStaffChoice = true
+        s.suggestedFallbackId = fallbackId
+        saveSession(phone,s); return
+      }
+
+      // ===== Resolver elección de staff si venimos del prompt anterior
+      if (s.awaitingStaffChoice){
+        if (detectLocation(text)){ // ha dicho cambiar de sede
+          s.locationKey = detectLocation(text)
+          s.awaitingStaffChoice = false
+          s.suggestedFallbackId = null
+          saveSession(phone,s)
+          await sock.sendMessage(from,{ text:`Ok, cambiamos a *${locationNice(s.locationKey)}*. Te propongo horas nuevas si hace falta.` })
+        } else if (YES_RE.test(text)) { // acepta fallback
+          s.preferredStaffId = s.suggestedFallbackId
+          s.awaitingStaffChoice = false
+          s.suggestedFallbackId = null
+          saveSession(phone,s)
+        } else if (NO_RE.test(text)) {
+          await sock.sendMessage(from,{ text:`Dime si prefieres otra profesional o cambia de salón (Málaga – La Luz / Torremolinos).` })
+          return
+        } else {
+          // No claro: seguimos pidiendo
+          await sock.sendMessage(from,{ text:`¿Confirmo con *${ID2LABEL[s.suggestedFallbackId] || "otra técnica"}* en *${locationNice(s.locationKey)}*? (Responde “sí” o di otra opción).` })
+          return
+        }
+      }
+
+      // ===== Cierre: nombre/email/cliente/booking
+      let customer = await squareFindCustomerByPhone(phone)
+      if (!customer){
+        if (!s.name){
+          s.awaitingName = true; saveSession(phone,s)
+          await sock.sendMessage(from,{ text:"Para cerrar, dime tu *nombre y apellidos*." })
+          return
+        }
+        if (!s.email){
+          const guess = await aiChat([
+            { role:"system", content:"Extrae de forma ultra-cauta nombre y email si aparecen. Responde SOLO JSON con {\"name\":\"\",\"email\":\"\"}. Si dudas, deja vacío." },
+            { role:"user", content:text }
+          ])
+          try {
+            const j = JSON.parse(guess)
+            if (!s.email && j?.email && isValidEmail(j.email)) s.email = j.email
+          } catch {}
+        }
+        if (!s.email){
+          s.awaitingEmail = true; saveSession(phone,s)
+          await sock.sendMessage(from,{ text:"Genial. Ahora tu email (tipo: nombre@correo.com)." })
+          return
+        }
+        customer = await squareCreateCustomer({ givenName: s.name, emailAddress: s.email, phoneNumber: phone })
+        if (!customer){
+          await sock.sendMessage(from,{ text:"Ese email no me funciona 🤕. Mándame uno válido y sigo." })
+          return
+        }
+      }
+
+      // Staff final (respeta preferencia si válida; si no había preferencia, elige cualquiera del salón)
+      let teamId = s.preferredStaffId ? pickStaffForLocation(s.locationKey, s.preferredStaffId) : pickStaffForLocation(s.locationKey, null)
+      if (!teamId){
+        await sock.sendMessage(from,{ text:"Ahora mismo no puedo asignar profesional para ese salón. ¿Te da igual con quién?" })
+        return
+      }
+
+      const startEU = ceilToSlotEU(toDayjsEU(s.selectedStartEU).clone())
+      if (!insideBusinessHours(startEU, s.durationMin)){
+        s.selectedStartEU = null
+        await sock.sendMessage(from,{ text:"Esa hora cae fuera de horario. Dime otra dentro de L–V 10–14 o 16–20." })
+        saveSession(phone,s); return
+      }
+
+      const startUTC = startEU.tz("UTC"), endUTC = startUTC.clone().add(s.durationMin,"minute")
+      const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
+      insertAppt.run({
+        id:aptId, customer_name:s.name || customer?.givenName || null, customer_phone:phone, customer_square_id:customer.id,
+        location_key:s.locationKey, service_key:s.serviceKey, service_name:SVC[s.serviceKey].name, duration_min:s.durationMin,
+        start_iso:startUTC.toISOString(), end_iso:endUTC.toISOString(), staff_id:teamId, status:"pending",
+        created_at:new Date().toISOString(), square_booking_id:null
+      })
+
+      const sq = await createSquareBooking({
+        startEU, serviceKey:s.serviceKey, locationKey:s.locationKey, customerId:customer.id, teamMemberId:teamId
+      })
+      if (!sq){
+        db.prepare(`DELETE FROM appointments WHERE id=@id`).run({id:aptId})
+        s.pendingConfirm=false; s.selectedStartEU=null
+        await sock.sendMessage(from,{ text:"No pude reservar ese hueco. Dime otra hora/día y lo intento de nuevo, o usa el link: https://gapinknails.square.site/" })
+        saveSession(phone,s); return
+      }
+
+      updateApptStatus.run({ id:aptId, status:"confirmed", square_booking_id: sq.id || null })
+      await sock.sendMessage(from,{ text:
+`Reserva confirmada 🎉
+Salón: ${locationNice(s.locationKey)} (${locationToAddress(s.locationKey)})
+Servicio: ${SVC[s.serviceKey].name}${s.preferredStaffId?`\nProfesional: ${ID2LABEL[s.preferredStaffId] || "asignación"}`:""}
+Fecha: ${fmtES(startEU)}
+Duración: ${s.durationMin} min
+Pago en persona.` })
+
+      clearSession(phone)
+    })
+  }catch(e){
+    console.error("startBot:", e?.message||e)
+  }
+}
