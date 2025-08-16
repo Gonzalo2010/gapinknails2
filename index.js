@@ -444,7 +444,7 @@ Tu trabajo es:
 5. Ejecutar acciones cuando tengas toda la información
 
 FORMATO DE RESPUESTA:
-Debes responder SIEMPRE en formato JSON válido (sin bloques de código markdown). Tu respuesta debe ser ÚNICAMENTE el JSON, sin ```json ni otros decoradores:
+Debes responder SIEMPRE en formato JSON válido (sin bloques de código markdown). Tu respuesta debe ser ÚNICAMENTE el JSON, sin \`\`\`json ni otros decoradores:
 {
   "message": "Mensaje para el cliente",
   "action": "none|propose_times|create_booking|list_appointments|cancel_appointment|need_info",
