@@ -949,203 +949,28 @@ app.get("/", (_req,res)=>{
   const totalAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments`).get()?.count || 0
   const successAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'confirmed'`).get()?.count || 0
   const failedAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'failed'`).get()?.count || 0
-  res.send(`<!doctype html>
-<html lang="es">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gapink Nails</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, #fce4ec 0%, #f8bbd9 50%, #e1bee7 100%);
-            padding: 20px;
-        }
-
-        .card {
-            background: rgba(255, 255, 255, 0.25);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            border-radius: 24px;
-            padding: 40px;
-            text-align: center;
-            box-shadow: 
-                0 8px 32px rgba(233, 30, 99, 0.15),
-                inset 0 1px 0 rgba(255, 255, 255, 0.4);
-            max-width: 400px;
-            width: 100%;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 1px;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.6), transparent);
-        }
-
-        .title {
-            font-size: 2rem;
-            font-weight: 300;
-            color: #ad1457;
-            margin-bottom: 30px;
-            letter-spacing: -0.02em;
-        }
-
-        /* Added styles for connection status */
-        .status {
-            padding: 16px 20px;
-            border-radius: 16px;
-            margin: 20px 0;
-            font-weight: 500;
-            font-size: 16px;
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-        }
-
-        .status.connected {
-            background: rgba(76, 175, 80, 0.2);
-            color: #2e7d32;
-            border-color: rgba(76, 175, 80, 0.3);
-        }
-
-        .status.disconnected {
-            background: rgba(244, 67, 54, 0.2);
-            color: #c62828;
-            border-color: rgba(244, 67, 54, 0.3);
-        }
-
-        .qr-container {
-            margin: 30px 0;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.4);
-            border-radius: 16px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            /* Added transition for smooth show/hide */
-            transition: all 0.3s ease;
-        }
-
-        .qr-container.hidden {
-            display: none;
-        }
-
-        .qr-placeholder {
-            width: 200px;
-            height: 200px;
-            background: rgba(173, 20, 87, 0.1);
-            border: 2px dashed #ad1457;
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto;
-            color: #ad1457;
-            font-size: 14px;
-            font-weight: 500;
-        }
-
-        .footer {
-            margin-top: 30px;
-            font-size: 14px;
-            color: #6a1b9a;
-            font-weight: 400;
-        }
-
-        .footer a {
-            color: #ad1457;
-            text-decoration: none;
-            font-weight: 500;
-            transition: all 0.3s ease;
-        }
-
-        .footer a:hover {
-            color: #e91e63;
-            text-shadow: 0 0 8px rgba(233, 30, 99, 0.3);
-        }
-
-        @media (max-width: 480px) {
-            .card {
-                padding: 30px 20px;
-                margin: 10px;
-            }
-            
-            .title {
-                font-size: 1.5rem;
-            }
-            
-            .qr-placeholder {
-                width: 160px;
-                height: 160px;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1 class="title">Gapink Nails</h1>
-        
-        <!-- Added connection status display -->
-        <div id="status" class="status disconnected">
-            ❌ Desconectado
-        </div>
-        
-        <div id="qrContainer" class="qr-container">
-            <div class="qr-placeholder">
-                Código QR
-            </div>
-        </div>
-        
-        <div class="footer">
-            Hecho por <a href="https://gonzalog.co" target="_blank" rel="noopener">Gonzalo García Aranda</a>
-        </div>
-    </div>
-
-    <!-- Added JavaScript for connection simulation -->
-    <script>
-        let conectado = false;
-        const statusEl = document.getElementById('status');
-        const qrContainer = document.getElementById('qrContainer');
-
-        function updateStatus() {
-            if (conectado) {
-                statusEl.textContent = '✅ Conectado';
-                statusEl.className = 'status connected';
-                qrContainer.classList.add('hidden');
-            } else {
-                statusEl.textContent = '❌ Desconectado';
-                statusEl.className = 'status disconnected';
-                qrContainer.classList.remove('hidden');
-            }
-        }
-
-        // Simulate connection toggle every 10 seconds for demo
-        setInterval(() => {
-            conectado = !conectado;
-            updateStatus();
-        }, 10000);
-
-        // Initial status
-        updateStatus();
-    </script>
-</body>
-</html>
-`)
+  res.send(`<!doctype html><meta charset="utf-8"><style>
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa}
+  .card{max-width:600px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
+  .status{padding:12px;border-radius:8px;margin:8px 0}
+  .success{background:#d4edda;color:#155724}
+  .error{background:#f8d7da;color:#721c24}
+  .warning{background:#fff3cd;color:#856404}
+  .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
+  </style><div class="card">
+  <h1>🩷 Gapink Nails Bot v26.9</h1>
+  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
+  ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
+  <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
+  <h3>📊 Estadísticas</h3>
+  <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
+  <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
+    <strong>🚀 Mejoras v26.9:</strong><br>
+    • Identidad por teléfono (sin pedir datos si ya existe)<br>
+    • Duplicados: elección por número<br>
+    • Alta nueva: pedir nombre/email solo si no existe<br>
+  </div>
+  </div>`)
 })
 app.get("/qr.png", async (_req,res)=>{
   if(!lastQR) return res.status(404).send("No QR")
