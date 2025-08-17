@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v27.3.0
+// index.js — Gapink Nails · v27.4.0 (fix single Express app + all AI/ñ/staff coherence)
 import express from "express"
 import pino from "pino"
 import qrcode from "qrcode"
@@ -74,6 +74,10 @@ function fmtES(d){
   const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ)
   return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")} ${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}`
 }
+function isHolidayEU(d){
+  const dd=String(d.date()).padStart(2,"0"), mm=String(d.month()+1).padStart(2,"0")
+  return HOLIDAYS_EXTRA.includes(`${dd}/${mm}`)
+}
 function insideBusinessHours(d,dur){
   const t=d.clone()
   if (!WORK_DAYS.includes(t.day())) return false
@@ -85,10 +89,6 @@ function insideBusinessHours(d,dur){
   const openMin  = OPEN.start*60
   const closeMin = OPEN.end*60
   return startMin >= openMin && endMin <= closeMin
-}
-function isHolidayEU(d){
-  const dd=String(d.date()).padStart(2,"0"), mm=String(d.month()+1).padStart(2,"0")
-  return HOLIDAYS_EXTRA.includes(`${dd}/${mm}`)
 }
 function nextOpeningFrom(d){
   let t=d.clone()
@@ -183,6 +183,26 @@ const insertSquareLog = db.prepare(`INSERT INTO square_logs
 (phone, action, request_data, response_data, error_data, timestamp, success)
 VALUES (@phone, @action, @request_data, @response_data, @error_data, @timestamp, @success)`)
 
+// ====== Sesión
+function loadSession(phone){
+  const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
+  if (!row?.data_json) return null
+  const s = JSON.parse(row.data_json)
+  if (Array.isArray(s.lastHours_ms)) s.lastHours = s.lastHours_ms.map(ms=>dayjs.tz(ms,EURO_TZ))
+  if (s.pendingDateTime_ms) s.pendingDateTime = dayjs.tz(s.pendingDateTime_ms,EURO_TZ)
+  return s
+}
+function saveSession(phone,s){
+  const c={...s}
+  c.lastHours_ms = Array.isArray(s.lastHours)? s.lastHours.map(d=>dayjs.isDayjs(d)?d.valueOf():null).filter(Boolean):[]
+  c.pendingDateTime_ms = s.pendingDateTime? dayjs(s.pendingDateTime).valueOf(): null
+  delete c.lastHours; delete c.pendingDateTime
+  const j=JSON.stringify(c)
+  const up=db.prepare(`UPDATE sessions SET data_json=@j, updated_at=@u WHERE phone=@p`).run({j,u:new Date().toISOString(),p:phone})
+  if (up.changes===0) db.prepare(`INSERT INTO sessions (phone,data_json,updated_at) VALUES (@p,@j,@u)`).run({p:phone,j,u:new Date().toISOString()})
+}
+function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
+
 // ====== Empleadas/servicios
 function deriveLabelsFromEnvKey(envKey){
   const raw = envKey.replace(/^SQ_EMP_/, "")
@@ -221,7 +241,7 @@ function pickStaffForLocation(locKey, preferId=null){
   return found?.id || null
 }
 
-// ====== Restaurar tildes/ñ para display (uñas, pestañas, nivelación…)
+// ====== Restaurar tildes/ñ para display
 function isUpper(s){ return s && s===s.toUpperCase() }
 function isTitle(s){ return s && s[0]===s[0].toUpperCase() && s.slice(1)===s.slice(1).toLowerCase() }
 function replaceWordKeepCase(s, plain, accented){
@@ -241,8 +261,8 @@ function fixDisplayAccents(label){
   out = replaceWordKeepCase(out, "semipermanete", "semipermanente")
   out = replaceWordKeepCase(out, "nivelacion", "nivelación")
   out = replaceWordKeepCase(out, "mas", "más")
-  out = out.replace(/\b(una)\s+(rota)\b/gi, (m,a,b)=> (isUpper(a)? "UÑA" : isTitle(a)? "Uña" : "uña") + " " + (isUpper(b)? "ROTA" : isTitle(b)? "Rota" : "rota"))
-  out = out.replace(/\b(una)\s+(dentro)\b/gi, (m,a,b)=> (isUpper(a)? "UÑA" : isTitle(a)? "Uña" : "uña") + " " + b)
+  out = out.replace(/\b(una)\s+(rota)\b/gi, (a,b,c)=> (isUpper(b)? "UÑA" : isTitle(b)? "Uña" : "uña")+" "+(isUpper(c)? "ROTA" : isTitle(c)? "Rota" : "rota"))
+  out = out.replace(/\b(una)\s+(dentro)\b/gi, (a,b,c)=> (isUpper(b)? "UÑA" : isTitle(b)? "Uña" : "uña")+" "+c)
   return out
 }
 function titleCaseFromEnvKey(raw){ return raw.replace(/\b([a-z])/g, m=>m.toUpperCase()) }
@@ -274,7 +294,7 @@ function resolveEnvKeyFromLabelAndSede(label, sedeKey){
   return list.find(s=>s.label.toLowerCase()===String(label||"").toLowerCase())?.key || null
 }
 
-// ====== Heurística general de matching de servicio
+// ====== Matching servicio
 function generalServiceScore(userText,label){
   const u=norm(userText), l=norm(label); let score=0
   const keys = [
@@ -301,13 +321,16 @@ function fuzzyFindBestService(sedeKey, text){
   return (bestScore>=2.5) ? best : null
 }
 
-// ====== IA: quick extractor (sede/servicio/staff/intent)
+// ====== IA Quick Extract
 async function aiQuickExtract(userText){
   if (!AI_API_KEY) return null
   const controller = new AbortController()
   const to = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
   try{
-    const promptSys = `Eres un extractor. Devuelve SOLO JSON:\n{"intent":"book|cancel|ask_hours|other","sede":"torremolinos|la_luz|null","serviceLabel":"cadena o null","staffName":"cadena o null"}\n- Si el usuario menciona sede y servicio en la misma frase, rellénalos.\n- Normaliza "La Luz" -> "la_luz"; "Torremolinos" -> "torremolinos".\n- No inventes servicios, usa el texto del usuario tal cual (con tildes si aparecen).\n- Si no estás seguro, pon null.`
+    const promptSys = `Eres un extractor. Devuelve SOLO JSON:
+{"intent":"book|cancel|ask_hours|other","sede":"torremolinos|la_luz|null","serviceLabel":"cadena o null","staffName":"cadena o null"}
+- Normaliza sede: "La Luz"->"la_luz", "Torremolinos"->"torremolinos".
+- Si dudas, pon null.`
     const body = { model: AI_MODEL, messages:[
       {role:"system", content: promptSys},
       {role:"user", content: `Texto: "${userText}"\nResponde SOLO el JSON.`}
@@ -327,7 +350,7 @@ async function aiQuickExtract(userText){
   }catch{ clearTimeout(to); return null }
 }
 
-// ====== Square: clientes/booking
+// ====== Square helpers
 async function searchCustomersByPhone(phone){
   try{
     const e164=normalizePhoneES(phone); if(!e164) return []
@@ -532,7 +555,7 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
   }catch{ return [] }
 }
 
-// ====== IA de conversación (acción)
+// ====== IA conversacional
 async function callAIOnce(messages, systemPrompt = "") {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
@@ -603,7 +626,7 @@ function buildLocalFallback(userMessage, sessionData){
   const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
   const bookMatch = /\b(reservar|cita|quiero.*(cita|reservar|hacerme|ponerme))\b/i.test(lower)
 
-  // Si dio sede+servicio, los rellenamos antes de acciones
+  // rellenar rápido con sede/servicio
   const sede = parseSede(msg)
   if (sede && !sessionData.sede) sessionData.sede = sede
   if (sessionData.sede && !sessionData.selectedServiceEnvKey){
@@ -668,7 +691,7 @@ async function getAIResponse(userMessage, sessionData, phone) {
   try { return JSON.parse(cleaned) } catch { return buildLocalFallback(userMessage, sessionData) }
 }
 
-// ====== Matching staff
+// ====== Staff lookup
 function _normName(s){ return norm(String(s||"")).replace(/\s+/g," ").trim() }
 function findStaffByName(inputName, locKey=null){
   const q = _normName(inputName||""); if (!q) return null
@@ -706,10 +729,9 @@ function findStaffByNameSmart(inputName, locKey, sessionData){
   return null
 }
 
-// ====== CORE ENSURE (IA + heurística) — para no volver a decir "necesito sede y servicio"
+// ====== Ensure core (IA + heurística)
 async function ensureCoreFromText(sessionData, userText){
   let changed=false
-  // 1) Quick IA extractor
   const extracted = await aiQuickExtract(userText)
   if (extracted){
     if (!sessionData.sede && (extracted.sede==="torremolinos" || extracted.sede==="la_luz")){
@@ -732,7 +754,7 @@ async function ensureCoreFromText(sessionData, userText){
       }
     }
   }
-  // 2) Heurística local adicional
+  // Heurística local
   if (!sessionData.sede){
     const sede = parseSede(userText); if (sede){ sessionData.sede=sede; changed=true }
   }
@@ -747,32 +769,7 @@ async function ensureCoreFromText(sessionData, userText){
   return changed
 }
 
-// ====== Bot principal
-let RECONNECT_SCHEDULED = false
-let RECONNECT_ATTEMPTS = 0
-const QUEUE=new Map()
-function enqueue(key,job){
-  const prev=QUEUE.get(key)||Promise.resolve()
-  const next=prev.then(job,job).finally(()=>{ if (QUEUE.get(key)===next) QUEUE.delete(key) })
-  QUEUE.set(key,next); return next
-}
-async function sendWithPresence(sock, jid, text){
-  try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
-  await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
-  return sock.sendMessage(jid, { text })
-}
-function isCancelIntent(text){
-  const lower = norm(text)
-  return /\b(cancelar|anular|borrar)\b/.test(lower) && /\b(cita|reserva|pr[oó]xima|mi)\b/.test(lower)
-}
-function parseSede(text){
-  const t=norm(text)
-  if (/\b(luz|la luz)\b/.test(t)) return "la_luz"
-  if (/\b(torre|torremolinos)\b/.test(t)) return "torremolinos"
-  return null
-}
-
-// ====== Elegir servicio (lista uñas si aplica)
+// ====== Categoría uñas (lista)
 function shouldIncludePedicure(userMsg){ return /\b(pedicur|pies|pie)\b/i.test(String(userMsg||"")) }
 function nailsServicesForSede(sedeKey, userMsg){
   const allowPedi = shouldIncludePedicure(userMsg)
@@ -849,7 +846,6 @@ async function executeChooseService(params, sessionData, phone, sock, jid, userM
 }
 
 async function executeProposeTime(_params, sessionData, phone, sock, jid) {
-  // ⚡ auto-completar con la ÚLTIMA frase del usuario si faltan datos
   if ((!sessionData.sede || !sessionData.selectedServiceEnvKey) && sessionData.__last_user_text){
     const changed = await ensureCoreFromText(sessionData, sessionData.__last_user_text)
     if (changed) saveSession(phone, sessionData)
@@ -1021,48 +1017,102 @@ async function executeCancelAppointment(params, sessionData, phone, sock, jid) {
   saveSession(phone, sessionData)
 }
 
-// ====== Mini-web + QR
-const app=express()
-const PORT=process.env.PORT||8080
-let lastQR=null, conectado=false
-app.get("/", (_req,res)=>{
-  const totalAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments`).get()?.count || 0
-  const successAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'confirmed'`).get()?.count || 0
-  const failedAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'failed'`).get()?.count || 0
-  res.send(`<!doctype html><meta charset="utf-8"><style>
-  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa}
-  .card{max-width:640px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
-  .status{padding:12px;border-radius:8px;margin:8px 0}
-  .success{background:#d4edda;color:#155724}
-  .error{background:#f8d7da;color:#721c24}
-  .warning{background:#fff3cd;color:#856404}
-  .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
-  </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.3.0</h1>
-  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
-  ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
-  <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
-  <h3>📊 Estadísticas</h3>
-  <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
-  <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Novedades v27.3.0:</strong><br>
-    • IA de extracción en *todas* las fases (antes de IA principal, durante acciones y en fallback).<br>
-    • Ya no te dirá “necesito sede y servicio” si lo acabas de decir.<br>
-    • Correcciones de tildes/ñ en display y coherencia de profesionales con los slots mostrados.<br>
-  </div>
-  </div>`)
-})
-app.get("/qr.png", async (_req,res)=>{
-  if(!lastQR) return res.status(404).send("No QR")
-  const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
-  res.set("Content-Type","image/png").send(png)
-})
-app.get("/logs", (_req,res)=>{
-  const recent = db.prepare(`SELECT * FROM square_logs ORDER BY timestamp DESC LIMIT 50`).all()
-  res.json({ logs: recent })
-})
+// ====== Bot/WhatsApp infra
+let RECONNECT_SCHEDULED = false
+let RECONNECT_ATTEMPTS = 0
+const QUEUE=new Map()
+function enqueue(key,job){
+  const prev=QUEUE.get(key)||Promise.resolve()
+  const next=prev.then(job,job).finally(()=>{ if (QUEUE.get(key)===next) QUEUE.delete(key) })
+  QUEUE.set(key,next); return next
+}
+async function sendWithPresence(sock, jid, text){
+  try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
+  await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
+  return sock.sendMessage(jid, { text })
+}
+function isCancelIntent(text){
+  const lower = norm(text)
+  return /\b(cancelar|anular|borrar)\b/.test(lower) && /\b(cita|reserva|pr[oó]xima|mi)\b/.test(lower)
+}
+function parseSede(text){
+  const t=norm(text)
+  if (/\b(luz|la luz)\b/.test(t)) return "la_luz"
+  if (/\b(torre|torremolinos)\b/.test(t)) return "torremolinos"
+  return null
+}
 
-// ====== Baileys
+function staffRosterForPromptShort(){
+  return EMPLOYEES.map(e=>{
+    const locs = e.allow.map(id=> id===LOC_TORRE?"torremolinos" : id===LOC_LUZ?"la_luz" : id).join(",")
+    return `ID:${e.id} [${e.labels.join(", ")}] sedes:${locs||"ALL"}`
+  }).join(" | ")
+}
+
+// ====== IA principal (system prompt) + fallback
+function buildSystemPromptMain() {
+  const nowEU = dayjs().tz(EURO_TZ);
+  const torremolinos_services = servicesForSedeKeyRaw("torremolinos");
+  const laluz_services = servicesForSedeKeyRaw("la_luz");
+  return `Eres el asistente de WhatsApp para Gapink Nails. Devuelves SOLO JSON válido.
+Fecha: ${nowEU.format("dddd DD/MM/YYYY HH:mm")} (Madrid)
+STAFF: ${staffRosterForPromptShort()}
+
+SERVICIOS TORREMOLINOS:
+${torremolinos_services.map(s => "- "+s.label+" (Clave: "+s.key+")").join("\n")}
+SERVICIOS LA LUZ:
+${laluz_services.map(s => "- "+s.label+" (Clave: "+s.key+")").join("\n")}
+
+Reglas: tildes/ñ correctas; coherencia con slots mostrados; si dice “con {nombre}” valida contra staff listado/sede; acciones: propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none`
+}
+
+// getAIResponse usa buildSystemPrompt (ya definida); mantenemos.
+
+async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
+  if (aiObj.session_updates) {
+    Object.keys(aiObj.session_updates).forEach(key => {
+      if (aiObj.session_updates[key] !== null && aiObj.session_updates[key] !== undefined) {
+        sessionData[key] = aiObj.session_updates[key]
+      }
+    })
+  }
+  // Seguridad: intenta resolver envKey si hay label+sede
+  if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
+    const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
+    if (ek) sessionData.selectedServiceEnvKey = ek
+  }
+
+  insertAIConversation.run({
+    phone, message_id: m.key.id, user_message: textRaw,
+    ai_response: safeJSONStringify(aiObj), timestamp: new Date().toISOString(),
+    session_data: safeJSONStringify(sessionData),
+    ai_error: null, fallback_used: 0
+  })
+  saveSession(phone, sessionData)
+
+  switch (aiObj.action) {
+    case "choose_service":
+      await executeChooseService(aiObj.action_params, sessionData, phone, sock, jid, textRaw); break
+    case "propose_times":
+      await executeProposeTime(aiObj.action_params, sessionData, phone, sock, jid); break
+    case "create_booking":
+      await executeCreateBooking(aiObj.action_params, sessionData, phone, sock, jid); break
+    case "list_appointments":
+      await executeListAppointments(aiObj.action_params, sessionData, phone, sock, jid); break
+    case "cancel_appointment":
+      await executeCancelAppointment(aiObj.action_params, sessionData, phone, sock, jid); break
+    case "need_info":
+    case "none":
+    default:
+      if (sessionData.sede && sessionData.selectedServiceEnvKey) {
+        await executeProposeTime({}, sessionData, phone, sock, jid)
+      } else {
+        await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
+      }
+  }
+}
+
+// ====== Baileys + Bot
 async function loadBaileys(){
   const require = createRequire(import.meta.url); let mod=null
   try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ try{ mod=await import("@whiskeysockets/baileys") }catch{} }
@@ -1080,12 +1130,24 @@ async function startBot(){
     if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
-    const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:Browsers.macOS("Desktop"), syncFullHistory:false })
+    const sock = makeWASocket({ 
+      logger:pino({level:"silent"}), 
+      printQRInTerminal:false, 
+      auth:state, 
+      version, 
+      browser:Browsers.macOS("Desktop"), 
+      syncFullHistory:false 
+    })
     globalThis.sock=sock
 
     sock.ev.on("connection.update", ({connection,qr})=>{
-      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
-      if (connection==="open"){ lastQR=null; conectado=true; RECONNECT_ATTEMPTS=0; RECONNECT_SCHEDULED=false; }
+      if (qr){ 
+        lastQR=qr; conectado=false; 
+        try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} 
+      }
+      if (connection==="open"){ 
+        lastQR=null; conectado=true; RECONNECT_ATTEMPTS=0; RECONNECT_SCHEDULED=false; 
+      }
       if (connection==="close"){ 
         conectado=false; 
         if (!RECONNECT_SCHEDULED){
@@ -1095,11 +1157,13 @@ async function startBot(){
         }
       }
     })
+    
     sock.ev.on("creds.update", saveCreds)
 
     sock.ev.on("messages.upsert", async ({messages})=>{
       const m=messages?.[0]; 
       if (!m?.message || m.key.fromMe) return
+      
       const jid = m.key.remoteJid
       const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
       const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
@@ -1108,18 +1172,33 @@ async function startBot(){
       await enqueue(phone, async ()=>{
         try {
           let sessionData = loadSession(phone) || {
-            greeted: false, sede: null, selectedServiceEnvKey: null, selectedServiceLabel: null,
-            preferredStaffId: null, preferredStaffLabel: null, pendingDateTime: null,
-            name: null, email: null, last_msg_id: null, lastStaffByIso: {},
-            lastProposeUsedPreferred: false, stage: null, cancelList: null,
-            serviceChoices: null, identityChoices: null, pendingCategory: null,
-            lastStaffNamesById: null, __last_user_text: null, __phone: phone
+            greeted: false,
+            sede: null,
+            selectedServiceEnvKey: null,
+            selectedServiceLabel: null,
+            preferredStaffId: null,
+            preferredStaffLabel: null,
+            pendingDateTime: null,
+            name: null,
+            email: null,
+            last_msg_id: null,
+            lastStaffByIso: {},
+            lastProposeUsedPreferred: false,
+            stage: null,
+            cancelList: null,
+            serviceChoices: null,
+            identityChoices: null,
+            pendingCategory: null,
+            lastStaffNamesById: null,
+            __last_user_text: null,
+            __phone: phone
           }
+          
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
           sessionData.__last_user_text = textRaw
 
-          // ===== Pre-parse universal con IA + heurística (auto-completar sede/servicio/staff)
+          // ===== Pre-parse universal (auto-completar sede/servicio/staff)
           const changed = await ensureCoreFromText(sessionData, textRaw)
           if (changed) saveSession(phone, sessionData)
 
@@ -1138,7 +1217,7 @@ async function startBot(){
             }
           }
 
-          // PRE: "con {nombre}" — coherente con roster o últimos slots
+          // PRE: “con {nombre}” — coherente con roster/slots
           const withMatch = textRaw.match(/\bcon\s+([a-záéíóúñü ]{2,})\??$/i)
           if (withMatch && sessionData.sede){
             const wanted = withMatch[1].trim()
@@ -1176,7 +1255,7 @@ async function startBot(){
           // IA principal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
 
-          // Post: si IA dio sede pero no envKey, resolvemos
+          // Post: resolver envKey si IA dio label + sede
           if (aiObj?.session_updates){
             const su = aiObj.session_updates
             if (!su.selectedServiceEnvKey && (su.selectedServiceLabel || sessionData.selectedServiceLabel) && (su.sede || sessionData.sede)){
@@ -1196,56 +1275,11 @@ async function startBot(){
   }catch{ setTimeout(() => startBot().catch(console.error), 5000) }
 }
 
-async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
-  if (aiObj.session_updates) {
-    Object.keys(aiObj.session_updates).forEach(key => {
-      if (aiObj.session_updates[key] !== null && aiObj.session_updates[key] !== undefined) {
-        sessionData[key] = aiObj.session_updates[key]
-      }
-    })
-  }
-  // Seguridad: intenta resolver envKey si hay label+sede
-  if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
-    const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
-    if (ek) sessionData.selectedServiceEnvKey = ek
-  }
+// ====== Mini-web + QR (UNA SOLA INSTANCIA)
+const app = express()
+const PORT = process.env.PORT || 8080
+let lastQR = null, conectado = false
 
-  // Persistir conversación
-  insertAIConversation.run({
-    phone, message_id: m.key.id, user_message: textRaw,
-    ai_response: safeJSONStringify(aiObj), timestamp: new Date().toISOString(),
-    session_data: safeJSONStringify(sessionData),
-    ai_error: null, fallback_used: 0
-  })
-  saveSession(phone, sessionData)
-
-  switch (aiObj.action) {
-    case "choose_service":
-      await executeChooseService(aiObj.action_params, sessionData, phone, sock, jid, textRaw); break
-    case "propose_times":
-      await executeProposeTime(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "create_booking":
-      await executeCreateBooking(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "list_appointments":
-      await executeListAppointments(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "cancel_appointment":
-      await executeCancelAppointment(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "need_info":
-    case "none":
-    default:
-      // Si dijo sede+servicio en la misma frase pero IA no lo pilló, re-intenta propose
-      if (sessionData.sede && sessionData.selectedServiceEnvKey) {
-        await executeProposeTime({}, sessionData, phone, sock, jid)
-      } else {
-        await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
-      }
-  }
-}
-
-// ====== Servidor
-const app=express()
-const PORT=process.env.PORT||8080
-let lastQR=null, conectado=false
 app.get("/", (_req,res)=>{
   const totalAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments`).get()?.count || 0
   const successAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'confirmed'`).get()?.count || 0
@@ -1259,14 +1293,14 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.3.0</h1>
+  <h1>🩷 Gapink Nails Bot v27.4.0</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 v27.3.0:</strong> IA en toda la tubería, extracción de sede/servicio automática y cero respuestas “necesito sede” si ya lo dijiste.
+    <strong>🚀 v27.4.0:</strong> Una única app Express, extracción IA previa, coherencia de staff y acentos/ñ arreglados.
   </div>
   </div>`)
 })
@@ -1280,73 +1314,9 @@ app.get("/logs", (_req,res)=>{
   res.json({ logs: recent })
 })
 
-async function startBot(){
-  try{
-    const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await (async()=>{
-      const require = createRequire(import.meta.url); let mod=null
-      try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ try{ mod=await import("@whiskeysockets/baileys") }catch{} }
-      if(!mod) throw new Error("Baileys incompatible")
-      const makeWASocket = mod.makeWASocket || mod.default?.makeWASocket || (typeof mod.default==="function"?mod.default:undefined)
-      const useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
-      const fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion || mod.default?.fetchLatestBaileysVersion || (async()=>({version:[2,3000,0]}))
-      const Browsers = mod.Browsers || mod.default?.Browsers || { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
-      return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
-    })()
-    if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
-    const { state, saveCreds } = await useMultiFileAuthState("auth_info")
-    const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
-    const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:Browsers.macOS("Desktop"), syncFullHistory:false })
-    globalThis.sock=sock
-
-    sock.ev.on("connection.update", ({connection,qr})=>{
-      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
-      if (connection==="open"){ lastQR=null; conectado=true; RECONNECT_ATTEMPTS=0; RECONNECT_SCHEDULED=false; }
-      if (connection==="close"){ 
-        conectado=false; 
-        if (!RECONNECT_SCHEDULED){
-          RECONNECT_SCHEDULED = true
-          const delay = Math.min(30000, 1500 * Math.pow(2, RECONNECT_ATTEMPTS++))
-          setTimeout(()=>{ RECONNECT_SCHEDULED=false; startBot().catch(console.error) }, delay)
-        }
-      }
-    })
-    sock.ev.on("creds.update", saveCreds)
-
-    sock.ev.on("messages.upsert", async ({messages})=>{
-      const m=messages?.[0]; 
-      if (!m?.message || m.key.fromMe) return
-      const jid = m.key.remoteJid
-      const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
-      const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
-      if (!textRaw) return
-
-      await enqueue(phone, async ()=>{
-        try {
-          let sessionData = loadSession(phone) || {
-            greeted: false, sede: null, selectedServiceEnvKey: null, selectedServiceLabel: null,
-            preferredStaffId: null, preferredStaffLabel: null, pendingDateTime: null,
-            name: null, email: null, last_msg_id: null, lastStaffByIso: {},
-            lastProposeUsedPreferred: false, stage: null, cancelList: null,
-            serviceChoices: null, identityChoices: null, pendingCategory: null,
-            lastStaffNamesById: null, __last_user_text: null, __phone: phone
-          }
-          if (sessionData.last_msg_id === m.key.id) return
-          sessionData.last_msg_id = m.key.id
-          sessionData.__last_user_text = textRaw
-
-          // Pre-parse + resto del flujo (la función grande ya hace todo)
-          // Para evitar duplicidad, redirigimos al manejador global ya declarado más arriba
-        } catch (error) {
-          if (BOT_DEBUG) console.error(error)
-          await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
-        }
-      })
-    })
-  }catch{ setTimeout(() => startBot().catch(console.error), 5000) }
-}
-
-console.log(`🩷 Gapink Nails Bot v27.3.0`)
+console.log(`🩷 Gapink Nails Bot v27.4.0`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
+
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
 process.on("SIGTERM", ()=>{ process.exit(0) })
