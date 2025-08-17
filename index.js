@@ -1,4 +1,8 @@
-// index.js — Gapink Nails · v27.4.0 (fix single Express app + all AI/ñ/staff coherence)
+// index.js — Gapink Nails · v27.5.1
+// Cambios clave v27.5.1:
+// - Se elimina el código de "Referencia: ..." del mensaje de confirmación de cita.
+// - Resto del flujo igual que v27.5.0 (bienvenida + autoservicio para cancelar/reagendar/editar).
+
 import express from "express"
 import pino from "pino"
 import qrcode from "qrcode"
@@ -18,7 +22,7 @@ if (!globalThis.crypto) globalThis.crypto = webcrypto
 dayjs.extend(utc); dayjs.extend(tz); dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
 
-// ====== Config horario
+// ====== Config horario (negocio)
 const WORK_DAYS = [1,2,3,4,5]
 const SLOT_MIN = 30
 const OPEN = { start: 9, end: 20 }
@@ -47,6 +51,29 @@ const AI_MODEL = process.env.AI_MODEL || "deepseek-chat"
 const AI_MAX_RETRIES = Number(process.env.AI_MAX_RETRIES || 3)
 const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 15000)
 const sleep = ms => new Promise(r=>setTimeout(r, ms))
+
+// ====== Mensajes fijos
+const SELF_SERVICE_LINK = "https://gapinknails.square.site/?source=qr-code"
+const WELCOME_MSG =
+`Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.
+
+Solo atenderemos por WhatsApp y llamadas en horario de lunes a viernes de 10 a 14:00 y de 16:00 a 20:00 
+
+Si quieres reservar una cita puedes hacerlo a través de este link:
+
+${SELF_SERVICE_LINK}
+
+Y si quieres modificarla puedes hacerlo a través del link del sms que llega con su cita! 
+
+Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.
+Gracias 😘`
+
+const CANCEL_MODIFY_MSG =
+`Para *cancelar*, *reagendar* o *editar* tu cita:
+• Usa el enlace que recibiste por *SMS* o *email* junto a tu reserva.
+• Para *reservar una nueva* cita: ${SELF_SERVICE_LINK}
+
+Si necesitas cualquier otra cosa, dime y te ayudo dentro del horario 🩷`
 
 // ====== Utils
 const onlyDigits = s => String(s||"").replace(/\D+/g,"")
@@ -261,8 +288,8 @@ function fixDisplayAccents(label){
   out = replaceWordKeepCase(out, "semipermanete", "semipermanente")
   out = replaceWordKeepCase(out, "nivelacion", "nivelación")
   out = replaceWordKeepCase(out, "mas", "más")
-  out = out.replace(/\b(una)\s+(rota)\b/gi, (a,b,c)=> (isUpper(b)? "UÑA" : isTitle(b)? "Uña" : "uña")+" "+(isUpper(c)? "ROTA" : isTitle(c)? "Rota" : "rota"))
-  out = out.replace(/\b(una)\s+(dentro)\b/gi, (a,b,c)=> (isUpper(b)? "UÑA" : isTitle(b)? "Uña" : "uña")+" "+c)
+  out = out.replace(/\b(una)\s+(rota)\b/gi, (b1,b2,c2)=> (isUpper(b2)? "UÑA" : isTitle(b2)? "Uña" : "uña")+" "+(isUpper(c2)? "ROTA" : isTitle(c2)? "Rota" : "rota"))
+  out = out.replace(/\b(una)\s+(dentro)\b/gi, (b1,b2,c2)=> (isUpper(b2)? "UÑA" : isTitle(b2)? "Uña" : "uña")+" "+c2)
   return out
 }
 function titleCaseFromEnvKey(raw){ return raw.replace(/\b([a-z])/g, m=>m.toUpperCase()) }
@@ -328,7 +355,7 @@ async function aiQuickExtract(userText){
   const to = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
   try{
     const promptSys = `Eres un extractor. Devuelve SOLO JSON:
-{"intent":"book|cancel|ask_hours|other","sede":"torremolinos|la_luz|null","serviceLabel":"cadena o null","staffName":"cadena o null"}
+{"intent":"book|cancel|ask_hours|modify|other","sede":"torremolinos|la_luz|null","serviceLabel":"cadena o null","staffName":"cadena o null"}
 - Normaliza sede: "La Luz"->"la_luz", "Torremolinos"->"torremolinos".
 - Si dudas, pon null.`
     const body = { model: AI_MODEL, messages:[
@@ -417,7 +444,7 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
   }
   if (DRY_RUN) return { success: true, booking: { id:`TEST_SIM_${Date.now()}`, __sim:true } }
   const sv = await getServiceIdAndVersion(envServiceKey)
-  if (!sv?.id || !sv?.version) return { success: false, error: `No se pudo obtener servicio ${envServiceKey}` }
+  if (!sv?.id || !sv?.version) return { success: false, error: `No se pudo obtener servicio ${envKey}` }
   const startISO = startEU.tz("UTC").toISOString()
   const idempotencyKey = stableKey({ loc:locationToId(locationKey), sv:sv.id, startISO, customerId, teamMemberId })
   let lastError = null
@@ -460,14 +487,7 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
   }
   return { success: false, error: `No se pudo crear reserva: ${lastError?.message || 'Error desconocido'}`, lastError }
 }
-async function cancelBooking(bookingId){
-  if (DRY_RUN) return true
-  try{
-    const body = { idempotencyKey:`cancel_${bookingId}_${Date.now()}` }
-    const resp = await square.bookingsApi.cancelBooking(bookingId, body)
-    return !!resp?.result?.booking
-  }catch{ return false }
-}
+async function cancelBooking(_bookingId){ return false } // ya no se usa (autoservicio)
 async function enumerateCitasByPhone(phone){
   const items=[]
   let cid=null
@@ -608,25 +628,28 @@ SERVICIOS LA LUZ:
 ${laluz_services.map(s => "- "+s.label+" (Clave: "+s.key+")").join("\n")}
 
 REGLAS CLAVE:
-1) Si el usuario menciona sede y servicio en la misma frase, **rellena session_updates.sede y selectedServiceEnvKey** (mapea por sede).
-2) Tildes y ñ SIEMPRE en display (uñas, pestañas, nivelación, semipermanente, uña…).
-3) “con {nombre}”: si existe y es reservable en esa sede → preferredStaffId/Label; si no, dilo y ofrece alternativas.
-4) No contradigas los últimos slots mostrados (si se enseñó Desi, no digas que no está).
-5) Para crear reserva hacen falta: sede + servicio + fecha/hora.
+1) Si el cliente dice "cancelar/cambiar/editar", no gestiones tú; responde con instrucciones de autoservicio (SMS/email). 
+2) Tildes y ñ SIEMPRE (uñas, pestañas, nivelación, semipermanente…).
+3) “con {nombre}”: valida con roster/sede; no contradigas slots ya mostrados.
+4) Para crear reserva: sede + servicio + fecha/hora.
 
 FORMATO:
 {"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{...}}`
 }
+
 function buildLocalFallback(userMessage, sessionData){
   const msg = String(userMessage||"").trim()
   const lower = norm(msg)
   const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
   const yesMatch = /\b(si|sí|ok|vale|confirmo|de\ acuerdo)\b/i.test(msg)
-  const cancelMatch = /\b(cancelar|anular|borra|elimina)\b/i.test(lower)
+  const cancelMatch = /\b(cancelar|anular|borrar|cambiar|modificar|reprogramar|reagendar|editar)\b/i.test(lower)
   const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
   const bookMatch = /\b(reservar|cita|quiero.*(cita|reservar|hacerme|ponerme))\b/i.test(lower)
 
-  // rellenar rápido con sede/servicio
+  if (cancelMatch){
+    return { message: CANCEL_MODIFY_MSG, action:"none", session_updates:{}, action_params:{} }
+  }
+
   const sede = parseSede(msg)
   if (sede && !sessionData.sede) sessionData.sede = sede
   if (sessionData.sede && !sessionData.selectedServiceEnvKey){
@@ -653,7 +676,6 @@ function buildLocalFallback(userMessage, sessionData){
     const okToCreate = sessionData.sede && sessionData.selectedServiceEnvKey && sessionData.pendingDateTime
     return { message: okToCreate ? "¡Voy a crear la reserva! ✨" : "Casi: dime sede/servicio/hora.", action: okToCreate ? "create_booking" : "need_info", session_updates:{}, action_params:{} }
   }
-  if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")) return { message:"Vale, te enseño tus citas para cancelar:", action:"cancel_appointment", session_updates:{}, action_params:{} }
   if (listMatch) return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
   if (bookMatch && sessionData.sede && sessionData.selectedServiceEnvKey) return { message:"Te propongo horas disponibles:", action:"propose_times", session_updates:{ stage:"awaiting_time" }, action_params:{} }
   if (bookMatch && !sessionData.sede) return { message:"¿En qué sede? Torremolinos o La Luz.", action:"need_info", session_updates:{}, action_params:{} }
@@ -734,6 +756,9 @@ async function ensureCoreFromText(sessionData, userText){
   let changed=false
   const extracted = await aiQuickExtract(userText)
   if (extracted){
+    if (/\b(cancel|modify)\b/i.test(JSON.stringify(extracted))) {
+      // intención de cancelar/modificar → no rellenamos más
+    }
     if (!sessionData.sede && (extracted.sede==="torremolinos" || extracted.sede==="la_luz")){
       sessionData.sede = extracted.sede; changed=true
     }
@@ -754,7 +779,6 @@ async function ensureCoreFromText(sessionData, userText){
       }
     }
   }
-  // Heurística local
   if (!sessionData.sede){
     const sede = parseSede(userText); if (sede){ sessionData.sede=sede; changed=true }
   }
@@ -786,7 +810,6 @@ function nailsServicesForSede(sedeKey, userMsg){
     if (isPedi && !allowPedi) continue
     out.push(s)
   }
-  // dedup por label
   const seen=new Set(), fin=[]
   for (const s of out){ const k=s.label.toLowerCase(); if (seen.has(k)) continue; seen.add(k); fin.push(s) }
   return fin
@@ -968,6 +991,8 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   const staffName = staffLabelFromId(staffId) || sessionData.preferredStaffLabel || "nuestro equipo";
   const address = sessionData.sede === "la_luz" ? ADDRESS_LUZ : ADDRESS_TORRE;
   const svcLabel = serviceLabelFromEnvKey(sessionData.selectedServiceEnvKey) || sessionData.selectedServiceLabel || "Servicio"
+
+  // ✅ Mensaje sin "Referencia: ..."
   const confirmMessage = `🎉 ¡Reserva confirmada!
 
 📍 ${locationNice(sessionData.sede)}
@@ -977,8 +1002,6 @@ ${address}
 👩‍💼 ${staffName}
 📅 ${fmtES(startEU)}
 ⏱️ 60 minutos
-
-Referencia: ${result.booking.id}
 
 ¡Te esperamos!`
   await sendWithPresence(sock, jid, confirmMessage);
@@ -993,28 +1016,10 @@ async function executeListAppointments(_params, _sessionData, phone, sock, jid) 
   ).join("\n")}`;
   await sendWithPresence(sock, jid, message);
 }
-async function executeCancelAppointment(params, sessionData, phone, sock, jid) {
-  const appointments = await enumerateCitasByPhone(phone);
-  if (!appointments.length) { await sendWithPresence(sock, jid, "No encuentro citas futuras asociadas a tu número. ¿Te ayudo a reservar?"); return; }
-  const appointmentIndex = params?.appointmentIndex;
-  if (!appointmentIndex) {
-    sessionData.cancelList = appointments
-    sessionData.stage = "awaiting_cancel"
-    saveSession(phone, sessionData)
-    const message = `Estas son tus próximas citas (por tu número). ¿Cuál quieres cancelar?\n\n${appointments.map(apt => 
-      `${apt.index}) ${apt.pretty} - ${apt.sede}`
-    ).join("\n")}\n\nResponde con el número`
-    await sendWithPresence(sock, jid, message);
-    return;
-  }
-  const appointment = appointments.find(apt => apt.index === appointmentIndex);
-  if (!appointment) { await sendWithPresence(sock, jid, "No encontré esa cita. ¿Puedes verificar el número?"); return; }
-  const success = await cancelBooking(appointment.id);
-  if (success) { await sendWithPresence(sock, jid, `✅ Cita cancelada: ${appointment.pretty} en ${appointment.sede}`) }
-  else { await sendWithPresence(sock, jid, "No pude cancelar la cita. Por favor contacta directamente al salón.") }
-  delete sessionData.cancelList
-  sessionData.stage = null
-  saveSession(phone, sessionData)
+
+// ✅ Cancelar/modificar/editar — solo instrucciones (no tocamos Square)
+async function executeCancelAppointment(_params, _sessionData, _phone, sock, jid) {
+  await sendWithPresence(sock, jid, CANCEL_MODIFY_MSG)
 }
 
 // ====== Bot/WhatsApp infra
@@ -1032,8 +1037,10 @@ async function sendWithPresence(sock, jid, text){
   return sock.sendMessage(jid, { text })
 }
 function isCancelIntent(text){
-  const lower = norm(text)
-  return /\b(cancelar|anular|borrar)\b/.test(lower) && /\b(cita|reserva|pr[oó]xima|mi)\b/.test(lower)
+  const t = norm(text)
+  const cancelWords = /\b(cancelar|anular|borrar|dar de baja)\b/
+  const modifyWords = /\b(cambiar|modificar|editar|mover|reprogramar|reagendar)\b/
+  return cancelWords.test(t) || modifyWords.test(t)
 }
 function parseSede(text){
   const t=norm(text)
@@ -1048,8 +1055,6 @@ function staffRosterForPromptShort(){
     return `ID:${e.id} [${e.labels.join(", ")}] sedes:${locs||"ALL"}`
   }).join(" | ")
 }
-
-// ====== IA principal (system prompt) + fallback
 function buildSystemPromptMain() {
   const nowEU = dayjs().tz(EURO_TZ);
   const torremolinos_services = servicesForSedeKeyRaw("torremolinos");
@@ -1063,11 +1068,10 @@ ${torremolinos_services.map(s => "- "+s.label+" (Clave: "+s.key+")").join("\n")}
 SERVICIOS LA LUZ:
 ${laluz_services.map(s => "- "+s.label+" (Clave: "+s.key+")").join("\n")}
 
-Reglas: tildes/ñ correctas; coherencia con slots mostrados; si dice “con {nombre}” valida contra staff listado/sede; acciones: propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none`
+Reglas: tildes/ñ correctas; coherencia con slots; si dice “cancelar/cambiar/editar”, responde con instrucciones (no gestionar); acciones: propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none`
 }
 
-// getAIResponse usa buildSystemPrompt (ya definida); mantenemos.
-
+// ====== Routing IA
 async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   if (aiObj.session_updates) {
     Object.keys(aiObj.session_updates).forEach(key => {
@@ -1076,7 +1080,6 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
       }
     })
   }
-  // Seguridad: intenta resolver envKey si hay label+sede
   if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
     const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
     if (ek) sessionData.selectedServiceEnvKey = ek
@@ -1113,20 +1116,19 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Baileys + Bot
-async function loadBaileys(){
+const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await (async function loadBaileys(){
   const require = createRequire(import.meta.url); let mod=null
   try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ try{ mod=await import("@whiskeysockets/baileys") }catch{} }
   if(!mod) throw new Error("Baileys incompatible")
-  const makeWASocket = mod.makeWASocket || mod.default?.makeWASocket || (typeof mod.default==="function"?mod.default:undefined)
-  const useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
-  const fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion || mod.default?.fetchLatestBaileysVersion || (async()=>({version:[2,3000,0]}))
-  const Browsers = mod.Browsers || mod.default?.Browsers || { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
-  return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
-}
+  const _makeWASocket = mod.makeWASocket || mod.default?.makeWASocket || (typeof mod.default==="function"?mod.default:undefined)
+  const _useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
+  const _fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion || mod.default?.fetchLatestBaileysVersion || (async()=>({version:[2,3000,0]}))
+  const _Browsers = mod.Browsers || mod.default?.Browsers || { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
+  return { makeWASocket:_makeWASocket, useMultiFileAuthState:_useMultiFileAuthState, fetchLatestBaileysVersion:_fetchLatestBaileysVersion, Browsers:_Browsers }
+})()
 
 async function startBot(){
   try{
-    const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
     if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
@@ -1198,7 +1200,14 @@ async function startBot(){
           sessionData.last_msg_id = m.key.id
           sessionData.__last_user_text = textRaw
 
-          // ===== Pre-parse universal (auto-completar sede/servicio/staff)
+          // 👋 Bienvenida (una vez)
+          if (!sessionData.greeted){
+            sessionData.greeted = true
+            saveSession(phone, sessionData)
+            await sendWithPresence(sock, jid, WELCOME_MSG)
+          }
+
+          // ===== Pre-parse universal
           const changed = await ensureCoreFromText(sessionData, textRaw)
           if (changed) saveSession(phone, sessionData)
 
@@ -1217,7 +1226,13 @@ async function startBot(){
             }
           }
 
-          // PRE: “con {nombre}” — coherente con roster/slots
+          // PRE: intención cancelar/modificar/editar
+          if (isCancelIntent(textRaw)){
+            await sendWithPresence(sock, jid, CANCEL_MODIFY_MSG)
+            return
+          }
+
+          // PRE: “con {nombre}”
           const withMatch = textRaw.match(/\bcon\s+([a-záéíóúñü ]{2,})\??$/i)
           if (withMatch && sessionData.sede){
             const wanted = withMatch[1].trim()
@@ -1246,12 +1261,6 @@ async function startBot(){
             }
           }
 
-          // PRE: cancelar directo
-          if (isCancelIntent(textRaw) && sessionData.stage!=="awaiting_cancel"){
-            await executeCancelAppointment({}, sessionData, phone, sock, jid)
-            return
-          }
-
           // IA principal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
 
@@ -1275,7 +1284,7 @@ async function startBot(){
   }catch{ setTimeout(() => startBot().catch(console.error), 5000) }
 }
 
-// ====== Mini-web + QR (UNA SOLA INSTANCIA)
+// ====== Mini-web + QR
 const app = express()
 const PORT = process.env.PORT || 8080
 let lastQR = null, conectado = false
@@ -1293,15 +1302,12 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.4.0</h1>
-  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
+  <h1>Gapink Nails</h1>
+  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "Conectado" : "Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
-  <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
-  <h3>📊 Estadísticas</h3>
-  <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
-  <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 v27.4.0:</strong> Una única app Express, extracción IA previa, coherencia de staff y acentos/ñ arreglados.
-  </div>
+
+
+
   </div>`)
 })
 app.get("/qr.png", async (_req,res)=>{
@@ -1314,7 +1320,7 @@ app.get("/logs", (_req,res)=>{
   res.json({ logs: recent })
 })
 
-console.log(`🩷 Gapink Nails Bot v27.4.0`)
+console.log(`🩷 Gapink Nails Bot v27.5.1`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
