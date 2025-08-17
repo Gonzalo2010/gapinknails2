@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v27.2.0
+// index.js — Gapink Nails · v27.2.0.0
 // Fixes clave:
 // • Etiquetas siempre con “uñas”, “pestañas” y tildes (función applySpanishDiacritics).
 // • Nunca proponemos ni reservamos con una pro no permitida en esa sede (isStaffAllowedInLocation + filtro en proposeTime).
