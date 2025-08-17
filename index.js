@@ -1,13 +1,3 @@
-// index.js — Gapink Nails · v29.1 (IA en todas partes)
-// Cambios clave v29.1:
-// - FIX: añadida findStaffElsewhere (faltaba → provocaba “error técnico”).
-// - IA aplicada en: salón, categoría, servicio, profesional, horarios.
-// - Bienvenida SIEMPRE y luego sigue el flujo (sin cortar).
-// - Intent “info” → no se responde (salvo bienvenida).
-// - Cancelar/editar → autoservicio por SMS/email.
-// - Reemplazo “sede” → “salón”. Acentos/ñ corregidos en etiquetas.
-// - Coherencia staff/slots por salón. Fuzzy “con {nombre}”.
-
 import express from "express"
 import pino from "pino"
 import qrcode from "qrcode"
