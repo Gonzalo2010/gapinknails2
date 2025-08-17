@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v29.1 (IA en todas partes)
+// index.js — Gapink Nails · v29.1.0 (IA en todas partes)
 // Cambios clave v29.1:
 // - FIX: añadida findStaffElsewhere (faltaba → provocaba “error técnico”).
 // - IA aplicada en: salón, categoría, servicio, profesional, horarios.
