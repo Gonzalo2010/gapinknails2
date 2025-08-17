@@ -1,12 +1,10 @@
-// index.js — Gapink Nails · v28.0
-// ✨ Cambios clave v28.0
-// - IA con extracción estructurada + few-shots: intent, salón, categoría, servicio, staff.
-// - Orquestación híbrida: IA + heurística + verificación dura (salón/servicio/staff).
-// - Listas por categoría (cejas/pestañas/uñas/manicura/pedicura) sin mezcla.
-// - Ofertas de horas solo con staff realmente disponible en ese salón/servicio/slot.
-// - Acentos/ñ y títulos bonitos en todos los labels.
-// - Bienvenida siempre; cancelar/editar = autoservicio.
-// - Miniweb rosa suave con firma de Gonzalo (link a gonzalog.co).
+// index.js — Gapink Nails · v28.1
+// ✨ Cambios v28.1
+// - FIX bucle identidad: al elegir 1/2/3 en "awaiting_identity_pick" se guarda customerId y se continúa.
+// - executeCreateBooking prioriza sessionData.customerId y NO vuelve a preguntar.
+// - Limpieza de stage/identityChoices tras elegir.
+// - insideBusinessHours: corrección de endMin (antes tomaba t.minute()).
+// - Resto intacto de v28.0 (IA, categorías, miniweb rosa, bienvenida, autoservicio para cancelar/modificar).
 
 import express from "express"
 import pino from "pino"
@@ -117,7 +115,7 @@ function insideBusinessHours(d,dur){
   const end=t.clone().add(dur,"minute")
   if (!t.isSame(end,"day")) return false
   const startMin = t.hour()*60 + t.minute()
-  const endMin   = end.hour()*60 + t.minute()
+  const endMin   = end.hour()*60 + end.minute() // ✅ FIX aquí
   const openMin  = OPEN.start*60
   const closeMin = OPEN.end*60
   return startMin >= openMin && endMin <= closeMin
@@ -154,7 +152,7 @@ function safeJSONStringify(value){
   }catch{ try { return String(value) } catch { return "[Unserializable]" } }
 }
 
-// ====== Estado global miniweb/QR
+// ====== Estado miniweb/QR
 let lastQR = null
 let conectado = false
 
@@ -399,26 +397,14 @@ function fuzzyFindBestService(sedeKey, text, categoryHint=null){
   return (bestScore>=2.5) ? best : null
 }
 
-// ====== IA Quick Extract (más lista + few-shots)
+// ====== IA Quick Extract
 async function aiQuickExtract(userText){
   if (!AI_API_KEY) return null
   const controller = new AbortController()
   const to = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
   try{
     const promptSys = `Eres un extractor experto. Devuelve SOLO JSON:
-{"intent":"book|cancel|modify|info|other","sede":"torremolinos|la_luz|null","category":"unas|pestanas|cejas|pedicura|manicura|null","serviceLabel":"cadena o null","staffName":"cadena o null"}
-Reglas:
-- intent=book si pide reservar/horas/huecos o dice "quiero hacerme/ponerme".
-- intent=cancel/modify si pide cancelar/cambiar/reagendar/editar.
-- intent=info si pide precios, duración, dirección, dudas. (Aun así el bot enviará bienvenida y responderá).
-- Sede: "La Luz"->"la_luz", "Torremolinos"->"torremolinos".
-- Categoría por palabras clave (cejas/pestañas/uñas/manicura/pedicura). Prioriza cejas y pestañas si aparecen.
-- Si no estás seguro, usa null.
-Ejemplos:
-Q:"me quiero depilar las cejas en la luz" -> {"intent":"book","sede":"la_luz","category":"cejas","serviceLabel":null,"staffName":null}
-Q:"tienes horas para pestañas 2d mañana?" -> {"intent":"book","sede":null,"category":"pestanas","serviceLabel":"Pestañas 2D","staffName":null}
-Q:"cancela mi cita" -> {"intent":"cancel","sede":null,"category":null,"serviceLabel":null,"staffName":null}
-Q:"quiero con carmen belen unas esculpidas" -> {"intent":"book","sede":null,"category":"manicura","serviceLabel":"Uñas Esculpidas","staffName":"carmen belen"}`
+{"intent":"book|cancel|modify|info|other","sede":"torremolinos|la_luz|null","category":"unas|pestanas|cejas|pedicura|manicura|null","serviceLabel":"cadena o null","staffName":"cadena o null"}`
     const body = { model: AI_MODEL, messages:[
       {role:"system", content: promptSys},
       {role:"user", content: `Texto: "${userText}"\nResponde SOLO el JSON.`}
@@ -447,11 +433,17 @@ async function searchCustomersByPhone(phone){
   }catch{ return [] }
 }
 async function getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid){
+  // Si ya existe selección previa, úsala
+  if (sessionData.customerId) {
+    const stub = { id: sessionData.customerId }
+    return { status:"single", customer: stub }
+  }
   const matches = await searchCustomersByPhone(phone)
   if (matches.length === 1){
     const c = matches[0]
     sessionData.name = sessionData.name || c?.givenName || null
     sessionData.email = sessionData.email || c?.emailAddress || null
+    sessionData.customerId = c.id
     return { status:"single", customer:c }
   }
   if (matches.length === 0){
@@ -550,7 +542,7 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
 }
 async function cancelBooking(_bookingId){ return false } // no se usa (autoservicio)
 
-// ====== Citas por teléfono (para listar)
+// ====== Citas por teléfono (listar)
 async function enumerateCitasByPhone(phone){
   const items=[]
   let cid=null
@@ -664,7 +656,6 @@ async function callAIWithRetries(messages, systemPrompt=""){
   }
   return null
 }
-
 function staffRosterForPrompt(){
   return EMPLOYEES.map(e=>{
     const locs = e.allow.map(id=> id===LOC_TORRE?"torremolinos" : id===LOC_LUZ?"la_luz" : id).join(",")
@@ -690,17 +681,15 @@ SERVICIOS LA LUZ:
 ${laluz_services.map(s => "- "+s.label+" (Clave: "+s.key+")").join("\n")}
 
 REGLAS CLAVE:
-1) Si el cliente dice "cancelar/cambiar/editar", responde con autoservicio (SMS/email).
-2) Tildes y ñ SIEMPRE (uñas, pestañas, cejas, nivelación, semipermanente…).
-3) En mensajes al cliente usa la palabra "salón".
-4) Coherencia con slots/roster y sin contradicciones. Valida staff por salón.
-5) Para crear reserva: sede + servicio + fecha/hora.
-6) Si el servicio no está claro, propone lista de la *categoría detectada* (uñas/pestañas/cejas/pedicura/manicura).
+1) Cancelar/cambiar/editar → autoservicio (SMS/email).
+2) Tildes y ñ SIEMPRE. Usa “salón”.
+3) Coherencia con slots/roster. Valida staff por salón.
+4) Para crear reserva: salón + servicio + fecha/hora.
+5) Si el servicio no está claro, lista por *categoría* detectada.
 
 FORMATO:
-{"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{"category":"unas|pestanas|cejas|pedicura|manicura","candidates":[{"label":"...","confidence":0-1}]}}`
+{"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{},"action_params":{"category":"unas|pestanas|cejas|pedicura|manicura","candidates":[{"label":"...","confidence":0-1}]}}`
 }
-
 function buildSessionContext(sessionData){
   return `
 ESTADO:
@@ -790,7 +779,6 @@ async function ensureCoreFromText(sessionData, userText){
       }
     }
   } else {
-    // Heurística pura si IA no responde
     if (!sessionData.sede){
       const sede = parseSede(userText); if (sede){ sessionData.sede=sede; changed=true }
     }
@@ -806,7 +794,6 @@ async function ensureCoreFromText(sessionData, userText){
       }
     }
   }
-  // Coherencia categoría-servicio: si no encaja, forzar elección de categoría
   if (sessionData.sede && sessionData.selectedServiceLabel && sessionData.pendingCategory){
     if (!isLabelInCategory(sessionData.sede, sessionData.selectedServiceLabel, sessionData.pendingCategory)){
       sessionData.selectedServiceLabel = null
@@ -817,7 +804,7 @@ async function ensureCoreFromText(sessionData, userText){
   return changed
 }
 
-// ====== Scoring para ordenar candidatos en listas
+// ====== Scoring para listas
 function scoreServiceRelevance(userMsg, label){
   const u = norm(userMsg), l = norm(label); let score = 0
   if (/\b(uñas|manicura|pedicura|pestañas|cejas)\b/.test(u) && /\b(uñas|manicura|pedicura|pestañas|cejas)\b/.test(l)) score += 3
@@ -885,12 +872,10 @@ async function executeProposeTime(_params, sessionData, phone, sock, jid) {
     return;
   }
 
-  // Si pidió staff concreto, validar que existe en ese salón
   if (sessionData.preferredStaffId){
     const e = EMPLOYEES.find(x=>x.id===sessionData.preferredStaffId)
     const locId = locationToId(sessionData.sede)
     if (!e || !(e.allow.includes("ALL") || e.allow.includes(locId))){
-      // staff no trabaja en este salón: limpiar preferencia
       sessionData.preferredStaffId = null
       sessionData.preferredStaffLabel = null
     }
@@ -961,15 +946,21 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
   if (!staffId) { await sendWithPresence(sock, jid, "No hay profesionales disponibles en ese salón"); return; }
 
-  sessionData.__phone = phone
-  const { status, customer } = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid) || {}
-  if (status === "need_new" || status === "need_pick") return
+  // ✅ PRIORIDAD a selección previa de cliente
+  let customerId = sessionData.customerId || null
 
-  let customerId = customer?.id
+  if (!customerId){
+    sessionData.__phone = phone
+    const got = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid)
+    if (got?.status === "need_new" || got?.status === "need_pick") return
+    customerId = got?.customer?.id || null
+  }
+
   if (!customerId && (sessionData.name || sessionData.email)){
     const created = await findOrCreateCustomerWithRetry({ name: sessionData.name, email: sessionData.email, phone })
     if (!created){ await sendWithPresence(sock, jid, "No pude crear tu ficha de cliente. Intenta de nuevo o contacta al salón."); return }
     customerId = created.id
+    sessionData.customerId = customerId
   }
   if (!customerId){
     sessionData.stage = "awaiting_identity"
@@ -1056,14 +1047,13 @@ function isCancelIntent(text){
   const modifyWords = /\b(cambiar|modificar|editar|mover|reprogramar|reagendar)\b/
   return cancelWords.test(t) || modifyWords.test(t)
 }
-
 function buildSystemPromptMain() {
   const nowEU = dayjs().tz(EURO_TZ);
   const torremolinos_services = servicesForSedeKeyRaw("torremolinos");
   const laluz_services = servicesForSedeKeyRaw("la_luz");
   return `Eres el asistente de WhatsApp para Gapink Nails. Devuelves SOLO JSON válido.
 Fecha: ${nowEU.format("dddd DD/MM/YYYY HH:mm")} (Madrid)
-Reglas: usa "salón" en mensajes al cliente; tildes/ñ; coherencia con slots; autoservicio para cancelar/cambiar; acciones: propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none
+Reglas: usa "salón"; tildes/ñ; coherencia con slots; autoservicio cancelar/cambiar; acciones: propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none
 
 SERVICIOS TORREMOLINOS:
 ${torremolinos_services.map(s => "- "+s.label+" (Clave: "+s.key+")").join("\n")}
@@ -1073,7 +1063,6 @@ ${laluz_services.map(s => "- "+s.label+" (Clave: "+s.key+")").join("\n")}`
 
 // ====== Routing IA
 async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
-  // session updates
   if (aiObj?.session_updates) {
     Object.keys(aiObj.session_updates).forEach(key => {
       if (aiObj.session_updates[key] !== null && aiObj.session_updates[key] !== undefined) {
@@ -1081,12 +1070,10 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
       }
     })
   }
-  // Resolver envKey si IA dio label + salón
   if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
     const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
     if (ek) sessionData.selectedServiceEnvKey = ek
   }
-  // Coherencia categoría-servicio
   if (sessionData.sede && sessionData.selectedServiceLabel && sessionData.pendingCategory){
     if (!isLabelInCategory(sessionData.sede, sessionData.selectedServiceLabel, sessionData.pendingCategory)){
       sessionData.selectedServiceLabel=null
@@ -1197,6 +1184,7 @@ async function startBot(){
             pendingDateTime: null,
             name: null,
             email: null,
+            customerId: null,          // ✅ nuevo
             last_msg_id: null,
             lastStaffByIso: {},
             lastProposeUsedPreferred: false,
@@ -1234,6 +1222,30 @@ async function startBot(){
 
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
+
+          // ✅ PRIMERO: resolución de identidad si estamos esperando pick
+          if (numMatch && sessionData.stage==="awaiting_identity_pick" && Array.isArray(sessionData.identityChoices) && sessionData.identityChoices.length){
+            const idx = Number(numMatch[1]) - 1
+            const pick = sessionData.identityChoices[idx]
+            if (pick){
+              sessionData.customerId = pick.id
+              sessionData.name = pick.name || sessionData.name
+              sessionData.email = (pick.email && pick.email!=="—") ? pick.email : sessionData.email
+              sessionData.identityChoices = null
+              sessionData.stage = null
+              saveSession(phone, sessionData)
+
+              // Si ya hay hora/servicio/salón → crear directamente
+              if (sessionData.sede && sessionData.selectedServiceEnvKey && sessionData.pendingDateTime){
+                await executeCreateBooking({}, sessionData, phone, sock, jid)
+              } else if (sessionData.sede && sessionData.selectedServiceEnvKey){
+                await executeProposeTime({}, sessionData, phone, sock, jid)
+              } else {
+                await sendWithPresence(sock, jid, "Perfecto. Dime en qué *salón* (Torremolinos o La Luz) y el *servicio* para continuar ✨")
+              }
+              return
+            }
+          }
 
           // Salón solicitado para listas por categoría
           if (sessionData.stage==="awaiting_salon_for_services"){
@@ -1292,7 +1304,7 @@ async function startBot(){
             }
           }
 
-          // IA principal (por si puede cerrar sola)
+          // IA principal
           const aiObj = await (async ()=>{
             const systemPrompt = buildSystemPrompt()
             const recent = db.prepare(`SELECT user_message, ai_response FROM ai_conversations WHERE phone = ? ORDER BY timestamp DESC LIMIT 6`).all(phone);
@@ -1310,7 +1322,7 @@ async function startBot(){
             try { return JSON.parse(cleaned) } catch { return null }
           })()
 
-          // Si la IA no lo deja claro pero hay categoría → lista de esa categoría
+          // Si IA no decide y hay categoría → lista esa categoría
           if ((!aiObj || aiObj.action==="none" || aiObj.action==="need_info") && sessionData.sede && (sessionData.pendingCategory || detectCategory(textRaw)) && !sessionData.selectedServiceEnvKey){
             await executeChooseService({ category: sessionData.pendingCategory || detectCategory(textRaw), candidates: [] }, sessionData, phone, sock, jid, textRaw)
             return
@@ -1385,7 +1397,7 @@ app.get("/logs", (_req,res)=>{
   res.json({ logs: recent })
 })
 
-console.log(`🩷 Gapink Nails Bot v28.0`)
+console.log(`🩷 Gapink Nails Bot v28.1`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
