@@ -1,12 +1,12 @@
-// index.js — Gapink Nails · v29.0
-// 💅 Novedades v29.0 (IA gestiona empleado):
-// - IA entiende intención de empleado: "con {nombre}", "¿quién me recomiendas?", "me da igual", etc.
-// - Acción choose_staff: lista profesionales del salón ordenados por *próxima disponibilidad*.
-// - Si nombras a alguien que trabaja en el otro salón → propone cambio de *salón* y continua.
-// - Si hay varias coincidencias por tu número, primero te pide elegir la ficha y luego sigue.
-// - Si dices "me da igual", la IA elige automáticamente a quien tenga hueco más pronto.
-// - Coherencia total con roster/slots; nunca ofrece alguien y luego dice que no está disponible.
-// - Mantiene: bienvenida fija, autoservicio cancelar/modificar, “salón” en vez de “sede”, tildes/ñ, no pedir nombre/email si existe cliente por teléfono, etc.
+// index.js — Gapink Nails · v29.1 (IA en todas partes)
+// Cambios clave v29.1:
+// - FIX: añadida findStaffElsewhere (faltaba → provocaba “error técnico”).
+// - IA aplicada en: salón, categoría, servicio, profesional, horarios.
+// - Bienvenida SIEMPRE y luego sigue el flujo (sin cortar).
+// - Intent “info” → no se responde (salvo bienvenida).
+// - Cancelar/editar → autoservicio por SMS/email.
+// - Reemplazo “sede” → “salón”. Acentos/ñ corregidos en etiquetas.
+// - Coherencia staff/slots por salón. Fuzzy “con {nombre}”.
 
 import express from "express"
 import pino from "pino"
@@ -84,6 +84,7 @@ Si necesitas cualquier otra cosa, dime y te ayudo dentro del horario 🩷`
 const onlyDigits = s => String(s||"").replace(/\D+/g,"")
 const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = s => rm(s).toLowerCase().replace(/[+.,;:()/_-]/g," ").replace(/[^\p{Letter}\p{Number}\s]/gu," ").replace(/\s+/g," ").trim()
+
 function normalizePhoneES(raw){
   const d=onlyDigits(raw); if(!d) return null
   if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
@@ -628,7 +629,7 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
   }catch{ return [] }
 }
 
-// ====== IA conversacional
+// ====== IA conversacional core
 async function callAIOnce(messages, systemPrompt = "") {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
@@ -690,20 +691,8 @@ REGLAS CLAVE:
 FORMATO:
 {"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|choose_staff|need_info|none","session_updates":{"sede": "...","selectedServiceLabel":"...","selectedServiceEnvKey":"...","preferredStaffId":"...","preferredStaffLabel":"..."},"action_params":{"category":"unas|pestanas|cejas|pedicura|manicura","candidates":[{"label":"...","confidence":0-1}],"staffCandidates":[{"name":"...","confidence":0-1}]}}`
 }
-function buildSessionContext(sessionData){
-  return `
-ESTADO:
-- Salón: ${sessionData?.sede || 'no seleccionado'}
-- Categoría: ${sessionData?.pendingCategory ? CATEGORY_PRETTY[sessionData.pendingCategory] : '—'}
-- Servicio: ${sessionData?.selectedServiceLabel || 'no seleccionado'} (${sessionData?.selectedServiceEnvKey || 'no_key'})
-- Profesional preferida: ${sessionData?.preferredStaffLabel || 'ninguna'}
-- Fecha/hora pendiente: ${sessionData?.pendingDateTime ? fmtES(parseToEU(sessionData.pendingDateTime)) : 'no seleccionada'}
-- Etapa: ${sessionData?.stage || 'inicial'}
-- Últimas horas propuestas: ${Array.isArray(sessionData?.lastHours) ? sessionData.lastHours.length + ' opciones' : 'ninguna'}
-`
-}
 
-// ====== Staff fuzzy utils
+// ====== Heurísticas staff
 function _normName(s){ return norm(String(s||"")).replace(/\s+/g," ").trim() }
 function parseSede(text){
   const t=norm(text)
@@ -782,6 +771,19 @@ function findStaffAnySalon(inputName){
   }
   return null
 }
+// ✅ NUEVO: estaba faltando y causaba "error técnico"
+function findStaffElsewhere(inputName, currentSalonKey){
+  const match = findStaffAnySalon(inputName)
+  if (!match) return null
+  const sedes = match.allow.includes("ALL")
+    ? ["torremolinos","la_luz"]
+    : match.allow.map(id => idToLocKey(id)).filter(Boolean)
+  if (!sedes.length) return null
+  // Si trabaja en otro salón distinto al actual → sugerir cambio
+  if (currentSalonKey && sedes.includes(currentSalonKey)) return null
+  return { ...match, sedes }
+}
+
 function extractStaffAsk(text){
   const m = text.match(/\bcon\s+([a-záéíóúñü]+(?:\s+[a-záéíóúñü]+){0,2})\b/i)
   return m ? m[1].trim() : null
@@ -809,11 +811,12 @@ async function rankStaffForService(salonKey, envServiceKey, fromEU){
   return rows
 }
 
-// ====== Híbrido IA + Heurística (extrae también staffIntent)
+// ====== Híbrido IA + Heurística
 async function ensureCoreFromText(sessionData, userText){
   let changed=false
   const extracted = await aiQuickExtract(userText)
   if (extracted){
+    sessionData.__last_intent = extracted.intent || null
     if (!sessionData.sede && (extracted.sede==="torremolinos" || extracted.sede==="la_luz")){
       sessionData.sede = extracted.sede; changed=true
     }
@@ -894,7 +897,7 @@ async function ensureCoreFromText(sessionData, userText){
   return changed
 }
 
-// ====== Scoring listas
+// ====== Scoring y listas
 function scoreServiceRelevance(userMsg, label){
   const u = norm(userMsg), l = norm(label); let score = 0
   if (/\b(uñas|manicura|pedicura|pestañas|cejas)\b/.test(u) && /\b(uñas|manicura|pedicura|pestañas|cejas)\b/.test(l)) score += 3
@@ -970,7 +973,6 @@ async function executeChooseStaff(params, sessionData, phone, sock, jid){
     next: r.next ? fmtES(r.next) : null,
     ai: aiMap.get(_normName(r.staff.labels?.[0]||"")) || 0
   }))
-  // Ordena por IA primero (si hay), luego por próxima fecha
   rows.sort((a,b)=>{
     if (b.ai!==a.ai) return b.ai - a.ai
     if (a.next && b.next) return dayjs(a.next,"dddd DD/MM HH:mm") - dayjs(b.next,"dddd DD/MM HH:mm")
@@ -1023,7 +1025,6 @@ async function executeProposeTime(_params, sessionData, phone, sock, jid) {
 
   const hoursEnum = enumerateHours(slots.map(s => s.date))
   const map = {}; for (const s of slots) map[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
-
   const nameMap = {}
   Object.values(map).forEach(sid => { if (sid) nameMap[sid] = staffLabelFromId(sid) })
   sessionData.lastStaffNamesById = nameMap
@@ -1179,7 +1180,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
       }
     })
   }
-  // Resolver envKey desde label si hace falta
+  // Resolver envKey desde label si falta
   if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
     const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
     if (ek) sessionData.selectedServiceEnvKey = ek
@@ -1308,7 +1309,7 @@ async function startBot(){
         try {
           let sessionData = loadSession(phone) || {
             greeted: false,
-            sede: null, // mantenemos la propiedad interna, pero hablamos de "salón" en mensajes
+            sede: null, // almacenamos “salón” como sede interna
             selectedServiceEnvKey: null,
             selectedServiceLabel: null,
             preferredStaffId: null,
@@ -1337,7 +1338,7 @@ async function startBot(){
           sessionData.last_msg_id = m.key.id
           sessionData.__last_user_text = textRaw
 
-          // Bienvenida siempre
+          // Bienvenida SIEMPRE y luego seguimos (no cortamos el flujo)
           if (!sessionData.greeted){
             sessionData.greeted = true
             saveSession(phone, sessionData)
@@ -1350,7 +1351,15 @@ async function startBot(){
             return
           }
 
-          // Confirmación de cambio de salón por staff
+          // Extrae intención rápida para silenciar “info”
+          const quick = await aiQuickExtract(textRaw)
+          if (quick?.intent === "info"){
+            sessionData.__last_intent = "info"
+            saveSession(phone, sessionData)
+            return // No respondemos (salvo bienvenida ya enviada)
+          }
+
+          // Confirmación de cambio de salón por staff (si venía de antes)
           if (sessionData.stage==="confirm_switch_salon"){
             if (isAffirmative(textRaw)){
               sessionData.sede = sessionData.switchTargetSalon
@@ -1426,7 +1435,7 @@ async function startBot(){
             }
           }
 
-          // 👉 Detección "con {nombre}" en cualquier parte
+          // Detección “con {nombre}”
           const staffAsk = extractStaffAsk(textRaw)
           if (staffAsk && sessionData.sede){
             let staff = findStaffByName(staffAsk, sessionData.sede) || suggestClosestStaff(staffAsk, sessionData.sede)
@@ -1459,7 +1468,6 @@ async function startBot(){
               sessionData.selectedServiceEnvKey = resolveEnvKeyFromLabelAndSede(pick.label, sessionData.sede)
               sessionData.stage = null
               saveSession(phone, sessionData)
-              // Si usuario pregunta por recomendación de staff o es indiferente → elegir staff
               if (/quien|quién|recomiendas|profesional/i.test(textRaw) || isIndifferent(textRaw)){
                 await executeChooseStaff({ staffCandidates: [] }, sessionData, phone, sock, jid)
               } else {
@@ -1494,7 +1502,7 @@ async function startBot(){
             ]).flat();
             const messages = [
               ...conversationHistory,
-              { role: "user", content: `MENSAJE DEL CLIENTE: "${textRaw}"\n${buildSessionContext(sessionData)}\nINSTRUCCIÓN: Devuelve SOLO JSON siguiendo las reglas.` }
+              { role: "user", content: `MENSAJE DEL CLIENTE: "${textRaw}"\nESTADO:\n- Salón: ${sessionData?.sede || '—'}\n- Categoría: ${sessionData?.pendingCategory || '—'}\n- Servicio: ${sessionData?.selectedServiceLabel || '—'} (${sessionData?.selectedServiceEnvKey || 'no_key'})\n- Profesional: ${sessionData?.preferredStaffLabel || '—'}\n- Fecha/hora: ${sessionData?.pendingDateTime ? fmtES(parseToEU(sessionData.pendingDateTime)) : '—'}\nINSTRUCCIÓN: Devuelve SOLO JSON siguiendo las reglas.` }
             ];
             const aiText = await callAIWithRetries(messages, systemPrompt)
             if (!aiText) return null
@@ -1511,15 +1519,16 @@ async function startBot(){
           await routeAIResult(aiObj||{action:"none",message:null,session_updates:{},action_params:{}}, sessionData, textRaw, m, phone, sock, jid)
 
         } catch (error) {
-          if (BOT_DEBUG) console.error(error)
-          await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
+          if (BOT_DEBUG) console.error("Handler error:", error)
+          // Fallback amable en vez de “error técnico”
+          await sendWithPresence(sock, jid, "He tenido un pequeño contratiempo, pero seguimos 🙌. Dime el *salón* (Torremolinos o La Luz) y el *servicio* (por ejemplo “depilar cejas”), y te propongo horas al momento.")
         }
       })
     })
   }catch{ setTimeout(() => startBot().catch(console.error), 5000) }
 }
 
-// ====== Mini-web + QR (rosa suave + crédito)
+// ====== Mini-web (rosa suave) + QR + crédito
 const app = express()
 const PORT = process.env.PORT || 8080
 
@@ -1577,7 +1586,7 @@ app.get("/logs", (_req,res)=>{
   res.json({ logs: recent })
 })
 
-console.log(`🩷 Gapink Nails Bot v29.0`)
+console.log(`🩷 Gapink Nails Bot v29.1`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
