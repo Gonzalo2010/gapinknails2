@@ -267,7 +267,7 @@ function parseEmployees(){
     const allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
     const labels = deriveLabelsFromEnvKey(k)
 
-    // Centro base opcional por variable: EMP_CENTER_<SUFIJO de SQ_EMP_...> = la_luz|torremolinos
+    // Centro base opcional: EMP_CENTER_<SUFIJO de SQ_EMP_...> = la_luz|torremolinos
     const centerKey = `EMP_CENTER_${k.replace(/^SQ_EMP_/,"")}`
     const rawCenter = String(process.env[centerKey]||"").trim().toLowerCase()
     const baseCenter = rawCenter==="la_luz" ? "la_luz" : rawCenter==="torremolinos" ? "torremolinos" : null
@@ -1175,11 +1175,38 @@ function enqueue(key,job){
   const next=prev.then(job,job).finally(()=>{ if (QUEUE.get(key)===next) QUEUE.delete(key) })
   QUEUE.set(key,next); return next
 }
+
+// === NUEVO: rastrear mensajes enviados por el bot para no confundirlos con intervención humana
+const BOT_SENT = new Map() // phone -> Set<msgId>
+function markBotSent(phone, id){
+  if (!phone || !id) return
+  let s = BOT_SENT.get(phone)
+  if (!s){ s = new Set(); BOT_SENT.set(phone, s) }
+  s.add(id)
+  // prune
+  if (s.size > 200){
+    const it = s.values()
+    for (let i=0;i<50;i++){ const v = it.next().value; if (v) s.delete(v) }
+  }
+}
+function wasBotSent(phone, id){
+  const s = BOT_SENT.get(phone)
+  if (!s) return false
+  if (s.has(id)){ s.delete(id); return true }
+  return false
+}
+
 async function sendWithPresence(sock, jid, text){
   try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
   await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
-  return sock.sendMessage(jid, { text })
+  const msg = await sock.sendMessage(jid, { text })
+  try{
+    const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
+    if (msg?.key?.id) markBotSent(phone, msg.key.id)
+  }catch{}
+  return msg
 }
+
 function isCancelIntent(text){
   const t = norm(text)
   const cancelWords = /\b(cancelar|anular|borrar|dar de baja)\b/
@@ -1318,8 +1345,9 @@ async function startBot(){
       const jid = m.key.remoteJid
       const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
 
-      // Intervención manual (fromMe) → pausa 6h
+      // Intervención manual (fromMe) → pausa 6h, pero IGNORAMOS lo que envió el propio bot
       if (m.key.fromMe){
+        if (wasBotSent(phone, m.key.id)) return
         if (phone) setPause(phone, INTERVENTION_PAUSE_HOURS)
         return
       }
@@ -1359,14 +1387,14 @@ async function startBot(){
             __operator_flag: false
           }
 
-          // Pausa por intervención
+          // Pausa por intervención real
           if (isPaused(sessionData)) return
           
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
           sessionData.__last_user_text = textRaw
 
-          // ✅ Bienvenida solo una vez y CORTAMOS el turno para evitar doble mensaje
+          // Bienvenida solo una vez y cortamos este turno (el siguiente ya fluye normal)
           if (!sessionData.greeted){
             sessionData.greeted = true
             saveSession(phone, sessionData)
@@ -1594,7 +1622,7 @@ app.get("/logs", (_req,res)=>{
   res.json({ logs: recent })
 })
 
-console.log(`🩷 Gapink Nails Bot v30.1`)
+console.log(`🩷 Gapink Nails Bot v30.2`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
