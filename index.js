@@ -30,7 +30,7 @@ const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
 const SQUARE_MAX_RETRIES = Number(process.env.SQUARE_MAX_RETRIES || 3)
 const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "")
 
-// ====== Pausas por intervención humana
+// ====== Pausas por intervención manual (con ".")
 const INTERVENTION_PAUSE_HOURS = Number(process.env.INTERVENTION_PAUSE_HOURS || 6)
 
 // ====== Square
@@ -414,14 +414,14 @@ function fuzzyFindBestService(salonKey, text, categoryHint=null){
   return (bestScore>=2.5) ? best : null
 }
 
-// ====== IA Quick Extract (extendida con intervención y urgencia)
+// ====== IA Quick Extract (SIN bandera de intervención manual)
 async function aiQuickExtract(userText){
   if (!AI_API_KEY) return null
   const controller = new AbortController()
   const to = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
   try{
     const promptSys = `Eres un extractor experto. Devuelve SOLO JSON:
-{"intent":"book|cancel|modify|list|info|other","sede":"torremolinos|la_luz|null","category":"unas|pestanas|cejas|pedicura|manicura|null","serviceLabel":"cadena o null","staffName":"cadena o null","staffIntent":"pick|suggest|any|none","operatorIntervention":true|false,"urgency":"asap|specific|none"}`
+{"intent":"book|cancel|modify|list|info|other","sede":"torremolinos|la_luz|null","category":"unas|pestanas|cejas|pedicura|manicura|null","serviceLabel":"cadena o null","staffName":"cadena o null","staffIntent":"pick|suggest|any|none","urgency":"asap|specific|none"}`
     const body = { model: AI_MODEL, messages:[
       {role:"system", content: promptSys},
       {role:"user", content: `Texto: "${userText}"\nResponde SOLO el JSON.`}
@@ -708,7 +708,6 @@ function levenshtein(a,b){
 }
 function nameSim(a,b){
   const A=_normName(a), B=_normName(b)
-  if (!A || !B) return 0
   const dist = levenshtein(A,B)
   const maxLen = Math.max(A.length,B.length)
   return maxLen ? (1 - dist/maxLen) : 0
@@ -803,10 +802,6 @@ async function ensureCoreFromText(sessionData, userText){
   const extracted = await aiQuickExtract(userText)
   if (extracted){
     sessionData.__last_intent = extracted.intent || null
-
-    if (extracted.operatorIntervention === true){
-      sessionData.__operator_flag = true
-    }
 
     if (!sessionData.sede && (extracted.sede==="torremolinos" || extracted.sede==="la_luz")){
       sessionData.sede = extracted.sede; changed=true
@@ -1176,7 +1171,7 @@ function enqueue(key,job){
   QUEUE.set(key,next); return next
 }
 
-// === NUEVO: rastrear mensajes enviados por el bot para no confundirlos con intervención humana
+// === Rastreo de mensajes enviados por el bot para no confundirlos con intervención humana
 const BOT_SENT = new Map() // phone -> Set<msgId>
 function markBotSent(phone, id){
   if (!phone || !id) return
@@ -1212,68 +1207,6 @@ function isCancelIntent(text){
   const cancelWords = /\b(cancelar|anular|borrar|dar de baja)\b/
   const modifyWords = /\b(cambiar|modificar|editar|mover|reprogramar|reagendar)\b/
   return cancelWords.test(t) || modifyWords.test(t)
-}
-
-async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
-  if (aiObj?.session_updates) {
-    Object.keys(aiObj.session_updates).forEach(key => {
-      if (aiObj.session_updates[key] !== null && aiObj.session_updates[key] !== undefined) {
-        sessionData[key] = aiObj.session_updates[key]
-      }
-    })
-  }
-  // Resolver envKey desde label si falta
-  if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
-    const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
-    if (ek) sessionData.selectedServiceEnvKey = ek
-  }
-  // Validar categoría
-  if (sessionData.sede && sessionData.selectedServiceLabel && sessionData.pendingCategory){
-    if (!isLabelInCategory(sessionData.sede, sessionData.selectedServiceLabel, sessionData.pendingCategory)){
-      sessionData.selectedServiceLabel=null
-      sessionData.selectedServiceEnvKey=null
-    }
-  }
-
-  insertAIConversation.run({
-    phone, message_id: m.key.id, user_message: textRaw,
-    ai_response: safeJSONStringify(aiObj || {}), timestamp: new Date().toISOString(),
-    session_data: safeJSONStringify(sessionData),
-    ai_error: null, fallback_used: 0
-  })
-  saveSession(phone, sessionData)
-
-  if (aiObj?.action === "choose_service"){
-    await executeChooseService(aiObj.action_params, sessionData, phone, sock, jid, textRaw); 
-    return
-  }
-  if (aiObj?.action === "choose_staff"){
-    await executeChooseStaff(aiObj.action_params, sessionData, phone, sock, jid);
-    return
-  }
-
-  switch (aiObj?.action) {
-    case "propose_times":
-      await executeProposeTime(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "create_booking":
-      await executeCreateBooking(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "list_appointments":
-      await executeListAppointments(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "cancel_appointment":
-      await executeCancelAppointment(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "need_info":
-    case "none":
-    default:
-      if (sessionData.sede && (sessionData.pendingCategory || detectCategory(textRaw)) && !sessionData.selectedServiceEnvKey){
-        await executeChooseService({ category: sessionData.pendingCategory || detectCategory(textRaw), candidates: [] }, sessionData, phone, sock, jid, textRaw)
-      } else if (sessionData.sede && sessionData.selectedServiceEnvKey && !sessionData.preferredStaffId && /quien|quién|recomiendas|profesional/i.test(textRaw)){
-        await executeChooseStaff({ staffCandidates: [] }, sessionData, phone, sock, jid)
-      } else if (sessionData.sede && sessionData.selectedServiceEnvKey) {
-        await executeProposeTime({}, sessionData, phone, sock, jid)
-      } else {
-        await sendWithPresence(sock, jid, aiObj?.message || "¿Puedes decirme el *salón* (Torremolinos o La Luz) y el *servicio*?")
-      }
-  }
 }
 
 // ====== IA principal
@@ -1345,10 +1278,13 @@ async function startBot(){
       const jid = m.key.remoteJid
       const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
 
-      // Intervención manual (fromMe) → pausa 6h, pero IGNORAMOS lo que envió el propio bot
+      // Intervención manual SOLO si el mensaje fromMe es exactamente "."
       if (m.key.fromMe){
         if (wasBotSent(phone, m.key.id)) return
-        if (phone) setPause(phone, INTERVENTION_PAUSE_HOURS)
+        const textFromMe = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
+        if (textFromMe === "."){
+          if (phone) setPause(phone, INTERVENTION_PAUSE_HOURS)
+        }
         return
       }
 
@@ -1383,18 +1319,17 @@ async function startBot(){
             __phone: phone,
             switchTargetSalon: null,
             asapWanted: false,
-            pauseUntil: null,
-            __operator_flag: false
+            pauseUntil: null
           }
 
-          // Pausa por intervención real
+          // Pausa vigente → no contestamos
           if (isPaused(sessionData)) return
           
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
           sessionData.__last_user_text = textRaw
 
-          // Bienvenida solo una vez y cortamos este turno (el siguiente ya fluye normal)
+          // Bienvenida solo una vez (y cortamos este turno)
           if (!sessionData.greeted){
             sessionData.greeted = true
             saveSession(phone, sessionData)
@@ -1408,15 +1343,9 @@ async function startBot(){
             return
           }
 
-          // Enriquecer estado (incluye detección intervención y ASAP)
+          // Enriquecer estado (IA + heurística)
           await ensureCoreFromText(sessionData, textRaw)
           saveSession(phone, sessionData)
-
-          // Si IA detecta intervención por texto → pausa 6h
-          if (sessionData.__operator_flag === true){
-            setPause(phone, INTERVENTION_PAUSE_HOURS)
-            return
-          }
 
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
@@ -1622,7 +1551,7 @@ app.get("/logs", (_req,res)=>{
   res.json({ logs: recent })
 })
 
-console.log(`🩷 Gapink Nails Bot v30.2`)
+console.log(`🩷 Gapink Nails Bot v30.3`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
