@@ -1,12 +1,7 @@
-// index.js — Gapink Nails · v29.5
-// Cambios clave vs v29.4:
-// - ✅ Respeta "con {nombre}" en cualquier punto del flujo (incluso tras proponer horas)
-// - ✅ Nunca hace dos preguntas a la vez: cola de identidad perfeccionada
-// - ✅ Implementado executeCreateBooking (¡toca Square de verdad!)
-// - ✅ DeepSeek en extracción rápida + orquestación principal + ranking sugerencias
-// - ✅ Fixes de acentos/ñ y matching difuso mejorado (alias de staff por ENV)
-// - ✅ Si el usuario pregunta por sus citas -> recuerda SMS/email y lista desde Square
-// - ✅ Miniweb indica si está en modo producción o simulación (DRY_RUN auto si falta token)
+// index.js — Gapink Nails · v29.5.1 (fix PORT dup)
+// Cambios vs v29.5:
+// - 🩹 Eliminada la doble declaración de PORT (y appServer/app2 sobrantes)
+// - ✅ Resto igual: DeepSeek integrado, flujo sin solapes, Square on/off según ENV
 
 import express from "express"
 import pino from "pino"
@@ -38,7 +33,7 @@ const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,0
 // ====== Flags
 const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
 const SQUARE_MAX_RETRIES = Number(process.env.SQUARE_MAX_RETRIES || 3)
-// ⚠️ DRY_RUN auto si falta token de Square para evitar confusiones
+// ⚠️ DRY_RUN auto si falta token de Square
 const DRY_RUN = process.env.SQUARE_ACCESS_TOKEN ? /^true$/i.test(process.env.DRY_RUN || "") : true
 
 // ====== Square
@@ -281,9 +276,7 @@ function pickStaffForLocation(locKey, preferId=null){
   return found?.id || null
 }
 
-// ====== Alias de staff (opcional por ENV)
-// Formato sugerido: STAFF_ALIASES='desi:desiree,desiré;rocio chica:rocío chica,rocio'
-// o JSON: STAFF_ALIASES_JSON='{"desi":["desiree","desiré"],"rocio":["rocío"]}'
+// ====== Alias staff opcionales por ENV
 const STAFF_ALIAS_MAP = (() => {
   try {
     if (process.env.STAFF_ALIASES_JSON) {
@@ -306,7 +299,7 @@ const STAFF_ALIAS_MAP = (() => {
   return map
 })()
 
-// ====== Acentos/ñ + TitleCase unicode
+// ====== Acentos/ñ
 function toTitleUnicode(s){
   return String(s||"").toLowerCase().replace(/\p{L}[\p{L}\p{M}]*/gu, w => w[0].toUpperCase()+w.slice(1))
 }
@@ -447,7 +440,7 @@ function fuzzyFindBestService(salonKey, text, categoryHint=null){
   return (bestScore>=2.5) ? best : null
 }
 
-// ====== IA Quick Extract (añade intent has_citas)
+// ====== IA Quick Extract
 async function aiQuickExtract(userText){
   if (!AI_API_KEY) return null
   const controller = new AbortController()
@@ -489,7 +482,6 @@ async function searchCustomersByPhone(phone){
   }catch{ return [] }
 }
 
-// 🔒 Evitar dos preguntas a la vez: identidad solo cuando el stage está libre
 function isStageBlockingIdentity(stage){
   return [
     "awaiting_service_choice",
@@ -812,8 +804,6 @@ REGLAS CLAVE:
 FORMATO:
 {"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|choose_staff|need_info|none","session_updates":{"sede": "...","selectedServiceLabel":"...","selectedServiceEnvKey":"...","preferredStaffId":"...","preferredStaffLabel":"..."},"action_params":{"category":"unas|pestanas|cejas|pedicura|manicura","candidates":[{"label":"...","confidence":0-1}],"staffCandidates":[{"name":"...","confidence":0-1}]}}`
 }
-
-// ====== Heurísticas staff
 function _normName(s){ return norm(String(s||"")).replace(/\s+/g," ").trim() }
 function parseSede(text){
   const t=norm(text)
@@ -914,7 +904,6 @@ function findStaffElsewhere(inputName, currentSalonKey){
   return { ...match, sedes }
 }
 function extractStaffAsk(text){
-  // Captura "con desi", "con la desi", "quiero con desi", "prefiero a desi"
   const m = text.match(/\bcon\s+([a-záéíóúñü]+(?:\s+[a-záéíóúñü]+){0,2})\b/i)
   if (m) return m[1].replace(/\b(la|el)\b/gi,"").trim()
   const m2 = text.match(/\b(?:prefiero|quiero)\s+a\s+([a-záéíóúñü]+(?:\s+[a-záéíóúñü]+){0,2})\b/i)
@@ -924,7 +913,7 @@ function isAffirmative(text){ return /\b(s[ií]|si|vale|ok|claro|de acuerdo|perf
 function isNegative(text){ return /\b(no|nah|nop)\b/i.test(text) }
 function isIndifferent(text){ return /\b(me da igual|cualquiera|quien sea|elige t[uú]|como veas)\b/i.test(norm(text)) }
 
-// ====== Ranking de staff por disponibilidad
+// ====== Ranking staff
 async function rankStaffForService(salonKey, envServiceKey, fromEU){
   const locId = locationToId(salonKey)
   const allowed = EMPLOYEES.filter(e=> e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
@@ -979,7 +968,7 @@ function buildServiceChoiceListBySedeCategory(salonKey, userMsg, category, aiCan
   return final.map((s,i)=>({ index:i+1, label:s.label }))
 }
 
-// ====== Acciones UI/flujo
+// ====== Acciones
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
   const category = params?.category || sessionData.pendingCategory || detectCategory(userMsg||"") || "unas"
   sessionData.pendingCategory = category
@@ -1037,7 +1026,6 @@ async function executeChooseStaff(params, sessionData, phone, sock, jid){
   await sendWithPresence(sock, jid, `¿Con quién prefieres?\n\n${lines}\n\nResponde con el número.`)
 }
 
-// 👉 Listado de citas: SIEMPRE recuerda SMS/email y toca Square
 async function executeListAppointments(_params, _sessionData, phone, sock, jid) {
   const header = `Puedes revisar tu *email* o tus *SMS*; ahí te llegará el mensaje de Square con el enlace de tu cita para verla o gestionarla. Aun así, lo reviso por aquí:`
   const appointments = await enumerateCitasByPhone(phone);
@@ -1136,10 +1124,8 @@ async function executeProposeTime(_params, sessionData, phone, sock, jid) {
   await sendWithPresence(sock, jid, `${header}\n${lines}\n\nResponde con el número (1, 2 o 3)`)
 }
 
-// ====== Crear reserva (¡toca Square!)
 async function executeCreateBooking(_params, sessionData, phone, sock, jid){
   try{
-    // Requisitos previos
     if (!sessionData.sede || !sessionData.selectedServiceEnvKey){
       await sendWithPresence(sock, jid, "Necesito el *salón* y el *servicio* antes de confirmar. Dime esos datos y sigo al vuelo.")
       return
@@ -1156,15 +1142,12 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid){
       return
     }
 
-    // Identidad única o en cola
     const idRes = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid)
     if (idRes.status === "need_new" || idRes.status === "need_pick" || idRes.status === "queued_new" || idRes.status === "queued_pick"){
-      // Ya hemos preguntado o lo dejaremos en cola; paramos para no solapar preguntas
       return
     }
     const customerId = sessionData.customerId
 
-    // Staff
     let teamMemberId = sessionData.preferredStaffId || pickStaffForLocation(sessionData.sede, null)
     if (!teamMemberId){
       await sendWithPresence(sock, jid, "No encuentro profesional disponible ahora mismo. Te paso opciones en cuanto haya hueco.")
@@ -1189,7 +1172,6 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid){
     }
 
     const booking = res.booking
-    // Guardado local
     try{
       insertAppt.run({
         id: `local_${Date.now()}`,
@@ -1219,7 +1201,6 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid){
       `¡Listo! ✨ He confirmado tu cita:\n\n📍 *${niceSalon}*\n👩‍💼 *${niceStaff}*\n🗓️ *${niceTime}*\n\nRecibirás un *SMS/email* de Square con el enlace para ver, cambiar o cancelar la cita.`
     )
 
-    // Limpiar estado mínimo
     sessionData.pendingDateTime = null
     sessionData.lastHours = null
     sessionData.lastStaffByIso = {}
@@ -1262,12 +1243,10 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
       }
     })
   }
-  // Resolver envKey desde label si falta
   if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
     const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
     if (ek) sessionData.selectedServiceEnvKey = ek
   }
-  // Validar categoría
   if (sessionData.sede && sessionData.selectedServiceLabel && sessionData.pendingCategory){
     if (!isLabelInCategory(sessionData.sede, sessionData.selectedServiceLabel, sessionData.pendingCategory)){
       sessionData.selectedServiceLabel=null
@@ -1397,20 +1376,16 @@ async function startBot(){
           sessionData.last_msg_id = m.key.id
           sessionData.__last_user_text = textRaw
 
-          // Bienvenida
           if (!sessionData.greeted){
             sessionData.greeted = true
             saveSession(phone, sessionData)
             await sendWithPresence(sock, jid, WELCOME_MSG)
           }
 
-          // Cancelar/modificar → autoservicio
           if (isCancelIntent(textRaw)){ await sendWithPresence(sock, jid, CANCEL_MODIFY_MSG); return }
 
-          // IA rápida
           const quick = await aiQuickExtract(textRaw)
 
-          // Citas
           if (quick?.intent === "has_citas" || isAskingAppointments(textRaw)){
             await executeListAppointments({}, sessionData, phone, sock, jid)
             insertAIConversation.run({
@@ -1423,14 +1398,12 @@ async function startBot(){
             return
           }
 
-          // “info” → silencioso
           if (quick?.intent === "info"){
             sessionData.__last_intent = "info"
             saveSession(phone, sessionData)
             return
           }
 
-          // Confirmación cambio de salón por staff
           if (sessionData.stage==="confirm_switch_salon"){
             if (isAffirmative(textRaw)){
               sessionData.sede = sessionData.switchTargetSalon
@@ -1450,14 +1423,12 @@ async function startBot(){
             }
           }
 
-          // Enriquecer con IA + heurística
           await ensureCoreFromText(sessionData, textRaw)
           saveSession(phone, sessionData)
 
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
 
-          // Resolver identidad si estamos esperando pick
           if (numMatch && sessionData.stage==="awaiting_identity_pick" && Array.isArray(sessionData.identityChoices) && sessionData.identityChoices.length){
             const idx = Number(numMatch[1]) - 1
             const pick = sessionData.identityChoices[idx]
@@ -1480,7 +1451,6 @@ async function startBot(){
             }
           }
 
-          // Salón pendiente para listar servicios por categoría
           if (sessionData.stage==="awaiting_salon_for_services"){
             const sede = parseSede(textRaw)
             if (sede){
@@ -1492,7 +1462,6 @@ async function startBot(){
             }
           }
 
-          // Elección de staff desde lista
           if (numMatch && sessionData.stage==="awaiting_staff_choice" && Array.isArray(sessionData.staffChoices) && sessionData.staffChoices.length){
             const idx = Number(numMatch[1]) - 1
             const pick = sessionData.staffChoices[idx]
@@ -1506,7 +1475,6 @@ async function startBot(){
             }
           }
 
-          // 🆕 Cambio de staff “en caliente” incluso tras proponer horas
           const staffAsk = extractStaffAsk(textRaw)
           if (staffAsk && sessionData.sede){
             let staff = findStaffByName(staffAsk, sessionData.sede) || suggestClosestStaff(staffAsk, sessionData.sede)
@@ -1514,7 +1482,7 @@ async function startBot(){
               sessionData.preferredStaffId = staff.id
               sessionData.preferredStaffLabel = staff.labels?.[0] || staffAsk
               saveSession(phone, sessionData)
-              await executeProposeTime({}, sessionData, phone, sock, jid) // reproponemos con ese staff
+              await executeProposeTime({}, sessionData, phone, sock, jid)
               return
             }
             const elsewhere = findStaffElsewhere(staffAsk, sessionData.sede)
@@ -1530,7 +1498,6 @@ async function startBot(){
             return
           }
 
-          // Selección de servicio desde lista
           if (numMatch && sessionData.stage==="awaiting_service_choice" && Array.isArray(sessionData.serviceChoices)){
             const idx = Number(numMatch[1]) - 1
             const pick = sessionData.serviceChoices[idx]
@@ -1549,7 +1516,6 @@ async function startBot(){
             }
           }
 
-          // Selección de horario
           if (numMatch && Array.isArray(sessionData.lastHours) && sessionData.lastHours.length && (!sessionData.stage || sessionData.stage==="awaiting_time")){
             const idx = Number(numMatch[1]) - 1
             const pick = sessionData.lastHours[idx]
@@ -1569,7 +1535,6 @@ async function startBot(){
             }
           }
 
-          // IA principal (DeepSeek)
           const aiObj = await (async ()=>{
             const systemPrompt = buildSystemPrompt()
             const recent = db.prepare(`SELECT user_message, ai_response FROM ai_conversations WHERE phone = ? ORDER BY timestamp DESC LIMIT 6`).all(phone);
@@ -1598,7 +1563,6 @@ INSTRUCCIÓN: Devuelve SOLO JSON siguiendo las reglas.` }
           if (aiObj?.action==="choose_staff"){ await executeChooseStaff(aiObj.action_params, sessionData, phone, sock, jid); return }
           await routeAIResult(aiObj||{action:"none",message:null,session_updates:{},action_params:{}}, sessionData, textRaw, m, phone, sock, jid)
 
-          // Si en este tick quedó libre el stage y hay identidad en cola, la disparamos
           await maybeAskQueuedIdentity(sessionData, sock, jid)
 
         } catch (error) {
@@ -1679,10 +1643,7 @@ app.get("/health", (_req,res)=>{
   })
 })
 
-console.log("🩷 Gapink Nails Bot v29.5 (DeepSeek + staff-smart + Square on)")
-const appServer = express()
-const app2 = app // alias por si quieres expandir
-const PORT = process.env.PORT || 8080
+console.log("🩷 Gapink Nails Bot v29.5.1 (DeepSeek + staff-smart + Square on)")
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
@@ -1690,7 +1651,7 @@ process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:"
 process.on("SIGTERM", ()=>{ process.exit(0) })
 process.on("SIGINT", ()=>{ process.exit(0) })
 
-// ====== Core ensure (se mantiene al final para capturar dependencias)
+// ====== Core ensure (al final: hoisting OK)
 async function ensureCoreFromText(sessionData, userText){
   let changed=false
   const extracted = await aiQuickExtract(userText)
