@@ -473,7 +473,7 @@ async function aiRepairJSON(maybe){
 // ====== IA Quick Extract mejorado
 async function aiQuickExtract(userText){
   if (!AI_API_KEY || !AI_ENABLED) return null
-  const promptSys = `Eres un extractor experto para un sistema de reservas de uñas. Devuelve SOLO JSON: {
+  const promptSys = `Eres un extractor experto para un sistema de reservas de uñas. Devuelves SOLO JSON: {
   "intent":"book|cancel|modify|info|has_citas|other",
   "sede":"torremolinos|la_luz|null",
   "category":"unas|pestanas|cejas|pedicura|manicura|null",
@@ -882,12 +882,24 @@ async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId,
     const locationId = locId
     
     const body = {
-      query:{ filter:{
-        startAtRange:{ startAt, endAt },
-        locationId,
-        segmentFilters:[{ serviceVariationId: sv.id, teamMemberIdFilter:{ any:[ staffId ] }]
-      } }
-    }
+      query: {
+        filter: {
+          startAtRange: { 
+            startAt, 
+            endAt 
+          },
+          locationId,
+          segmentFilters: [
+            {
+              serviceVariationId: sv.id,
+              teamMemberIdFilter: {
+                any: [ staffId ]
+              }
+            }
+          ]
+        }
+      }
+    };
     const resp = await square.bookingsApi.searchAvailability(body)
     const avail = resp?.result?.availabilities || []
     const durMin = getServiceDurationMin(locationKey, envServiceKey)
@@ -914,12 +926,21 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
     const endAt = fromEU.clone().add(days,"day").tz("UTC").toISOString()
     const locationId = locationToId(locationKey)
     const body = {
-      query:{ filter:{
-        startAtRange:{ startAt, endAt },
-        locationId,
-        segmentFilters:[{ serviceVariationId: sv.id }]
-      } }
-    }
+      query: {
+        filter: {
+          startAtRange: { 
+            startAt, 
+            endAt 
+          },
+          locationId,
+          segmentFilters: [
+            {
+              serviceVariationId: sv.id
+            }
+          ]
+        }
+      }
+    };
     const resp = await square.bookingsApi.searchAvailability(body)
     const avail = resp?.result?.availabilities || []
     const durMin = getServiceDurationMin(locationKey, envServiceKey)
@@ -1072,7 +1093,7 @@ function findStaffByName(inputName, locKey=null){
   
   if (candidates.length === 1) return candidates[0]
   if (candidates.length > 1 && AI_ENABLED) {
-    return await aiDisambiguateStaff(q, candidates, locKey)
+    return aiDisambiguateStaff(q, candidates, locKey)
   }
   return candidates[0] || null
 }
