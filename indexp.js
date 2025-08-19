@@ -952,7 +952,6 @@ ${address}
 💅 ${svcLabel}
 👩‍💼 ${staffName}
 📅 ${fmtES(startEU)}
-⏱️ 60 minutos
 
 Referencia: ${result.booking.id}
 
