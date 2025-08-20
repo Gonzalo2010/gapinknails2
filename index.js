@@ -1,13 +1,14 @@
-// index.js — Gapink Nails · v27.3.2
+// index.js — Gapink Nails · v27.3.3
 // Cambios de esta versión:
-// • Intenciones “ASAP / lo más pronto posible” y “otro día” detectadas en cualquier momento:
-//   - ASAP → proponemos los 3 primeros huecos disponibles ampliando ventana (30 días).
-//   - “otro día” → saltamos a partir de mañana y mostramos 3 días distintos con el primer hueco de cada uno (ventana 60 días).
-// • “Quiero con Cristina” vuelve a buscar ampliando días y, si no hay sede y es Cristina, pide sede primero.
-// • Auto-sede por profesional (excepto Cristina) mantenida. Si hay profesional ≠ Cristina y falta sede, la inferimos.
-// • ProposeTime acepta parámetros (fromEU, days, n, distinctDays) para búsquedas flexibles.
-// • Más logs de consola (intenciones, parámetros de propuesta, elecciones y resultados).
-// • Resto de mejoras de v27.3.x se mantienen (categorías robustas, filtros, comité IA, snooze con “.”, etc.).
+// • Si el mensaje menciona una profesional (ej. “con Patri/Patricia”), forzamos flujo sin IA:
+//   - Si NO es Cristina ⇒ auto-sede (según su disponibilidad) y NO preguntamos centro.
+//   - Pedimos categoría (uñas/pestañas/cejas) si falta, SIN mencionar “depilación”.
+//   - En cuanto haya categoría ⇒ mostramos lista de servicios (executeChooseService) directamente.
+// • Si la IA devuelve need_info pero ya hay profesional+sede ⇒ ignoramos y lanzamos choose_service determinista.
+// • Menús de uñas sin colarse faciales/laser/etc. (filtro reforzado).
+// • Intenciones “ASAP / lo más pronto posible” y “otro día” con búsqueda ampliada (se mantiene).
+// • Snooze 6h por mensaje “.” (se mantiene).
+// • Más logs: detección de staff, auto-sede, selector de categoría, overrides a la IA, etc.
 
 import express from "express"
 import pino from "pino"
@@ -752,10 +753,9 @@ ${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 REGLAS IRROMPIBLES:
 - Devuelve SOLO JSON con las claves EXACTAS: message (string), action (string), session_updates (objeto), action_params (objeto).
 - action ∈ {propose_times, create_booking, list_appointments, cancel_appointment, choose_service, need_info, none}.
-- NUNCA inventes servicios ni IDs. Si mencionas un servicio, debe existir en las listas de arriba.
-- Categorías: "uñas", "pestañas", "cejas". No mezcles categorías. Pedicura solo si el cliente lo pide.
-- Si el cliente CAMBIA de categoría en mitad del menú (p.ej. dice "cejas"), debes conmutar a esa categoría.
-- Si falta sede NO listes servicios: pide la sede (salvo que haya una profesional indicada y no sea Cristina: en ese caso, deduce sede válida).
+- NUNCA inventes servicios ni IDs. No menciones categorías fuera de {uñas, pestañas, cejas}. NO digas “depilación”.
+- Si el cliente CAMBIA de categoría, conmuta a esa categoría.
+- Si falta sede NO listes servicios: pide la sede (salvo que haya una profesional indicada y NO sea Cristina: en ese caso, deduce sede válida).
 - Si el usuario responde 1/2/3 tras proponer horas, se interpreta como selección de hora.
 
 FORMATO:
@@ -852,7 +852,6 @@ function parseSede(text){
   if (/\b(torre|torremolinos)\b/.test(t)) return "torremolinos"
   return null
 }
-// Intenciones nuevas
 function isASAPIntent(text){
   const u = norm(text||"")
   return /\b(asap|antes posible|lo mas pronto|lo más pronto|lo antes posible|lo mas rapido|lo más rapido|lo mas rápido|pronto|cuanto antes)\b/.test(u)
@@ -1189,17 +1188,17 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.3.2</h1>
+  <h1>🩷 Gapink Nails Bot v27.3.3</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v27.3.2:</strong><br>
-    • Intenciones “ASAP” y “otro día” con búsqueda ampliada.<br>
-    • Reintentos con Cristina ampliando rango y pidiendo sede si falta.<br>
-    • ProposeTime parametrizable y más logs.<br>
+    <strong>🚀 Mejoras v27.3.3:</strong><br>
+    • Profesional ⇒ flujo determinista (auto-sede salvo Cristina + selección de categoría).<br>
+    • IA en fallback, pero override seguro de need_info ⇒ choose_service.<br>
+    • Menús filtrados; fuera “depilación”. Logs ampliados.<br>
   </div>
   </div>`)
 })
@@ -1300,11 +1299,35 @@ async function startBot(){
             ensureSedeForStaff(sessionData, staffMaybe)
             saveSession(phone, sessionData)
             log("STAFF detected", { staff: sessionData.preferredStaffLabel, sede: sessionData.sede })
+
+            // 🔐 Flujo determinista post-staff (sin IA):
+            if (!sessionData.selectedServiceEnvKey){
+              const cat = detectCategoryFromText(textRaw)
+              if (!sessionData.sede && isCristinaEmployee(staffMaybe)){
+                // ÚNICO caso en que pedimos sede tras profesional indicada
+                sessionData.stage = "awaiting_sede_for_services"
+                saveSession(phone, sessionData)
+                await sendWithPresence(sock, jid, "¿En qué sede te viene mejor, Torremolinos o La Luz, para reservar con Cristina?")
+                return
+              }
+              if (!cat){
+                sessionData.stage = "awaiting_category_for_staff"
+                saveSession(phone, sessionData)
+                log("ASK CATEGORY (by staff)", { staff: sessionData.preferredStaffLabel })
+                await sendWithPresence(sock, jid, `Perfecto, con ${sessionData.preferredStaffLabel}. ¿Qué te gustaría hacer? Podemos con *uñas*, *pestañas* o *cejas*.`)
+                return
+              } else {
+                sessionData.pendingCategory = cat
+                saveSession(phone, sessionData)
+                log("DIRECT choose_service (staff + cat)", { staff: sessionData.preferredStaffLabel, cat })
+                await executeChooseService({ candidates: [], category: cat }, sessionData, phone, sock, jid, textRaw)
+                return
+              }
+            }
           }
 
           // ===== Intenciones ASAP / Otro Día (si ya hay sede+servicio)
-          if ((isASAPIntent(textRaw) || isAnotherDayIntent(textRaw)) && (!sessionData.stage || sessionData.stage==="awaiting_time" || sessionData.stage==="awaiting_service_choice")){
-            // Si falta sede: inferir por profesional ≠ Cristina; si Cristina o sin staff, pedir sede
+          if ((isASAPIntent(textRaw) || isAnotherDayIntent(textRaw)) && (!sessionData.stage || sessionData.stage==="awaiting_time" || sessionData.stage==="awaiting_service_choice" || sessionData.stage==="awaiting_category_for_staff")){
             if (!sessionData.sede){
               const e = employeeById(sessionData.preferredStaffId)
               if (e && !isCristinaEmployee(e)){
@@ -1322,7 +1345,6 @@ async function startBot(){
               if (ek){ sessionData.selectedServiceEnvKey = ek; saveSession(phone, sessionData) }
             }
             if (!sessionData.selectedServiceEnvKey){
-              // No tenemos servicio aún → mostrar menú de la categoría más probable
               const cat = detectCategoryFromText(textRaw) || sessionData.pendingCategory || "uñas"
               sessionData.pendingCategory = cat
               saveSession(phone, sessionData)
@@ -1345,8 +1367,8 @@ async function startBot(){
             }
           }
 
-          // === CAMBIO DE CATEGORÍA EN CALIENTE (mientras se muestra menú de servicios)
-          if (sessionData.stage==="awaiting_service_choice"){
+          // === CAMBIO DE CATEGORÍA EN CALIENTE
+          if (sessionData.stage==="awaiting_service_choice" || sessionData.stage==="awaiting_category_for_staff"){
             const newCat = detectCategoryFromText(textRaw)
             const curCat = sessionData.pendingCategory || "uñas"
             if (newCat && newCat !== curCat){
@@ -1365,6 +1387,17 @@ async function startBot(){
                 await sendWithPresence(sock, jid, "¿En qué sede te viene mejor, Torremolinos o La Luz? (así te muestro las opciones correctas)")
                 return
               }
+              await executeChooseService({ candidates: [], category: newCat }, sessionData, phone, sock, jid, textRaw)
+              return
+            }
+            // Si estamos esperando categoría y no detectamos aún, recordatorio suave
+            if (sessionData.stage==="awaiting_category_for_staff" && !newCat){
+              await sendWithPresence(sock, jid, "¿Qué te va mejor: *uñas*, *pestañas* o *cejas*?")
+              return
+            }
+            if (sessionData.stage==="awaiting_category_for_staff" && newCat){
+              sessionData.pendingCategory = newCat
+              saveSession(phone, sessionData)
               await executeChooseService({ candidates: [], category: newCat }, sessionData, phone, sock, jid, textRaw)
               return
             }
@@ -1474,11 +1507,10 @@ async function startBot(){
             return
           }
 
-          // === PRE-INTERCEPT: “con {nombre}”
+          // === PRE-INTERCEPT: “con {nombre}” explícito después de servicio
           if (sessionData.selectedServiceEnvKey){
             const maybe = parsePreferredStaffFromText(textRaw)
             if (maybe){
-              // Si es Cristina y no hay sede → pedir sede primero
               if (!sessionData.sede && isCristinaEmployee(maybe)){
                 sessionData.preferredStaffId = maybe.id
                 sessionData.preferredStaffLabel = staffLabelFromId(maybe.id)
@@ -1492,7 +1524,6 @@ async function startBot(){
                 sessionData.preferredStaffId = maybe.id
                 sessionData.preferredStaffLabel = staffLabelFromId(maybe.id)
                 saveSession(phone, sessionData)
-                // Búsqueda ampliada si el usuario menciona explícitamente a la pro
                 await executeProposeTime({ days: 30, n: 3, distinctDays: true }, sessionData, phone, sock, jid)
                 return
               }
@@ -1507,10 +1538,29 @@ async function startBot(){
 
           // ===== IA normal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
+
+          // 🔄 OVERRIDE: si IA pide need_info pero ya hay profesional+sede ⇒ mostramos servicios
+          if (aiObj?.action === "need_info" && sessionData.preferredStaffId && sessionData.sede && !sessionData.selectedServiceEnvKey){
+            const cat = detectCategoryFromText(textRaw) || sessionData.pendingCategory || null
+            log("OVERRIDE need_info→choose_service", { staff: sessionData.preferredStaffLabel, sede: sessionData.sede, cat })
+            if (!cat){
+              sessionData.stage = "awaiting_category_for_staff"
+              saveSession(phone, sessionData)
+              await sendWithPresence(sock, jid, `Con ${sessionData.preferredStaffLabel}, ¿prefieres *uñas*, *pestañas* o *cejas*?`)
+              return
+            } else {
+              sessionData.pendingCategory = cat
+              saveSession(phone, sessionData)
+              await executeChooseService({ candidates: [], category: cat }, sessionData, phone, sock, jid, textRaw)
+              return
+            }
+          }
+
           if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
             const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
             if (ek) aiObj.session_updates.selectedServiceEnvKey = ek
           }
+
           await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
 
         } catch (error) {
@@ -1566,10 +1616,11 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     case "none":
     default:
       const catFromMsg = detectCategoryFromText(textRaw)
-      if (!sessionData.selectedServiceEnvKey && catFromMsg){
-        sessionData.pendingCategory = catFromMsg
+      if (!sessionData.selectedServiceEnvKey && (catFromMsg || sessionData.stage==="awaiting_category_for_staff")){
+        const cat = catFromMsg || sessionData.pendingCategory || "uñas"
+        sessionData.pendingCategory = cat
         saveSession(phone, sessionData)
-        await executeChooseService({ candidates: aiObj?.action_params?.candidates || [], category: catFromMsg }, sessionData, phone, sock, jid, textRaw)
+        await executeChooseService({ candidates: aiObj?.action_params?.candidates || [], category: cat }, sessionData, phone, sock, jid, textRaw)
       } else {
         await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
       }
@@ -1577,7 +1628,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v27.3.2 — LOG_VERBOSE=${LOG_VERBOSE ? "on" : "off"}`)
+console.log(`🩷 Gapink Nails Bot v27.3.3 — LOG_VERBOSE=${LOG_VERBOSE ? "on" : "off"}`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
