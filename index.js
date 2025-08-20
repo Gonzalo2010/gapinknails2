@@ -1,11 +1,10 @@
-// index.js — Gapink Nails · v27.3.0.0
-// Fixes clave (v27.3):
-// • Si el cliente menciona una profesional, NO pedimos sede (salvo si es Cristina). Auto-selección de sede válida.
-// • Pre-intercepts mejorados: números para elegir SERVICIO, identidad (multi-ficha), nombre/email, cancelar.
-// • Snooze por chat: si alguien envía ".", el bot calla 6h en ese chat.
-// • IA blindada (comité + reparación + validación) ya integrada en todos los flujos.
-// • Menús por categoría (uñas / pestañas / cejas) y detección robusta.
-// • Logs ultra-verbosos en consola para trazar todo (entradas, decisiones, salidas IA, slots, reservas, etc).
+// index.js — Gapink Nails · v27.3.1
+// Cambios de esta versión:
+// • Cambio de categoría en caliente: si el cliente dice “cejas” o “pestañas” mientras está viendo uñas (o viceversa),
+//   cambiamos inmediatamente el menú a esa categoría (sin pasar por IA), manteniendo la sede y respetando “Cristina”.
+// • Filtro de servicios por categoría mejorado: se excluyen faciales, láser/depilación, hilo/labio, etc. de la lista de uñas.
+// • Logs adicionales en consola para: detección de categoría, conmutación de menús y decisiones de sede por profesional.
+// • Resto de mejoras de v27.3.0 se mantienen (auto-sede por profesional excepto Cristina, snooze con ".", IA comité, etc.).
 
 import express from "express"
 import pino from "pino"
@@ -36,7 +35,6 @@ const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,0
 
 // ====== Flags / Logs
 const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
-// Ultra-logs siempre activos salvo LOG_VERBOSE=false
 const LOG_VERBOSE = String(process.env.LOG_VERBOSE || "").toLowerCase() !== "false"
 function log(...args){ if (LOG_VERBOSE) try{ console.log(new Date().toISOString(), ...args) }catch{} }
 
@@ -287,7 +285,6 @@ function defaultSedeForStaff(e){
   const hasLuz = e.allow.includes(LOC_LUZ) || e.allow.includes("ALL")
   if (hasTor && !hasLuz) return "torremolinos"
   if (!hasTor && hasLuz) return "la_luz"
-  // ambos o ALL → por defecto Torremolinos
   return "torremolinos"
 }
 function pickStaffForLocation(locKey, preferId=null){
@@ -329,15 +326,20 @@ function serviceLabelFromEnvKey(envKey){
 }
 function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...servicesForSedeKeyRaw("la_luz")] }
 
-// ====== Clasificación por categorías
+// ====== Clasificación por categorías (mejorada)
 const POS_NAIL_ANCHORS = [
   "uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente",
   "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte","pedicur","pies","pie"
 ]
-const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash"]
+// Excluir de UÑAS: pestañas/cejas + tratamientos faciales/depilación/laser/etc.
+const NEG_NOT_NAILS = [
+  "pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash",
+  "facial","laser","láser","hilo","labio","depilacion","depilación","fotodepil","foto","ipl",
+  "peeling","masaje","piedras","microblading","microshading","polvo","powder","micro"
+]
 
-const POS_LASH_ANCHORS = ["pesta","pestañ","lash","pelo a pelo","volumen"]
-const POS_BROW_ANCHORS = ["ceja","cejas","henna","laminado","diseño cejas","depilación cejas","depilacion cejas"]
+const POS_LASH_ANCHORS = ["pesta","pestañ","lash","pelo a pelo","volumen","lifting"]
+const POS_BROW_ANCHORS = ["ceja","cejas","henna","laminado","laminacion","laminación","diseño cejas","diseno cejas","depilación cejas","depilacion cejas","microblading","microshading","polvo","powder","shading"]
 
 function detectCategoryFromText(text){
   const u = norm(text||"")
@@ -751,7 +753,7 @@ REGLAS IRROMPIBLES:
 - action ∈ {propose_times, create_booking, list_appointments, cancel_appointment, choose_service, need_info, none}.
 - NUNCA inventes servicios ni IDs. Si mencionas un servicio, debe existir en las listas de arriba.
 - Categorías: "uñas", "pestañas", "cejas". No mezcles categorías. Pedicura solo si el cliente lo pide.
-- Si el cliente cambia a otra categoría, cambia tu propuesta a esa categoría.
+- Si el cliente CAMBIA de categoría en mitad del menú (p.ej. dice "cejas"), debes conmutar a esa categoría.
 - Si falta sede NO listes servicios: pide la sede (salvo que haya una profesional indicada y no sea Cristina: en ese caso, deduce sede válida).
 - Si el usuario responde 1/2/3 tras proponer horas, se interpreta como selección de hora.
 
@@ -854,7 +856,6 @@ function parseSede(text){
 function extractStaffFromText(text){
   const t = norm(text||"")
   if (!t) return null
-  // Prefer pattern "con {nombre}"
   const m = t.match(/\bcon\s+([a-zñáéíóú]+)\b/i)
   if (m){
     const token = norm(m[1])
@@ -862,7 +863,6 @@ function extractStaffFromText(text){
       for (const lbl of e.labels){ if (norm(lbl).includes(token)) return e }
     }
   }
-  // Otherwise, scan any alias present as a whole token or substring
   for (const e of EMPLOYEES){
     for (const lbl of e.labels){
       const L = norm(lbl)
@@ -903,7 +903,6 @@ function buildServiceChoiceListBySedeAndCategory(sedeKey, category, userMsg, aiC
 }
 
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
-  // Si hay staff preferida y NO es Cristina, auto-sede si falta
   if (!sessionData.sede && sessionData.preferredStaffId){
     const e = employeeById(sessionData.preferredStaffId)
     if (e && !isCristinaEmployee(e)){
@@ -1020,17 +1019,12 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
   if (!staffId) { await sendWithPresence(sock, jid, "No hay profesionales disponibles en esa sede"); return; }
 
-  // Identidad: si ya eligió ficha en multi (chosenCustomerId), úsala
   let customerId = sessionData.chosenCustomerId || null
-
-  // Si no hay customerId, resolvemos por teléfono (preguntará justo tras confirmar si 0 o >1)
   if (!customerId){
     const { status, customer } = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid) || {}
     if (status === "need_new" || status === "need_pick") return
     customerId = customer?.id || null
   }
-
-  // Si aún no hay, intentar crear con nombre/email si los recopilamos
   if (!customerId && (sessionData.name || sessionData.email)){
     const created = await findOrCreateCustomerWithRetry({ name: sessionData.name, email: sessionData.email, phone })
     if (!created){ await sendWithPresence(sock, jid, "No pude crear tu ficha de cliente. Intenta de nuevo o contacta al salón."); return }
@@ -1177,17 +1171,17 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.3.0</h1>
+  <h1>🩷 Gapink Nails Bot v27.3.1</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v27.3.0:</strong><br>
-    • Auto-sede por profesional (excepto Cristina).<br>
-    • Números eligen servicio correctamente; sin desvíos a “ver citas”.<br>
-    • Snooze 6h con "." y logs detalladísimos en consola.<br>
+    <strong>🚀 Mejoras v27.3.1:</strong><br>
+    • Cambio de categoría en caliente (uñas ⇄ cejas ⇄ pestañas).<br>
+    • Filtro de uñas sin faciales/depilación.<br>
+    • Logs extra para diagnóstico fino.<br>
   </div>
   </div>`)
 })
@@ -1204,7 +1198,7 @@ app.get("/logs", (_req,res)=>{
 // ====== Baileys
 async function loadBaileys(){
   const require = createRequire(import.meta.url); let mod=null
-  try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ try{ mod=await import("@whiskeysockets/baileys") }catch{} }
+  try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ mod=await import("@whiskeysockets/baileys") }
   if(!mod) throw new Error("Baileys incompatible")
   const makeWASocket = mod.makeWASocket || mod.default?.makeWASocket || (typeof mod.default==="function"?mod.default:undefined)
   const useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
@@ -1267,13 +1261,12 @@ async function startBot(){
             sessionData.snooze_until_ms = until
             saveSession(phone, sessionData)
             log("SNOOZE set 6h", { phone, until })
-            return // no respondemos
+            return
           }
           if (sessionData.snooze_until_ms && dayjs().valueOf() < Number(sessionData.snooze_until_ms)){
             log("SNOOZE active skip", { phone, until: sessionData.snooze_until_ms })
             return
           } else if (sessionData.snooze_until_ms){
-            // expirado
             delete sessionData.snooze_until_ms
             saveSession(phone, sessionData)
           }
@@ -1286,9 +1279,37 @@ async function startBot(){
           if (staffMaybe){
             sessionData.preferredStaffId = staffMaybe.id
             sessionData.preferredStaffLabel = staffLabelFromId(staffMaybe.id)
-            ensureSedeForStaff(sessionData, staffMaybe) // auto-sede salvo Cristina
+            ensureSedeForStaff(sessionData, staffMaybe)
             saveSession(phone, sessionData)
             log("STAFF detected", { staff: sessionData.preferredStaffLabel, sede: sessionData.sede })
+          }
+
+          // === CAMBIO DE CATEGORÍA EN CALIENTE (mientras se muestra menú de servicios)
+          if (sessionData.stage==="awaiting_service_choice"){
+            const newCat = detectCategoryFromText(textRaw)
+            const curCat = sessionData.pendingCategory || "uñas"
+            if (newCat && newCat !== curCat){
+              log("CATEGORY SWITCH", { from: curCat, to: newCat })
+              sessionData.pendingCategory = newCat
+              // Asegurar sede si tenemos profesional (no Cristina) y falta sede
+              if (!sessionData.sede && sessionData.preferredStaffId){
+                const e = employeeById(sessionData.preferredStaffId)
+                if (e && !isCristinaEmployee(e)){
+                  ensureSedeForStaff(sessionData, e)
+                }
+              }
+              saveSession(phone, sessionData)
+              // Si aún no hay sede, preguntarla
+              if (!sessionData.sede){
+                sessionData.stage = "awaiting_sede_for_services"
+                saveSession(phone, sessionData)
+                await sendWithPresence(sock, jid, "¿En qué sede te viene mejor, Torremolinos o La Luz? (así te muestro las opciones correctas)")
+                return
+              }
+              // Mostrar directamente el nuevo menú de la nueva categoría
+              await executeChooseService({ candidates: [], category: newCat }, sessionData, phone, sock, jid, textRaw)
+              return
+            }
           }
 
           // === PRE-INTERCEPT: sede si estamos esperando para servicios ===
@@ -1308,7 +1329,6 @@ async function startBot(){
             const idx = Number(numMatch[1]) - 1
             const pick = sessionData.serviceChoices[idx]
             if (pick){
-              // Asegurar sede si hay staff preferida y no es Cristina
               if (!sessionData.sede && sessionData.preferredStaffId){
                 const e = employeeById(sessionData.preferredStaffId)
                 if (e && !isCristinaEmployee(e)){
@@ -1316,7 +1336,6 @@ async function startBot(){
                 }
               }
               if (!sessionData.sede){
-                // Solo pedimos sede si sigue faltando (o si era Cristina)
                 sessionData.stage = "awaiting_sede_for_services"
                 saveSession(phone, sessionData)
                 await sendWithPresence(sock, jid, "¿En qué sede te viene mejor, Torremolinos o La Luz?")
@@ -1397,11 +1416,10 @@ async function startBot(){
             return
           }
 
-          // === PRE-INTERCEPT: “con {nombre}” → proponer con esa pro si ya hay sede/servicio
+          // === PRE-INTERCEPT: “con {nombre}”
           if (sessionData.selectedServiceEnvKey){
             const maybe = parsePreferredStaffFromText(textRaw)
             if (maybe && isStaffAllowedInLocation(maybe.id, sessionData.sede || defaultSedeForStaff(maybe))){
-              // Auto-sede salvo Cristina
               ensureSedeForStaff(sessionData, maybe)
               sessionData.preferredStaffId = maybe.id
               sessionData.preferredStaffLabel = staffLabelFromId(maybe.id)
@@ -1443,13 +1461,11 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
       }
     })
   }
-  // Si IA pidió choose_service, asegura categoría
   if (aiObj.action === "choose_service") {
     const intendedCat = sessionData.pendingCategory || detectCategoryFromText(textRaw) || "uñas"
     aiObj.action_params = aiObj.action_params || {}
     aiObj.action_params.category = intendedCat
   }
-  // Resolver envKey si ya hay sede + label
   if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
     const ek = resolveEnvKeyFuzzy(sessionData.selectedServiceLabel, sessionData.sede)
     if (ek) sessionData.selectedServiceEnvKey = ek
@@ -1491,7 +1507,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v27.3.0 — LOG_VERBOSE=${LOG_VERBOSE ? "on" : "off"}`)
+console.log(`🩷 Gapink Nails Bot v27.3.1 — LOG_VERBOSE=${LOG_VERBOSE ? "on" : "off"}`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
