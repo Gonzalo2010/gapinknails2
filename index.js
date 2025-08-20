@@ -1,14 +1,10 @@
-// index.js — Gapink Nails · v28.0.0 (Core IA Avanzada + Square 100%)
-// Changelog clave vs v27.2.x:
-// • 🔥 Motor IA multinivel (preproc → intenciones → contexto → respuesta adaptativa → validación).
-// • 🧠 Memoria conversacional en sessionData (preferencias, estilo, urgencia, satisfacción, patrones).
-// • 🧩 Prompt de sistema dinámico (tiempo, historial, contexto de servicios y staff).
-// • 🛡️ Validador inteligente antes de crear reservas + sugerencias.
-// • 🤝 Integración Square con predicción/optimización IA (placeholders seguros).
-// • 👋 “Con {nombre}” sigue priorizando staff; solo oferta staff permitido en esa sede.
-// • 🔕 Punto “.” silencia 6h por chat (igual que antes).
-// • 🧽 Eliminado sistema rígido de anchors POS_/NEG_ → ahora NLP avanzado interno.
-// • 🧾 Logs/metricas IA y Square en SQLite (mismo fichero).
+// index.js — Gapink Nails · v27.3.0 (additive sobre v27.2.0.0)
+// Cambios ADD-ONLY:
+// • Categorías: uñas / pestañas / cejas (detector + menús por sede).
+// • Intercept numérico al elegir servicio (stage "awaiting_service_choice").
+// • Anti-spam del mensaje de error técnico (cooldown 20s).
+// • “pedicura” añadido al detector de pedicura.
+// • System prompt actualizado para categorías (sin quitar reglas previas).
 
 import express from "express"
 import pino from "pino"
@@ -52,7 +48,7 @@ const ADDRESS_TORRE = process.env.ADDRESS_TORREMOLINOS || "Av. de Benyamina 18, 
 const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Luz"
 const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "")
 
-// ====== IA (DeepSeek por defecto)
+// ====== IA
 const AI_API_KEY = process.env.DEEPSEEK_API_KEY || ""
 const AI_MODEL = process.env.AI_MODEL || "deepseek-chat"
 const AI_MAX_RETRIES = Number(process.env.AI_MAX_RETRIES || 3)
@@ -214,16 +210,6 @@ CREATE TABLE IF NOT EXISTS square_logs (
   timestamp TEXT,
   success BOOLEAN
 );
-CREATE TABLE IF NOT EXISTS ai_metrics (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  phone TEXT,
-  response_time_ms INTEGER,
-  user_satisfaction REAL,
-  task_completion REAL,
-  error_rate REAL,
-  conversion_rate REAL,
-  timestamp TEXT
-);
 `)
 
 const insertAppt = db.prepare(`INSERT INTO appointments
@@ -238,43 +224,14 @@ const insertSquareLog = db.prepare(`INSERT INTO square_logs
 (phone, action, request_data, response_data, error_data, timestamp, success)
 VALUES (@phone, @action, @request_data, @response_data, @error_data, @timestamp, @success)`)
 
-const insertMetrics = db.prepare(`INSERT INTO ai_metrics
-(phone, response_time_ms, user_satisfaction, task_completion, error_rate, conversion_rate, timestamp)
-VALUES (@phone, @rt, @sat, @task, @err, @conv, @ts)`)
-
 // ====== Sesión
-function enhanceSessionData(sessionData) {
-  const base = {
-    conversationMemory: {
-      topics: [],
-      preferences: {},
-      communicationStyle: 'formal',
-      urgencyLevel: 'normal',
-      satisfactionLevel: 'neutral'
-    },
-    predictiveContext: {
-      likelyNextAction: null,
-      suggestedServices: [],
-      preferredTimes: [],
-      behaviorPattern: 'new_user'
-    },
-    decisionHistory: [],
-    interactionMetrics: {
-      responseTime: [],
-      clarificationCount: 0,
-      successfulBookings: 0,
-      cancelledBookings: 0
-    }
-  }
-  return { ...base, ...sessionData, conversationMemory: { ...base.conversationMemory, ...(sessionData?.conversationMemory || {}) }, predictiveContext: { ...base.predictiveContext, ...(sessionData?.predictiveContext || {}) }, interactionMetrics: { ...base.interactionMetrics, ...(sessionData?.interactionMetrics || {}) } }
-}
 function loadSession(phone){
   const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
   if (!row?.data_json) return null
   const s = JSON.parse(row.data_json)
   if (Array.isArray(s.lastHours_ms)) s.lastHours = s.lastHours_ms.map(ms=>dayjs.tz(ms,EURO_TZ))
   if (s.pendingDateTime_ms) s.pendingDateTime = dayjs.tz(s.pendingDateTime_ms,EURO_TZ)
-  return enhanceSessionData(s)
+  return s
 }
 function saveSession(phone,s){
   const c={...s}
@@ -375,6 +332,101 @@ function serviceLabelFromEnvKey(envKey){
   return all.find(s=>s.key===envKey)?.label || null
 }
 function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...servicesForSedeKeyRaw("la_luz")] }
+
+// ====== (ADD) Clasificación de categorías
+const CATEGORY = { NAILS: "uñas", LASHES: "pestañas", BROWS: "cejas" }
+const POS_NAIL_ANCHORS = [
+  "uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente",
+  "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte"
+]
+const POS_LASH_ANCHORS = [
+  "pesta","pestañ","pestanas","pestañas","lash","extens","volumen","lifting","rizado","laminado pestañas","2d","3d","4d","hibridas","híbridas","retirar pestañas","relleno pestañas"
+]
+const POS_BROW_ANCHORS = [
+  "ceja","cejas","diseño cejas","diseño de cejas","depilacion cejas","depilación cejas","henna","laminado cejas","brow","brow lift","perfilado cejas","tinte cejas"
+]
+const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash","brow"]
+const NEG_NOT_LASHES = ["uña","unas","uñas","manicura","ceja","cejas","pedicura","pie","pies","brow"]
+const NEG_NOT_BROWS  = ["uña","unas","uñas","manicura","pesta","pestañ","pestanas","pestañas","lash","ojos"]
+
+// (ADD) pedicura con ‘a’ incluida
+function shouldIncludePedicure(userMsg){
+  return /\b(pedicur|pedicura|pies|pie)\b/i.test(String(userMsg||""))
+}
+function isNailsLabel(labelNorm, allowPedicure){
+  if (NEG_NOT_NAILS.some(n=>labelNorm.includes(norm(n)))) return false
+  const hasPos = POS_NAIL_ANCHORS.some(p=>labelNorm.includes(norm(p)))
+  if (!hasPos) return false
+  const isPedi = /\b(pedicur|pedicura|pies|pie)\b/.test(labelNorm)
+  if (isPedi && !allowPedicure) return false
+  return true
+}
+function isLashesLabel(labelNorm){
+  if (NEG_NOT_LASHES.some(n=>labelNorm.includes(norm(n)))) return false
+  return POS_LASH_ANCHORS.some(p=>labelNorm.includes(norm(p)))
+}
+function isBrowsLabel(labelNorm){
+  if (NEG_NOT_BROWS.some(n=>labelNorm.includes(norm(n)))) return false
+  return POS_BROW_ANCHORS.some(p=>labelNorm.includes(norm(p)))
+}
+function uniqueByLabel(arr){
+  const seen=new Set(); const out=[]
+  for (const s of arr){
+    const key = s.label.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key); out.push(s)
+  }
+  return out
+}
+function nailsServicesForSede(sedeKey, userMsg){
+  const allowPedi = shouldIncludePedicure(userMsg)
+  const list = servicesForSedeKeyRaw(sedeKey)
+  const filtered = list.filter(s=>isNailsLabel(s.norm, allowPedi))
+  return uniqueByLabel(filtered)
+}
+// (ADD)
+function lashesServicesForSede(sedeKey){
+  const list = servicesForSedeKeyRaw(sedeKey)
+  return uniqueByLabel(list.filter(s=>isLashesLabel(s.norm)))
+}
+// (ADD)
+function browsServicesForSede(sedeKey){
+  const list = servicesForSedeKeyRaw(sedeKey)
+  return uniqueByLabel(list.filter(s=>isBrowsLabel(s.norm)))
+}
+// (ADD)
+function detectCategoryFromText(txt){
+  const t = norm(txt||"")
+  if (/\b(ceja|cejas|brow)\b/.test(t)) return CATEGORY.BROWS
+  if (/\b(pesta|pestañ|pestanas|pestañas|lash|extens|lifting)\b/.test(t)) return CATEGORY.LASHES
+  if (/\b(uñ|unas|uñas|manicura|gel|acrilic|acrilico|acrílico)\b/.test(t)) return CATEGORY.NAILS
+  return null
+}
+
+function scoreServiceRelevance(userMsg, label){
+  const u = norm(userMsg), l = norm(label); let score = 0
+  if (/\b(uñas|unas)\b/.test(u) && /\b(uñas|unas|manicura)\b/.test(l)) score += 3
+  if (/\bmanicura\b/.test(u) && /\bmanicura\b/.test(l)) score += 3
+  if (/\b(acrilic|acrilico|acrílico)\b/.test(u) && l.includes("acril")) score += 2.5
+  if (/\bgel\b/.test(u) && l.includes("gel")) score += 2.5
+  if (/\bsemi|semipermanente\b/.test(u) && l.includes("semi")) score += 2
+  if (/\brelleno\b/.test(u) && (l.includes("uña") || l.includes("manicura") || l.includes("gel") || l.includes("acril"))) score += 2
+  // pestañas / cejas
+  if (/\b(pesta|pestañ|pestanas|pestañas|lash)\b/.test(u) && /\b(pesta|pestañ|pestanas|pestañas|lash)\b/.test(l)) score += 3
+  if (/\b(2d|3d|4d|volumen|lifting|laminado)\b/.test(u) && /\b(2d|3d|4d|volumen|lifting|laminado)\b/.test(l)) score += 2.5
+  if (/\brelleno\b/.test(u) && l.includes("pesta")) score += 2
+  if (/\b(ceja|cejas|brow)\b/.test(u) && /\b(ceja|cejas|brow)\b/.test(l)) score += 3
+  if (/\b(laminado|diseño|henna|tinte|perfilado)\b/.test(u) && /\b(laminado|diseño|henna|tinte|perfilado)\b/.test(l)) score += 2.5
+  const utoks = new Set(u.split(" ").filter(Boolean))
+  const ltoks = new Set(l.split(" ").filter(Boolean))
+  let overlap=0; for (const t of utoks){ if (ltoks.has(t)) overlap++ }
+  score += Math.min(overlap,3)*0.25
+  return score
+}
+function resolveEnvKeyFromLabelAndSede(label, sedeKey){
+  const list = servicesForSedeKeyRaw(sedeKey)
+  return list.find(s=>s.label.toLowerCase()===String(label||"").toLowerCase())?.key || null
+}
 
 // ====== Square helpers (identidad por teléfono)
 async function searchCustomersByPhone(phone){
@@ -576,7 +628,7 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
   }catch{ return [] }
 }
 
-// ====== IA HTTP
+// ====== IA (prompts con reglas)
 async function callAIOnce(messages, systemPrompt = "") {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
@@ -603,6 +655,52 @@ async function callAIWithRetries(messages, systemPrompt=""){
   return null
 }
 
+// ====== Fallback local (ADD: categorías + mantener lo anterior)
+function buildLocalFallback(userMessage, sessionData){
+  const msg = String(userMessage||"").trim()
+  const lower = norm(msg)
+  const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
+  const yesMatch = /\b(si|sí|ok|vale|confirmo|de\ acuerdo)\b/i.test(msg)
+  const cancelMatch = /\b(cancelar|anular|borra|elimina)\b/i.test(lower)
+  const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
+  const bookMatch = /\b(reservar|cita|quiero.*(cita|reservar))\b/i.test(lower)
+
+  const hasCore = (s)=> s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime
+
+  if (numMatch && Array.isArray(sessionData?.lastHours) && sessionData.lastHours.length){
+    const idx = Number(numMatch[1]) - 1
+    const pick = sessionData.lastHours[idx]
+    if (dayjs.isDayjs(pick)){
+      const iso = pick.format("YYYY-MM-DDTHH:mm")
+      const staffFromIso = sessionData?.lastStaffByIso?.[iso] || null
+      const updates = { pendingDateTime: pick.tz(EURO_TZ).toISOString() }
+      if (staffFromIso) { updates.preferredStaffId = staffFromIso; updates.preferredStaffLabel = null }
+      const okToCreate = hasCore({...sessionData, ...updates})
+      return { message: okToCreate ? "Perfecto, voy a confirmar esa hora 👍" : "Genial. Me falta algún dato.", action: okToCreate ? "create_booking" : "need_info", session_updates: updates, action_params: {} }
+    }
+  }
+  if (yesMatch){
+    if (hasCore(sessionData)){
+      return { message:"¡Voy a crear la reserva! ✨", action:"create_booking", session_updates:{}, action_params:{} }
+    } else {
+      const faltan=[]; if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)"); if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio"); if (!sessionData?.pendingDateTime) faltan.push("fecha y hora")
+      return { message:`Para proponerte horas dime: ${faltan.join(" y ")}.`, action:"need_info", session_updates:{}, action_params:{} }
+    }
+  }
+  if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")) return { message:"Vale, te enseño tus citas para cancelar:", action:"cancel_appointment", session_updates:{}, action_params:{} }
+  if (listMatch) return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
+
+  // (ADD) Detección de categoría local si aún no hay servicio
+  if (!sessionData?.selectedServiceEnvKey){
+    const cat = detectCategoryFromText(msg)
+    if (cat){
+      return { message:`Elige tu servicio de ${cat}:`, action:"choose_service", session_updates:{ stage:"awaiting_service_choice", pendingCategory: cat }, action_params:{ candidates:[] } }
+    }
+  }
+
+  return { message:"¿Quieres reservar, cancelar o ver tus citas? Si es para reservar, dime sede y si es de *uñas, pestañas o cejas*.", action:"none", session_updates:{}, action_params:{} }
+}
+
 // ====== Roster para el prompt (IA ve TODO)
 function staffRosterForPrompt(){
   return EMPLOYEES.map(e=>{
@@ -611,341 +709,6 @@ function staffRosterForPrompt(){
   }).join("\n")
 }
 
-// ====== Helpers prompt avanzado
-function generateTimeContext(nowEU){
-  const dow = ["domingo","lunes","martes","miércoles","jueves","viernes","sábado"][nowEU.day()]
-  const within = insideBusinessHours(nowEU, 60) ? "dentro de horario" : "fuera de horario"
-  return `${dow} ${nowEU.format("DD/MM/YYYY HH:mm")} (${within})`
-}
-function analyzeUserPatterns(conversationHistory){
-  const text = conversationHistory.map(x => (x?.content||"")).join(" | ").toLowerCase()
-  const prefersTorre = /torre|torremolinos/.test(text)
-  const prefersLuz = /\bla luz\b|luz\b/.test(text)
-  const likesUnas = /\buña|manicura|gel|acril/i.test(text)
-  const likesLash = /\bpestañ|lash|lifting/i.test(text)
-  const style = /\bvale|ok|tio|bro|jaja|jeje|xd/i.test(text) ? "coloquial" : "formal"
-  return `preferencias: ${prefersTorre?"Torremolinos ":""}${prefersLuz?"La Luz ":""}${likesUnas?"uñas ":""}${likesLash?"pestañas ":""}| estilo:${style}`
-}
-function generateSmartServiceContext(sede){
-  const list = sede ? servicesForSedeKeyRaw(sede) : allServices()
-  const lines = list.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")
-  return `SERVICIOS DISPONIBLES${sede?` (${locationNice(sede)})`:""}:\n${lines}`
-}
-function generateSessionContext(s){
-  return `Sede:${s?.sede||"—"} | Servicio:${s?.selectedServiceLabel||"—"} (${s?.selectedServiceEnvKey||"—"}) | Preferida:${s?.preferredStaffLabel||"—"} | Pendiente:${s?.pendingDateTime?fmtES(parseToEU(s.pendingDateTime)):"—"} | Etapa:${s?.stage||"—"}`
-}
-
-// ====== Prompt avanzado
-function buildAdvancedSystemPrompt(sessionData, conversationHistory, userProfile) {
-  const nowEU = dayjs().tz(EURO_TZ);
-  const timeContext = generateTimeContext(nowEU);
-  const userPattern = analyzeUserPatterns(conversationHistory);
-  const serviceContext = generateSmartServiceContext(sessionData.sede);
-
-  return `Eres Gapink AI, la asistente más inteligente de salones de belleza en España. Devuelves SOLO JSON válido con el formato:
-{"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{...}}
-
-CONTEXTO TEMPORAL: ${timeContext}
-PERFIL USUARIO: ${userPattern}
-ESTADO ACTUAL: ${generateSessionContext(sessionData)}
-
-${serviceContext}
-
-REGLAS AVANZADAS DE IA:
-1. INTERPRETACIÓN INTELIGENTE: español coloquial, errores y abreviaciones.
-2. CONTEXTO PERSISTENTE: recuerda toda la conversación y patrones.
-3. PREDICCIÓN PROACTIVA: anticipa necesidades con el historial.
-4. FLEXIBILIDAD TOTAL: adapta el estilo al usuario.
-5. RESOLUCIÓN AUTOMÁTICA: usa contexto previo para ambigüedades.
-
-CAPACIDADES:
-- Multi-intención (reservar, cancelar, listar, cambiar).
-- Maneja referencias temporales naturales ("viernes", "la semana que viene").
-- Cambios de opinión en mitad de conversación.
-- Prioriza "con {nombre}" si es posible en la sede.
-
-FORMATO ESTRICTO: devuelve solo JSON, sin texto adicional.`
-}
-
-// ====== NLP Avanzado
-class AdvancedNLPProcessor {
-  static normalizeAdvanced(text) {
-    const corrections = {
-      'uñas': ['unas', 'unyas', 'uñass'],
-      'pestañas': ['pestanas', 'pestaañas', 'pestanyas', 'pestañass'],
-      'cejas': ['zejas', 'sejas'],
-      'torremolinos': ['torre', 'torremolino', 'torremelinos'],
-      'la luz': ['luz','laa luz','laluz'],
-      'semipermanente': ['semi permanente','semi-permanente','semipermanete'],
-      'acrílico': ['acrilico','acrilic','acrilyco'],
-      'francés': ['frances']
-    }
-    let normalized = String(text||"")
-    for (const [correct, vars] of Object.entries(corrections)) {
-      vars.forEach(v => { normalized = normalized.replace(new RegExp(v, 'gi'), correct) })
-    }
-    return normalized
-  }
-  static _synonyms(){
-    return {
-      unas: ['uñas','manicura','gel','acrílico','semipermanente','relleno','press on','tips','francés','nivelación','decoración','retirar'],
-      pedicura: ['pedicura','pies','pie'],
-      pestanas: ['pestañas','lifting','pelo a pelo','volumen','clásicas','russian'],
-      cejas: ['cejas','microblading','microshading','efecto polvo','hairstroke'],
-    }
-  }
-  static detectUrgency(text){
-    return /\burgente|ya|ahora|lo antes posible|prisa/i.test(text) ? 'alta' : 'normal'
-  }
-  static detectCommunicationStyle(text){
-    return /\bvale|ok|tio|bro|jaja|jeje|xd/i.test(text) ? 'coloquial' : 'formal'
-  }
-  static async analyzeEmotionalTone(){ return 'neutral' }
-  static async extractEntities(text){
-    const t = this.normalizeAdvanced(text).toLowerCase()
-    const loc = /\bla luz\b/.test(t) ? 'la_luz' : /\btorremolinos|torre\b/.test(t) ? 'torremolinos' : null
-    const staff = (() => {
-      for (const e of EMPLOYEES){
-        for (const lbl of e.labels){
-          if (norm(lbl) && norm(t).includes(norm(lbl))) return { id:e.id, label: e.labels[0] }
-        }
-      }
-      return null
-    })()
-    const dates = /\bhoy|mañana|pasado|viernes|lunes|martes|miércoles|jueves\b/i.test(t) ? ['relative'] : []
-    const times = /\b(\d{1,2}[:.]\d{2}|\d{1,2}\s*(am|pm))\b/i.test(t) ? ['clock'] : []
-    const syn = this._synonyms()
-    const services = []
-    for (const [k, arr] of Object.entries(syn)){
-      if (arr.some(w => t.includes(w))) services.push(k)
-    }
-    return { services, dates, times, locations: loc?[loc]:[], staff: staff?[staff]:[], emotions:[] }
-  }
-  static async detectIntentions(text, context){
-    const t = this.normalizeAdvanced(text).toLowerCase()
-    const intents = []
-    if (/\bcancel(ar|a|a la)\b|\banular\b|\bborrar\b/.test(t)) intents.push('cancel')
-    if (/\bmis citas|ver citas|lista\b/.test(t)) intents.push('list')
-    if (/\breserv(ar|a)|cita|quiero\b/.test(t)) intents.push('book')
-    if (/\bcon\s+[a-zñáéíóú]+/.test(t)) intents.push('with_staff')
-    if (!intents.length && /\buñas|manicura|gel|acrílico|semipermanente|pedicura|pestañas|cejas/i.test(t)) intents.push('choose_service')
-    return intents
-  }
-  static servicesForIntention(sedeKey, userMsg, target='unas'){
-    const pool = sedeKey ? servicesForSedeKeyRaw(sedeKey) : allServices()
-    const t = this.normalizeAdvanced(userMsg).toLowerCase()
-    const syn = this._synonyms()
-    let keys = syn[target] || []
-    if (target==='unas' && /\bpedicura|pies|pie\b/.test(t)) keys = [...keys, ...syn.pedicura]
-    const scored = pool.map(s=>{
-      const l = s.label.toLowerCase()
-      let score = 0
-      for (const k of keys){ if (l.includes(k) || t.includes(k)) score += 1.2 }
-      // bonus por superposición de tokens
-      const utoks = new Set(norm(t).split(" ").filter(Boolean))
-      const ltoks = new Set(norm(l).split(" ").filter(Boolean))
-      let overlap=0; for (const tok of utoks){ if (ltoks.has(tok)) overlap++ }
-      score += Math.min(overlap,3)*0.2
-      return { ...s, _score:score }
-    }).filter(x=>x._score>0.2)
-    scored.sort((a,b)=> b._score - a._score)
-    // dedup por label
-    const seen=new Set(); const out=[]
-    for (const s of scored){ const k=s.label.toLowerCase(); if(seen.has(k)) continue; seen.add(k); out.push(s) }
-    return out
-  }
-}
-
-// ====== Sistema de Aprendizaje
-class ContextualLearningEngine {
-  static async storeInteractionLearning(interaction){
-    try{
-      // Guardamos como conversación AI (reutilizamos tabla).
-      insertAIConversation.run({
-        phone: interaction.sessionContext?.phone || 'unknown',
-        message_id: `learn_${Date.now()}`,
-        user_message: interaction.userMessage || "",
-        ai_response: safeJSONStringify({ outcome: interaction.outcome, patterns: interaction.patterns }),
-        timestamp: new Date().toISOString(),
-        session_data: safeJSONStringify(interaction.sessionContext || {}),
-        ai_error: null,
-        fallback_used: 0
-      })
-    }catch{}
-  }
-  static async extractPatterns(userMessage, sessionData){
-    const ents = await AdvancedNLPProcessor.extractEntities(userMessage||"")
-    return { categories: ents.services, location: ents.locations?.[0]||null }
-  }
-  static async updateUserProfile(_phone, _interaction){ /* no-op local */ }
-  static async analyzeUserPatterns(conversationHistory){
-    return analyzeUserPatterns(conversationHistory)
-  }
-  static async predictUserNeeds(sessionData, conversationHistory){
-    const patterns = await this.analyzeUserPatterns(conversationHistory)
-    const prefersTorre = /Torremolinos/i.test(patterns)
-    const prefersLuz = /La Luz/i.test(patterns)
-    return {
-      likelyServices: [],
-      preferredTimes: [],
-      communicationPreferences: /\bestilo:coloquial/i.test(patterns) ? 'coloquial' : 'formal',
-      urgencyTendency: sessionData?.conversationMemory?.urgencyLevel || 'normal',
-      preferredSede: prefersTorre ? 'torremolinos' : (prefersLuz ? 'la_luz' : null)
-    }
-  }
-}
-
-// ====== Validador Inteligente
-class IntelligentValidator {
-  static async validateService(serviceEnvKey, sedeKey){
-    const list = servicesForSedeKeyRaw(sedeKey||"torremolinos")
-    const ok = list.some(s=>s.key===serviceEnvKey)
-    return { isValid: !!ok, reason: ok?null:`Servicio no existe en ${locationNice(sedeKey||"torremolinos")}` }
-  }
-  static async validateDateTime(dt, sessionData){
-    if (!dt) return { isValid:false, reason:"Fecha/hora no indicada" }
-    const d = parseToEU(dt)
-    const ok = insideBusinessHours(d, 60)
-    return { isValid: ok, reason: ok?null:"Fuera de horario laboral" }
-  }
-  static async validateLocation(loc){
-    const ok = loc==="torremolinos" || loc==="la_luz"
-    return { isValid: ok, reason: ok?null:"Sede inválida" }
-  }
-  static async validateStaff(staffId, loc){
-    if (!staffId) return { isValid:true }
-    const ok = isStaffAllowedInLocation(staffId, loc)
-    return { isValid: ok, reason: ok?null:"Profesional no disponible en sede" }
-  }
-  static async generateCorrections(validations, sessionData){
-    const corr = {}
-    if (!validations.location?.isValid && sessionData?.sede) corr.location = sessionData.sede
-    if (!validations.datetime?.isValid && sessionData?.pendingDateTime){
-      const baseFrom = nextOpeningFrom(dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN, "minute"))
-      corr.datetime = baseFrom.toISOString()
-    }
-    return corr
-  }
-  static async generatePreferenceSuggestions(sessionData){
-    const prefs = sessionData?.conversationMemory?.preferences || {}
-    const out=[]
-    if (prefs?.category==='unas') out.push("¿Te ofrezco semipermanente o gel según lo último que pediste?")
-    return out
-  }
-  static async generateAvailabilitySuggestions(_validations){
-    return ["Si te viene mejor, también puedo mirar el viernes por la tarde."]
-  }
-  static async generateIntelligentSuggestions(validations, sessionData){
-    const suggestions = []
-    if (sessionData.conversationMemory?.preferences) {
-      suggestions.push(...await this.generatePreferenceSuggestions(sessionData))
-    }
-    suggestions.push(...await this.generateAvailabilitySuggestions(validations))
-    return suggestions
-  }
-  static async validateAndCorrectBookingData(data, sessionData){
-    const v = {
-      service: await this.validateService(data.service, sessionData.sede),
-      datetime: await this.validateDateTime(data.datetime, sessionData),
-      location: await this.validateLocation(data.location),
-      staff: await this.validateStaff(data.staff, data.location)
-    }
-    const corrections = await this.generateCorrections(v, sessionData)
-    return { isValid: Object.values(v).every(x=>x.isValid), corrections, suggestions: await this.generateIntelligentSuggestions(v, sessionData), detail: v }
-  }
-}
-
-// ====== Respuestas adaptativas
-class AdaptiveResponseGenerator {
-  static determineResponseStyle(style){ return style==='coloquial'?'coloquial':'formal' }
-  static determineEmotionalTone(_){ return 'neutral' }
-  static determineUrgencyLevel(level){ return level || 'normal' }
-  static async generateBaseResponse(intention, sessionData){
-    switch(intention){
-      case 'list': return { message:"Estas son tus próximas citas:", action:"list_appointments" }
-      case 'cancel': return { message:"Vale, dime cuál cancelar:", action:"cancel_appointment" }
-      case 'book': return { message:"Te propongo horarios ahora 👇", action:"propose_times" }
-      default: return { message:"¿Quieres reservar, cancelar o ver tus citas?", action:"none" }
-    }
-  }
-  static async adaptResponse(base, _opts){ return base }
-  static generateHumanHandoffMessage(){ return { message:"Te paso con una persona del equipo para terminarlo 👩‍💻", action:"none" } }
-  static async generateAlternativeResponses(failed, sessionData){
-    const alt = []
-    alt.push({ message:"Te enseño otros horarios posibles", action:"propose_times" })
-    if (!sessionData?.sede) alt.push({ message:"¿En qué sede te viene mejor, Torremolinos o La Luz?", action:"need_info", session_updates:{ stage:"awaiting_sede_for_services" } })
-    return alt
-  }
-  static generateEscalationPath(attempts){ return attempts>=2?"human":"retry" }
-  static async generateContextualResponse(intention, sessionData, userProfile){
-    const style = this.determineResponseStyle(userProfile?.communicationStyle||'formal')
-    const urgency = this.determineUrgencyLevel(sessionData?.conversationMemory?.urgencyLevel)
-    const base = await this.generateBaseResponse(intention, sessionData)
-    return this.adaptResponse(base, { style, urgency })
-  }
-  static async generateSmartFallbacks(failedResponse, sessionData, attempts = 0) {
-    if (attempts > 3) return this.generateHumanHandoffMessage()
-    const alternatives = await this.generateAlternativeResponses(failedResponse, sessionData)
-    return { primary: alternatives[0], fallbacks: alternatives.slice(1), escalationPath: this.generateEscalationPath(attempts) }
-  }
-}
-
-// ====== Monitor de IA
-class AIPerformanceMonitor {
-  static async predictSatisfaction(_interaction){ return 0.9 }
-  static async analyzeTaskCompletion(_interaction){ return 0.8 }
-  static async calculateErrorRate(_interaction){ return 0.02 }
-  static async calculateConversionRate(_interaction){ return 0.6 }
-  static async storeMetrics(m){
-    try{
-      insertMetrics.run({ phone: m.phone||'unknown', rt:m.responseTime||0, sat:m.userSatisfaction, task:m.taskCompletion, err:m.errorRate, conv:m.conversionRate, ts:new Date().toISOString() })
-    }catch{}
-  }
-  static async triggerOptimizations(_){ /* no-op local */ }
-  static async trackInteraction(interaction){
-    const metrics = {
-      phone: interaction?.phone||'unknown',
-      responseTime: interaction?.responseTime||0,
-      userSatisfaction: await this.predictSatisfaction(interaction),
-      taskCompletion: await this.analyzeTaskCompletion(interaction),
-      errorRate: await this.calculateErrorRate(interaction),
-      conversionRate: await this.calculateConversionRate(interaction)
-    }
-    await this.storeMetrics(metrics)
-    await this.triggerOptimizations(metrics)
-  }
-}
-
-// ====== IA Square extra (placeholders seguros)
-async function getSquareHistoricalData(){ return [] }
-async function validateWithSquareAPI(pred){
-  // Validamos predicción mirando disponibilidad real
-  if (!pred?.service || !pred?.location) return null
-  const baseFrom = nextOpeningFrom(dayjs().tz(EURO_TZ).add(NOW_MIN_OFFSET_MIN,"minute"))
-  const envKey = pred.service
-  const slots = await searchAvailabilityGeneric({ locationKey: pred.location, envServiceKey: envKey, fromEU: baseFrom, n: 3 })
-  return slots?.length ? slots : null
-}
-async function getSquareAlternatives(){ return [] }
-async function getUserPreferences(){ return {} }
-async function getBusinessOptimizationRules(){ return {} }
-async function executeOptimizedBooking(opt){ return opt }
-async function aiPredictAvailability(userRequest, sessionData){
-  // Simple: intenta validar con Square con preferencias del usuario.
-  const prediction = {
-    service: userRequest.service,
-    preferredTimes: sessionData?.conversationMemory?.preferences?.times || [],
-    location: userRequest.location || sessionData?.sede || 'torremolinos',
-    historicalData: await getSquareHistoricalData()
-  }
-  return await validateWithSquareAPI(prediction)
-}
-async function aiOptimizeBooking(booking, alternatives){
-  const optimization = { originalBooking: booking, alternatives, userPreferences: await getUserPreferences(), businessRules: await getBusinessOptimizationRules() }
-  return await executeOptimizedBooking(optimization)
-}
-
-// ====== Builder de prompt legacy (fallback técnico, no principal)
 function buildSystemPrompt() {
   const nowEU = dayjs().tz(EURO_TZ);
   const torremolinos_services = servicesForSedeKeyRaw("torremolinos");
@@ -956,8 +719,16 @@ function buildSystemPrompt() {
 
 INFORMACIÓN:
 - Fecha/hora actual: ${nowEU.format("dddd DD/MM/YYYY HH:mm")} (Madrid)
+- Estado: PRODUCCIÓN
 
-PROFESIONALES:
+SEDES:
+- Torremolinos: ${ADDRESS_TORRE}
+- Málaga – La Luz: ${ADDRESS_LUZ}
+
+HORARIOS:
+- L-V 09:00-20:00; S/D cerrado; Festivos: ${HOLIDAYS_EXTRA.join(", ")}
+
+PROFESIONALES (con aliases y sedes permitidas):
 ${staffLines}
 
 SERVICIOS TORREMOLINOS:
@@ -966,95 +737,48 @@ ${torremolinos_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 SERVICIOS LA LUZ:
 ${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 
+REGLAS CLAVE:
+1) Identidad: NO pidas nombre/email si el número existe (match único). Solo si no existe o hay duplicados.
+2) Categoría: distingue *uñas / pestañas / cejas*. Si el cliente habla de una categoría → "choose_service" de esa categoría. No mezcles categorías.
+3) Sede: si no hay sede, pídela antes de listar servicios.
+4) Si el cliente escribe 1/2/3 para horas → selección directa (usa lastHours).
+5) Cancelar: usa el número del chat para listar y cancelar.
+6) Para crear reserva: sede + servicio + fecha/hora. La identidad se resuelve por teléfono.
+7) “con {nombre}”: forzar propuesta con esa profesional si está permitida en la sede.
+
 FORMATO:
-{"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{...}}`
+{"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{"category":"uñas|pestañas|cejas","candidates":[{"label":"...","confidence":0.0}]}}`
 }
 
-// ====== IA multinivel
-async function preprocessUserInput(userMessage, sessionData){
-  const normalized = AdvancedNLPProcessor.normalizeAdvanced(userMessage)
-  const entities = await AdvancedNLPProcessor.extractEntities(userMessage)
-  // actualizar memoria ligera
-  if (entities.locations?.[0]) sessionData.sede = sessionData.sede || entities.locations[0]
-  if (entities.staff?.[0]) {
-    sessionData.preferredStaffId = entities.staff[0].id
-    sessionData.preferredStaffLabel = entities.staff[0].label
-  }
-  sessionData.conversationMemory.urgencyLevel = AdvancedNLPProcessor.detectUrgency(userMessage)
-  sessionData.conversationMemory.communicationStyle = AdvancedNLPProcessor.detectCommunicationStyle(userMessage)
-  return { normalized, entities }
-}
-async function analyzeMultipleIntentions(preprocessed, conversationHistory){
-  const intentions = await AdvancedNLPProcessor.detectIntentions(preprocessed.normalized, { history: conversationHistory })
-  return intentions
-}
-async function resolveContextualAmbiguity(intentions, sessionData){
-  const top = intentions[0] || 'none'
-  return { topIntention: top, session: sessionData }
-}
-async function generateAdaptiveResponse(context, userMessage, sessionData){
-  const userProfile = {
-    communicationStyle: sessionData.conversationMemory.communicationStyle,
-    emotionalState: sessionData.conversationMemory.satisfactionLevel
-  }
-  // Si la intención es elegir servicio, generamos candidatos por NLP
-  if (context.topIntention === 'choose_service'){
-    const items = AdvancedNLPProcessor.servicesForIntention(sessionData.sede, userMessage, 'unas')
-    const candidates = items.slice(0, 10).map((s,i)=>({ index:i+1, label:s.label, confidence: Math.min(0.9, 0.4 + (s._score||0)/3) }))
-    return {
-      message: "Elige tu servicio de uñas:",
-      action: "choose_service",
-      session_updates: { stage:"awaiting_service_choice" },
-      action_params: { candidates }
-    }
-  }
-  // Listar/cancelar/crear/proponer
-  const base = await AdaptiveResponseGenerator.generateContextualResponse(context.topIntention, sessionData, userProfile)
-  return { ...base, session_updates:{}, action_params:{} }
-}
-async function validateAndOptimizeResponse(response, sessionData){
-  return response // placeholder: podría ajustar estilo/tone
-}
-async function getAdvancedAIResponse(userMessage, sessionData, phone, conversationHistory){
-  const t0 = Date.now()
-  const preprocessed = await preprocessUserInput(userMessage, sessionData)
-  const intentions = await analyzeMultipleIntentions(preprocessed, conversationHistory)
-  const context = await resolveContextualAmbiguity(intentions, sessionData)
+async function getAIResponse(userMessage, sessionData, phone) {
+  const systemPrompt = buildSystemPrompt();
 
-  // Generación adaptativa propia
-  let aiObj = await generateAdaptiveResponse(context, userMessage, sessionData)
-  aiObj = await validateAndOptimizeResponse(aiObj, sessionData)
-
-  // Si aún es “none” o necesitamos mayor contexto, pedimos a la LLM con prompt avanzado
-  if (!aiObj || aiObj.action==="none"){
-    const sys = buildAdvancedSystemPrompt(sessionData, conversationHistory, {})
-    const messages = [{ role:"user", content:`MENSAJE DEL CLIENTE: "${userMessage}"\n\nINSTRUCCIÓN: Devuelve SOLO JSON siguiendo el formato.` }]
-    const aiText = await callAIWithRetries(messages, sys)
-    if (aiText){
-      const cleaned = aiText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").replace(/^[^{]*/, "").replace(/[^}]*$/, "").trim()
-      try { aiObj = JSON.parse(cleaned) } catch { /* fallback abajo */ }
-    }
-  }
-  if (!aiObj){
-    // Fallback adaptativo
-    const fb = await AdaptiveResponseGenerator.generateSmartFallbacks({ message:"no"}, sessionData, 0)
-    aiObj = fb.primary || { message:"¿Quieres reservar, cancelar o ver tus citas?", action:"none" }
-    aiObj.__fallback_used = true
-  }
-
-  const t1 = Date.now()
-  AIPerformanceMonitor.trackInteraction({ phone, responseTime: t1-t0 }).catch(()=>{})
-  return aiObj
-}
-
-// ====== Enrutado principal (legacy signature)
-async function getAIResponse(userMessage, sessionData, phone){
-  const recent = db.prepare(`SELECT user_message, ai_response FROM ai_conversations WHERE phone = ? ORDER BY timestamp DESC LIMIT 8`).all(phone);
+  const recent = db.prepare(`SELECT user_message, ai_response FROM ai_conversations WHERE phone = ? ORDER BY timestamp DESC LIMIT 6`).all(phone);
   const conversationHistory = recent.reverse().map(msg => [
     { role: "user", content: msg.user_message },
     { role: "assistant", content: msg.ai_response }
   ]).flat();
-  return await getAdvancedAIResponse(userMessage, sessionData, phone, conversationHistory)
+
+  const sessionContext = `
+ESTADO:
+- Sede: ${sessionData?.sede || 'no seleccionada'}
+- Servicio: ${sessionData?.selectedServiceLabel || 'no seleccionado'} (${sessionData?.selectedServiceEnvKey || 'no_key'})
+- Profesional preferida: ${sessionData?.preferredStaffLabel || 'ninguna'}
+- Fecha/hora pendiente: ${sessionData?.pendingDateTime ? fmtES(parseToEU(sessionData.pendingDateTime)) : 'no seleccionada'}
+- Etapa: ${sessionData?.stage || 'inicial'}
+- Últimas horas propuestas: ${Array.isArray(sessionData?.lastHours) ? sessionData.lastHours.length + ' opciones' : 'ninguna'}
+`;
+
+  const messages = [
+    ...conversationHistory,
+    { role: "user", content: `MENSAJE DEL CLIENTE: "${userMessage}"\n\n${sessionContext}\n\nINSTRUCCIÓN: Devuelve SOLO JSON siguiendo las reglas.` }
+  ];
+
+  const aiText = await callAIWithRetries(messages, systemPrompt)
+  if (!aiText || /^error de conexión/i.test(aiText.trim())) return buildLocalFallback(userMessage, sessionData)
+
+  const cleaned = aiText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").replace(/^[^{]*/, "").replace(/[^}]*$/, "").trim()
+  try { return JSON.parse(cleaned) } catch { return buildLocalFallback(userMessage, sessionData) }
 }
 
 // ====== Bot principal
@@ -1092,11 +816,18 @@ function parseNameEmailFromText(txt){
   return { name: name || null, email }
 }
 
-// ====== Menú de servicios por NLP
-function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates){
-  const itemsNLP = AdvancedNLPProcessor.servicesForIntention(sedeKey, userMsg||"", 'unas')
+// ====== (ADD) selector por categoría
+function servicesByCategoryForSede(sedeKey, category, userMsg){
+  if (category === CATEGORY.LASHES) return lashesServicesForSede(sedeKey)
+  if (category === CATEGORY.BROWS)  return browsServicesForSede(sedeKey)
+  return nailsServicesForSede(sedeKey, userMsg)
+}
+
+// ====== Menú de uñas/lashes/cejas (EXTENSIÓN ADD-ONLY)
+function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates, category=CATEGORY.NAILS){
+  const list = servicesByCategoryForSede(sedeKey, category, userMsg)
   const localScores = new Map()
-  for (const s of itemsNLP){ localScores.set(s.label, s._score||0) }
+  for (const s of list){ localScores.set(s.label, scoreServiceRelevance(userMsg, s.label)) }
   const aiMap = new Map()
   if (Array.isArray(aiCandidates)){
     for (const c of aiCandidates){
@@ -1107,43 +838,13 @@ function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates){
       aiMap.set(label, conf)
     }
   }
-  const merged = [...itemsNLP]
-  // Añade candidatos de IA que no salieron por NLP
-  for (const c of aiCandidates||[]){
-    const label = String(cleanDisplayLabel(c.label||"")).trim()
-    if (label && !merged.some(x=>x.label.toLowerCase()===label.toLowerCase())){
-      merged.push({ label, sedeKey, key: null, id: null, norm: norm(label), _score: (c.confidence||0.1)*3 })
-    }
-  }
-  merged.sort((a,b)=> (localScores.get(b.label)||0)-(localScores.get(a.label)||0))
-  return merged.map((s,i)=>({ index:i+1, label:s.label }))
+  const inAI = list.filter(s=>aiMap.has(s.label)).sort((a,b)=> (aiMap.get(b.label)-aiMap.get(a.label)) || ((localScores.get(b.label)||0)-(localScores.get(a.label)||0)))
+  const rest = list.filter(s=>!aiMap.has(s.label)).sort((a,b)=> (localScores.get(b.label)||0)-(localScores.get(a.label)||0))
+  const final = [...inAI, ...rest]
+  return final.map((s,i)=>({ index:i+1, label:s.label, envKey:s.key }))
 }
 
-async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
-  if (!sessionData.sede){
-    sessionData.pendingCategory = "uñas"
-    sessionData.stage = "awaiting_sede_for_services"
-    saveSession(phone, sessionData)
-    await sendWithPresence(sock, jid, "¿En qué sede te viene mejor, Torremolinos o La Luz? (así te muestro las opciones de uñas correctas)")
-    return
-  }
-  const aiCands = Array.isArray(params?.candidates) ? params.candidates : []
-  const items = buildServiceChoiceListBySede(sessionData.sede, userMsg||"", aiCands)
-  if (!items.length){
-    await sendWithPresence(sock, jid, "Ahora mismo no tengo servicios de uñas configurados para esa sede.")
-    return
-  }
-  sessionData.serviceChoices = items
-  sessionData.stage = "awaiting_service_choice"
-  saveSession(phone, sessionData)
-  const lines = items.map(it=> {
-    const star = aiCands.find(c=>cleanDisplayLabel(String(c.label||"")).toLowerCase()===it.label.toLowerCase()) ? " ⭐" : ""
-    return `${it.index}) ${applySpanishDiacritics(it.label)}${star}`
-  }).join("\n")
-  await sendWithPresence(sock, jid, `Estas son nuestras opciones de **uñas** en ${locationNice(sessionData.sede)}:\n\n${lines}\n\nResponde con el número.`)
-}
-
-// ====== Proponer horas
+// ====== Proponer horas (SIN CAMBIO)
 function proposeSlots({ fromEU, durationMin=60, n=3 }){
   const out=[]
   let t = ceilToSlotEU(fromEU.clone())
@@ -1155,17 +856,49 @@ function proposeSlots({ fromEU, durationMin=60, n=3 }){
   return out
 }
 
+// ====== Elegir servicio (AMPLIADA con categorías, manteniendo firma)
+async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
+  const aiCat = (params?.category || "").toLowerCase()
+  const detected = detectCategoryFromText(userMsg||"")
+  const category = aiCat.includes("ceja") ? CATEGORY.BROWS
+                 : aiCat.includes("pesta")||aiCat.includes("lash") ? CATEGORY.LASHES
+                 : aiCat.includes("uña") ? CATEGORY.NAILS
+                 : sessionData.pendingCategory || detected || CATEGORY.NAILS
+
+  if (!sessionData.sede){
+    sessionData.pendingCategory = category
+    sessionData.stage = "awaiting_sede_for_services"
+    saveSession(phone, sessionData)
+    await sendWithPresence(sock, jid, `¿En qué sede te viene mejor, Torremolinos o La Luz? (así te muestro las opciones de ${category})`)
+    return
+  }
+  const aiCands = Array.isArray(params?.candidates) ? params.candidates : []
+  const items = buildServiceChoiceListBySede(sessionData.sede, userMsg||"", aiCands, category)
+  if (!items.length){
+    await sendWithPresence(sock, jid, `Ahora mismo no tengo servicios de ${category} configurados para esa sede.`)
+    return
+  }
+  sessionData.serviceChoices = items
+  sessionData.stage = "awaiting_service_choice"
+  sessionData.pendingCategory = category
+  saveSession(phone, sessionData)
+  const lines = items.map(it=> {
+    const star = aiCands.find(c=>cleanDisplayLabel(String(c.label||"")).toLowerCase()===it.label.toLowerCase()) ? " ⭐" : ""
+    return `${it.index}) ${applySpanishDiacritics(it.label)}${star}`
+  }).join("\n")
+  await sendWithPresence(sock, jid, `Estas son nuestras opciones de **${category}** en ${locationNice(sessionData.sede)}:\n\n${lines}\n\nResponde con el número.`)
+}
+
+// ====== Proponer horas (SIN CAMBIO en firma)
 async function executeProposeTime(_params, sessionData, phone, sock, jid) {
   const nowEU = dayjs().tz(EURO_TZ);
   const baseFrom = nextOpeningFrom(nowEU.add(NOW_MIN_OFFSET_MIN, "minute"));
   if (!sessionData.sede || !sessionData.selectedServiceEnvKey) { await sendWithPresence(sock, jid, "Necesito la sede y el servicio primero."); return; }
 
-  // Predicción IA simple (si fallan huecos luego, usamos genérico)
-  const pred = await aiPredictAvailability({ service: sessionData.selectedServiceEnvKey, location: sessionData.sede }, sessionData)
-  let slots = Array.isArray(pred) ? pred : []
-
+  let slots = []
   let usedPreferred = false
-  if (!slots.length && sessionData.preferredStaffId && isStaffAllowedInLocation(sessionData.preferredStaffId, sessionData.sede)) {
+
+  if (sessionData.preferredStaffId && isStaffAllowedInLocation(sessionData.preferredStaffId, sessionData.sede)) {
     const staffSlots = await searchAvailabilityForStaff({ locationKey: sessionData.sede, envServiceKey: sessionData.selectedServiceEnvKey, staffId: sessionData.preferredStaffId, fromEU: baseFrom, n: 3 })
     if (staffSlots.length){ slots = staffSlots; usedPreferred = true }
   }
@@ -1205,27 +938,14 @@ async function executeProposeTime(_params, sessionData, phone, sock, jid) {
   await sendWithPresence(sock, jid, `${header}\n${lines}\n\nResponde con el número (1, 2 o 3)`)
 }
 
-// ====== Crear reserva (con Validador Inteligente)
+// ====== Crear reserva (SIN CAMBIO)
 async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!sessionData.sede) { await sendWithPresence(sock, jid, "Falta seleccionar la sede (Torremolinos o La Luz)"); return; }
   if (!sessionData.selectedServiceEnvKey) { await sendWithPresence(sock, jid, "Falta seleccionar el servicio"); return; }
   if (!sessionData.pendingDateTime) { await sendWithPresence(sock, jid, "Falta seleccionar la fecha y hora"); return; }
 
   const startEU = parseToEU(sessionData.pendingDateTime)
-  // Validador IA
-  const validation = await IntelligentValidator.validateAndCorrectBookingData({
-    service: sessionData.selectedServiceEnvKey,
-    datetime: startEU.toISOString(),
-    location: sessionData.sede,
-    staff: sessionData.preferredStaffId || null
-  }, sessionData)
-
-  if (!validation.isValid){
-    const msg = `No puedo confirmar aún: ${Object.values(validation.detail).filter(v=>!v.isValid).map(v=>v.reason).join("; ")}.\n${validation.suggestions?.[0]||"¿Probamos otra hora?"}`
-    await sendWithPresence(sock, jid, msg)
-    await executeProposeTime({}, sessionData, phone, sock, jid)
-    return
-  }
+  if (!insideBusinessHours(startEU, 60)) { await sendWithPresence(sock, jid, "Esa hora está fuera del horario (L-V 09:00–20:00)"); return; }
 
   const iso = startEU.format("YYYY-MM-DDTHH:mm")
   let staffId = sessionData.lastProposeUsedPreferred ? (sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null)
@@ -1252,19 +972,18 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
     }
     customerId = customer?.id || null
   }
+
   if (!customerId && (sessionData.name || sessionData.email)){
     const created = await findOrCreateCustomerWithRetry({ name: sessionData.name, email: sessionData.email, phone })
     if (created) customerId = created.id
   }
+
   if (!customerId){
     sessionData.stage = "awaiting_identity"
     saveSession(phone, sessionData)
     await sendWithPresence(sock, jid, "Para terminar, dime tu *nombre* y (opcional) tu *email* para crear tu ficha 😊")
     return
   }
-
-  // Optimización IA (placeholder sin efectos destructivos)
-  await aiOptimizeBooking({ start: iso, staffId }, [])
 
   const result = await createBookingWithRetry({ startEU, locationKey: sessionData.sede, envServiceKey: sessionData.selectedServiceEnvKey, durationMin: 60, customerId, teamMemberId: staffId, phone })
   if (!result.success) {
@@ -1312,7 +1031,7 @@ Referencia: ${result.booking.id}
   clearSession(phone);
 }
 
-// ====== Listar/cancelar por teléfono
+// ====== Listar/cancelar por teléfono (SIN CAMBIO)
 async function enumerateCitasByPhone(phone){
   const items=[]
   let cid=null
@@ -1379,7 +1098,7 @@ async function executeCancelAppointment(params, sessionData, phone, sock, jid) {
   saveSession(phone, sessionData)
 }
 
-// ====== Mini-web + QR
+// ====== Mini-web + QR (SIN CAMBIO salvo versión visual)
 const app=express()
 const PORT=process.env.PORT||8080
 let lastQR=null, conectado=false
@@ -1389,24 +1108,24 @@ app.get("/", (_req,res)=>{
   const failedAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'failed'`).get()?.count || 0
   res.send(`<!doctype html><meta charset="utf-8"><style>
   body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa}
-  .card{max-width:720px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
+  .card{max-width:640px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
   .status{padding:12px;border-radius:8px;margin:8px 0}
   .success{background:#d4edda;color:#155724}
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v28.0.0</h1>
+  <h1>🩷 Gapink Nails Bot v27.3.0</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v28:</strong><br>
-    • Motor IA multinivel + memoria.<br>
-    • Prompt dinámico + NLP sin anchors rígidos.<br>
-    • Validador inteligente previo a Square y predicción de slots.<br>
+    <strong>🚀 Mejoras v27.3.0 (add-only):</strong><br>
+    • Categorías uñas/pestañas/cejas<br>
+    • Elección de servicio por número<br>
+    • Anti-spam de error técnico<br>
   </div>
   </div>`)
 })
@@ -1420,7 +1139,7 @@ app.get("/logs", (_req,res)=>{
   res.json({ logs: recent })
 })
 
-// ====== Baileys
+// ====== Baileys (SIN CAMBIO)
 async function loadBaileys(){
   const require = createRequire(import.meta.url); let mod=null
   try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ try{ mod=await import("@whiskeysockets/baileys") }catch{} }
@@ -1432,7 +1151,7 @@ async function loadBaileys(){
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
 
-// 👉 Pre-intercept “con {nombre}” (smart)
+// 👉 Pre-intercept “con {nombre}” (smart) (SIN CAMBIO)
 function parsePreferredStaffFromText(text){
   const t = norm(text)
   const m = t.match(/\bcon\s+([a-zñáéíóú]+)\b/i)
@@ -1444,6 +1163,17 @@ function parsePreferredStaffFromText(text){
     }
   }
   return null
+}
+
+// ====== (ADD) Anti-spam error técnico
+function shouldSendErrorNow(sessionData){
+  const now = Date.now()
+  const last = Number(sessionData.last_error_ts || 0)
+  if (isNaN(last) || now - last > 20000) { // 20s cooldown
+    sessionData.last_error_ts = now
+    return true
+  }
+  return false
 }
 
 async function startBot(){
@@ -1479,9 +1209,8 @@ async function startBot(){
       if (!textRaw) return
 
       await enqueue(phone, async ()=>{
-        const t0 = Date.now()
         try {
-          let sessionData = loadSession(phone) || enhanceSessionData({
+          let sessionData = loadSession(phone) || {
             greeted: false, sede: null, selectedServiceEnvKey: null, selectedServiceLabel: null,
             preferredStaffId: null, preferredStaffLabel: null, pendingDateTime: null,
             name: null, email: null, last_msg_id: null, lastStaffByIso: {},
@@ -1489,9 +1218,10 @@ async function startBot(){
             serviceChoices: null, identityChoices: null, pendingCategory: null,
             lastStaffNamesById: null,
             snooze_until_ms: null,
-            identityResolvedCustomerId: null
-          })
-          if (sessionData.last_msg_id === m.key.id) return
+            identityResolvedCustomerId: null,
+            last_error_ts: 0 // (ADD)
+          }
+          if (sessionData.last_msg_id === m.key.id) { saveSession(phone, sessionData); return }
           sessionData.last_msg_id = m.key.id
 
           // === MUTE BY "." ===
@@ -1560,9 +1290,23 @@ async function startBot(){
               sessionData.sede = sede
               sessionData.stage = null
               saveSession(phone, sessionData)
-              await executeChooseService({ candidates: [] }, sessionData, phone, sock, jid, textRaw)
+              await executeChooseService({ candidates: [], category: sessionData.pendingCategory }, sessionData, phone, sock, jid, textRaw)
               return
             }
+          }
+
+          // === (ADD) PRE-INTERCEPT: selección de SERVICIO por número
+          if (numMatch && sessionData.stage==="awaiting_service_choice" && Array.isArray(sessionData.serviceChoices) && sessionData.serviceChoices.length){
+            const idx = Number(numMatch[1]) - 1
+            const pick = sessionData.serviceChoices[idx]
+            if (!pick){ await sendWithPresence(sock, jid, "No encontré esa opción. Prueba con el número de la lista."); saveSession(phone, sessionData); return }
+            sessionData.selectedServiceLabel = pick.label
+            sessionData.selectedServiceEnvKey = resolveEnvKeyFromLabelAndSede(pick.label, sessionData.sede) || pick.envKey || null
+            sessionData.stage = null
+            saveSession(phone, sessionData)
+            await sendWithPresence(sock, jid, `Perfecto: **${applySpanishDiacritics(pick.label)}**. Te propongo horarios 👇`)
+            await executeProposeTime({}, sessionData, phone, sock, jid)
+            return
           }
 
           // === PRE-INTERCEPT: selección de horario ===
@@ -1601,7 +1345,7 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT: “con {nombre}” → proponer horas con esa pro
+          // === PRE-INTERCEPT: “con {nombre}” → proponer horas con esa pro (SIN CAMBIO)
           if (sessionData.sede && sessionData.selectedServiceEnvKey){
             const maybe = parsePreferredStaffFromText(textRaw)
             if (maybe && isStaffAllowedInLocation(maybe.id, sessionData.sede)){
@@ -1618,29 +1362,21 @@ async function startBot(){
             return
           }
 
-          // ===== IA multinivel
+          // IA normal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
           if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
-            // autocompletar envKey del servicio ya elegido si cambia sede
             const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
             if (ek) aiObj.session_updates.selectedServiceEnvKey = ek
           }
           await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
 
-          // Aprendizaje ligero
-          ContextualLearningEngine.learnFromInteraction(textRaw, safeJSONStringify(aiObj), sessionData, 'success').catch(()=>{})
-
         } catch (error) {
           if (BOT_DEBUG) console.error(error)
-          await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
-        } finally {
-          const t1 = Date.now()
-          try{
-            const arr = sessionData?.interactionMetrics?.responseTime || []
-            arr.push(t1 - t0)
-            sessionData.interactionMetrics.responseTime = arr.slice(-50)
-            saveSession(phone, sessionData)
-          }catch{}
+          // (ADD) anti spam del error técnico
+          if (shouldSendErrorNow(sessionData)){
+            await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
+          }
+          saveSession(phone, sessionData)
         }
       })
     })
@@ -1684,8 +1420,9 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     case "need_info":
     case "none":
     default:
-      // Si habló de uñas pero no eligió servicio → menú por NLP
-      if (!sessionData.selectedServiceEnvKey && /\buñ|manicura|gel|acrilic|acrílic|semi|press|tips|francesa|encapsul/i.test(textRaw)){
+      if (!sessionData.selectedServiceEnvKey && detectCategoryFromText(textRaw)){
+        await executeChooseService({ candidates: aiObj?.action_params?.candidates || [], category: detectCategoryFromText(textRaw) }, sessionData, phone, sock, jid, textRaw)
+      } else if (!sessionData.selectedServiceEnvKey && /\buñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul|pesta|ceja|brow|lash/i.test(textRaw)){
         await executeChooseService({ candidates: aiObj?.action_params?.candidates || [] }, sessionData, phone, sock, jid, textRaw)
       } else {
         await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
@@ -1694,15 +1431,9 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v28.0.0`)
-const server = app.listen(PORT, ()=>{ startBot().catch(console.error) })
+console.log(`🩷 Gapink Nails Bot v27.3.0`)
+app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
-process.on("SIGTERM", ()=>{ try{server.close()}catch{} process.exit(0) })
-process.on("SIGINT", ()=>{ try{server.close()}catch{} process.exit(0) })
-
-// ====== Helpers restantes usados arriba
-function resolveEnvKeyFromLabelAndSede(label, sedeKey){
-  const list = servicesForSedeKeyRaw(sedeKey)
-  return list.find(s=>s.label.toLowerCase()===String(label||"").toLowerCase())?.key || null
-}
+process.on("SIGTERM", ()=>{ process.exit(0) })
+process.on("SIGINT", ()=>{ process.exit(0) })
