@@ -5,6 +5,8 @@
 // • Pre-intercept “con {nombre}” (cuando ya hay sede/servicio) para forzar propuesta de horas con esa profesional.
 // • Al elegir una hora, se conserva el teamMemberId exacto del slot. Si no está permitido, se descarta y no se muestra.
 // • Limpieza de TitleCase y normalización sin romper caracteres españoles.
+// • Un "." en el chat silencia las respuestas durante 6h en ese chat.
+// • Si no hay ficha (0) o hay 2+, se pide la identidad **justo tras confirmar** y se finaliza la reserva cuando responda.
 
 import express from "express"
 import pino from "pino"
@@ -65,7 +67,6 @@ const norm = s => rm(s).toLowerCase().replace(/[+.,;:()/_-]/g," ").replace(/[^\p
 // 👉 Restaurar tildes/ñ y arreglar faltas comunes SOLO para mostrar
 function applySpanishDiacritics(label){
   let x = String(label||"")
-  // Forzamos ñ/acentos en palabras típicas del salón
   x = x.replace(/\bunas\b/gi, m => m[0] === 'U' ? 'Uñas' : 'uñas')
   x = x.replace(/\bpestan(as?|)\b/gi, (m, suf) => (m[0]==='P'?'Pestañ':'pestañ') + (suf||''))
   x = x.replace(/\bnivelacion\b/gi, m => m[0]==='N' ? 'Nivelación' : 'nivelación')
@@ -77,18 +78,12 @@ function applySpanishDiacritics(label){
     const out = base + (plural ? 's' : '')
     return cap ? out[0].toUpperCase()+out.slice(1) : out
   })
-  x = x.replace(/\bfrances\b/gi, m => m[0]==='F' ? 'Francés' : 'francés') // solo “francés”, no “francesa”
-  x = x.replace(/\bmas\b/gi, (m) => {
-    // “mas” → “más” cuando no es la conjunción (aquí asumimos que casi siempre es “más”)
-    return m[0]==='M' ? 'Más' : 'más'
-  })
+  x = x.replace(/\bfrances\b/gi, m => m[0]==='F' ? 'Francés' : 'francés')
+  x = x.replace(/\bmas\b/gi, (m) => (m[0]==='M' ? 'Más' : 'más'))
   x = x.replace(/\bsemi ?permanente\b/gi, m => /[A-Z]/.test(m[0]) ? 'Semipermanente' : 'semipermanente')
-  x = x.replace(/\bninas\b/gi, 'niñas') // por si acaso
-  // Ajustes específicos frecuentes
+  x = x.replace(/\bninas\b/gi, 'niñas')
   x = x.replace(/Esculpid(a|as)\b/gi, (m)=> {
-    // mantener capitalización inicial
-    const cap = /[A-Z]/.test(m[0])
-    const suf = m.endsWith('as') ? 'as' : 'a'
+    const cap = /[A-Z]/.test(m[0]); const suf = m.endsWith('as') ? 'as' : 'a'
     return (cap?'E':'e') + 'sculpid' + suf
   })
   return x
@@ -267,7 +262,24 @@ function parseEmployees(){
     const [id, book, locs] = String(v||"").split("|")
     if (!id) continue
     const bookable = (book||"").toUpperCase()==="BOOKABLE"
-    const allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
+    let allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
+
+    const empKey = "EMP_CENTER_" + k.replace(/^SQ_EMP_/, "")
+    const empVal = process.env[empKey]
+    if (empVal) {
+      const centers = String(empVal).split(",").map(s=>s.trim().toLowerCase()).filter(Boolean)
+      if (centers.some(c => c === "all")) {
+        allow = ["ALL"]
+      } else {
+        const normCenter = c => (c==="la luz" ? "la_luz" : c)
+        const ids = centers
+          .map(c => normCenter(c))
+          .map(centerKey => locationToId(centerKey))
+          .filter(Boolean)
+        if (ids.length) allow = ids
+      }
+    }
+
     const labels = deriveLabelsFromEnvKey(k)
     out.push({ envKey:k, id, bookable, allow, labels })
   }
@@ -310,7 +322,6 @@ function servicesForSedeKeyRaw(sedeKey){
     if (!k.startsWith(prefix)) continue
     const [id] = String(v||"").split("|"); if (!id) continue
     const raw = k.replace(prefix,"").replaceAll("_"," ")
-    // TitleCase y luego arreglos españoles
     let label = titleCase(raw)
     label = applySpanishDiacritics(label)
     out.push({ sedeKey, key:k, id, rawKey:k, label: cleanDisplayLabel(label), norm: norm(label) })
@@ -399,7 +410,7 @@ async function getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid){
   if (matches.length === 0){
     sessionData.stage = "awaiting_identity"
     saveSession(phone, sessionData)
-    await sock.sendMessage(jid, { text: "No encuentro tu ficha por este número. Dime tu *nombre completo* y, si quieres, tu *email* para crearte 😊" })
+    await sock.sendMessage(jid, { text: "Para terminar, no encuentro tu ficha por este número. Dime tu *nombre completo* y, si quieres, tu *email* para crearte 😊" })
     return { status:"need_new" }
   }
   const choices = matches.map((c,i)=>({
@@ -411,7 +422,7 @@ async function getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid){
   sessionData.stage = "awaiting_identity_pick"
   saveSession(phone, sessionData)
   const lines = choices.map(ch => `${ch.index}) ${ch.name} ${ch.email!=="—" ? `(${ch.email})`:""}`).join("\n")
-  await sock.sendMessage(jid, { text: `He encontrado varias fichas con tu número. ¿Cuál eres?\n\n${lines}\n\nResponde con el número.` })
+  await sock.sendMessage(jid, { text: `Para terminar, he encontrado varias fichas con tu número. ¿Cuál eres?\n\n${lines}\n\nResponde con el número.` })
   return { status:"need_pick" }
 }
 async function findOrCreateCustomerWithRetry({ name, email, phone }){
@@ -542,7 +553,6 @@ async function searchAvailabilityForStaff({ locationKey, envServiceKey, staffId,
       if (distinctDays){
         const key=d.format("YYYY-MM-DD"); if (seenDays.has(key)) continue; seenDays.add(key)
       }
-      // Asegurar que este staff puede en la sede
       if (!isStaffAllowedInLocation(staffId, locationKey)) continue
       slots.push({ date:d, staffId })
       if (slots.length>=n) break
@@ -573,7 +583,6 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
       if (distinctDays){
         const key=d.format("YYYY-MM-DD"); if (seenDays.has(key)) continue; seenDays.add(key)
       }
-      // Filtrar huecos de staff no permitido en esa sede (evita “te propongo con Desi” y luego “no disponible”)
       if (tm && !isStaffAllowedInLocation(tm, locationKey)) continue
       slots.push({ date:d, staffId: tm || null })
       if (slots.length>=n) break
@@ -651,7 +660,6 @@ function buildLocalFallback(userMessage, sessionData){
 
 // ====== Roster para el prompt (IA ve TODO)
 function staffRosterForPrompt(){
-  // Estructura compacta: id | nombres/aliases | sedes permitidas | bookable
   return EMPLOYEES.map(e=>{
     const locs = e.allow.map(id=> id===LOC_TORRE?"torremolinos" : id===LOC_LUZ?"la_luz" : id).join(",")
     return `• ID:${e.id} | Nombres:[${e.labels.join(", ")}] | Sedes:[${locs||"ALL"}] | Reservable:${e.bookable}`
@@ -707,14 +715,12 @@ FORMATO:
 async function getAIResponse(userMessage, sessionData, phone) {
   const systemPrompt = buildSystemPrompt();
 
-  // Historial reciente
   const recent = db.prepare(`SELECT user_message, ai_response FROM ai_conversations WHERE phone = ? ORDER BY timestamp DESC LIMIT 6`).all(phone);
   const conversationHistory = recent.reverse().map(msg => [
     { role: "user", content: msg.user_message },
     { role: "assistant", content: msg.ai_response }
   ]).flat();
 
-  // Contexto de sesión
   const sessionContext = `
 ESTADO:
 - Sede: ${sessionData?.sede || 'no seleccionada'}
@@ -764,6 +770,14 @@ function parseSede(text){
   return null
 }
 
+// 👉 parse básico para nombre/email en texto libre
+function parseNameEmailFromText(txt){
+  const emailMatch = String(txt||"").match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)
+  const email = emailMatch ? emailMatch[0] : null
+  const name = String(txt||"").replace(email||"", "").replace(/(email|correo)[:\s]*/ig,"").trim()
+  return { name: name || null, email }
+}
+
 // ====== Menú de uñas
 function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates){
   const nails = nailsServicesForSede(sedeKey, userMsg)
@@ -811,7 +825,6 @@ async function executeChooseService(params, sessionData, phone, sock, jid, userM
 
 // ====== Proponer horas
 function proposeSlots({ fromEU, durationMin=60, n=3 }){
-  // Simple fallback: 3 próximas franjas redondeadas a SLOT_MIN a partir de apertura
   const out=[]
   let t = ceilToSlotEU(fromEU.clone())
   while (out.length<n){
@@ -836,7 +849,6 @@ async function executeProposeTime(_params, sessionData, phone, sock, jid) {
   }
   if (!slots.length) {
     const generic = await searchAvailabilityGeneric({ locationKey: sessionData.sede, envServiceKey: sessionData.selectedServiceEnvKey, fromEU: baseFrom, n: 3 })
-    // ya viene filtrado por isStaffAllowedInLocation
     slots = generic
   }
   if (!slots.length) {
@@ -845,7 +857,6 @@ async function executeProposeTime(_params, sessionData, phone, sock, jid) {
   }
   if (!slots.length) { await sendWithPresence(sock, jid, "No encuentro horarios disponibles en los próximos días. ¿Otra fecha?"); return; }
 
-  // Filtra por staff permitido también aquí por si acaso
   slots = slots.filter(s => !s.staffId || isStaffAllowedInLocation(s.staffId, sessionData.sede))
 
   const hoursEnum = enumerateHours(slots.map(s => s.date))
@@ -885,11 +896,9 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   let staffId = sessionData.lastProposeUsedPreferred ? (sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null)
                                                     : (sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null)
 
-  // Si el staff del slot no está permitido en la sede, no seguimos con él
   if (staffId && !isStaffAllowedInLocation(staffId, sessionData.sede)) {
     staffId = null
   }
-
   if (!staffId) {
     const probe = await searchAvailabilityGeneric({ locationKey: sessionData.sede, envServiceKey: sessionData.selectedServiceEnvKey, fromEU: startEU.clone().subtract(1, "minute"), days: 1, n: 10 })
     const match = probe.find(x => x.date.isSame(startEU, "minute"))
@@ -898,15 +907,27 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
   if (!staffId) { await sendWithPresence(sock, jid, "No hay profesionales disponibles en esa sede"); return; }
 
-  const { status, customer } = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid) || {}
-  if (status === "need_new" || status === "need_pick") return
+  // === Identidad justo después de confirmar ===
+  // 1) Si ya la resolvimos (por respuesta del cliente), usarla.
+  let customerId = sessionData.identityResolvedCustomerId || null
 
-  let customerId = customer?.id
+  // 2) Si no, buscamos por teléfono. Si 0 o 2+, preguntamos ahora y esperamos la respuesta del cliente.
+  if (!customerId){
+    const { status, customer } = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid) || {}
+    if (status === "need_new" || status === "need_pick") {
+      // Se preguntó al cliente y quedamos a la espera. La próxima respuesta completará la reserva.
+      return
+    }
+    customerId = customer?.id || null
+  }
+
+  // 3) Si aún no hay customerId pero tenemos nombre/email previos, intentamos crear.
   if (!customerId && (sessionData.name || sessionData.email)){
     const created = await findOrCreateCustomerWithRetry({ name: sessionData.name, email: sessionData.email, phone })
-    if (!created){ await sendWithPresence(sock, jid, "No pude crear tu ficha de cliente. Intenta de nuevo o contacta al salón."); return }
-    customerId = created.id
+    if (created) customerId = created.id
   }
+
+  // 4) Si sigue sin haber customerId, pedimos identidad (último recurso) y aguardamos.
   if (!customerId){
     sessionData.stage = "awaiting_identity"
     saveSession(phone, sessionData)
@@ -1086,7 +1107,6 @@ function parsePreferredStaffFromText(text){
   const m = t.match(/\bcon\s+([a-zñáéíóú]+)\b/i)
   if (!m) return null
   const token = m[1]
-  // Busca por alias en labels del roster
   for (const e of EMPLOYEES){
     for (const lbl of e.labels){
       if (norm(lbl).includes(token)) return e
@@ -1120,8 +1140,9 @@ async function startBot(){
 
     sock.ev.on("messages.upsert", async ({messages})=>{
       const m=messages?.[0]; 
-      if (!m?.message || m.key.fromMe) return
+      if (!m?.message) return
       const jid = m.key.remoteJid
+      const isFromMe = !!m.key.fromMe
       const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
       const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
       if (!textRaw) return
@@ -1134,13 +1155,71 @@ async function startBot(){
             name: null, email: null, last_msg_id: null, lastStaffByIso: {},
             lastProposeUsedPreferred: false, stage: null, cancelList: null,
             serviceChoices: null, identityChoices: null, pendingCategory: null,
-            lastStaffNamesById: null
+            lastStaffNamesById: null,
+            snooze_until_ms: null,
+            identityResolvedCustomerId: null
           }
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
 
+          // === MUTE BY "." ===
+          const trimmed = textRaw.trim()
+          const nowEU = dayjs().tz(EURO_TZ)
+          if (trimmed === ".") {
+            sessionData.snooze_until_ms = nowEU.add(6, "hour").valueOf()
+            saveSession(phone, sessionData)
+            return
+          }
+          if (sessionData.snooze_until_ms && nowEU.valueOf() < sessionData.snooze_until_ms) {
+            saveSession(phone, sessionData)
+            return
+          }
+          if (isFromMe) { saveSession(phone, sessionData); return }
+
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
+
+          // === PRE-INTERCEPT: identidad (varias fichas) ===
+          if (sessionData.stage==="awaiting_identity_pick"){
+            if (!numMatch){
+              await sendWithPresence(sock, jid, "Responde con el número de tu ficha (1, 2, ...).")
+              return
+            }
+            const n = Number(numMatch[1])
+            const choice = (sessionData.identityChoices||[]).find(c=>c.index===n)
+            if (!choice){
+              await sendWithPresence(sock, jid, "No encontré esa opción. Prueba con el número de la lista.")
+              return
+            }
+            sessionData.identityResolvedCustomerId = choice.id
+            sessionData.stage = null
+            saveSession(phone, sessionData)
+            await sendWithPresence(sock, jid, "¡Gracias! Finalizo tu reserva…")
+            await executeCreateBooking({}, sessionData, phone, sock, jid)
+            return
+          }
+
+          // === PRE-INTERCEPT: identidad (crear nueva) ===
+          if (sessionData.stage==="awaiting_identity"){
+            const { name, email } = parseNameEmailFromText(textRaw)
+            if (!name && !email){
+              await sendWithPresence(sock, jid, "Dime tu *nombre completo* y, si quieres, tu *email* 😊")
+              return
+            }
+            if (name) sessionData.name = name
+            if (email) sessionData.email = email
+            const created = await findOrCreateCustomerWithRetry({ name: sessionData.name, email: sessionData.email, phone })
+            if (!created){
+              await sendWithPresence(sock, jid, "No pude crear tu ficha. ¿Puedes repetir tu *nombre* y (opcional) tu *email*?")
+              return
+            }
+            sessionData.identityResolvedCustomerId = created.id
+            sessionData.stage = null
+            saveSession(phone, sessionData)
+            await sendWithPresence(sock, jid, "¡Gracias! Finalizo tu reserva…")
+            await executeCreateBooking({}, sessionData, phone, sock, jid)
+            return
+          }
 
           // === PRE-INTERCEPT: sede si estamos esperando para servicios ===
           if (sessionData.stage==="awaiting_sede_for_services"){
@@ -1161,7 +1240,6 @@ async function startBot(){
             if (dayjs.isDayjs(pick)){
               const iso = pick.format("YYYY-MM-DDTHH:mm")
               const staffFromIso = sessionData?.lastStaffByIso?.[iso] || null
-              // No aceptamos staff no permitido en la sede
               if (staffFromIso && !isStaffAllowedInLocation(staffFromIso, sessionData.sede)) {
                 await sendWithPresence(sock, jid, "Esa hora ya no está disponible con esa profesional en esa sede. Te paso otras opciones 👇")
                 await executeProposeTime({}, sessionData, phone, sock, jid)
@@ -1191,7 +1269,7 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT: “con {nombre}” → proponer horas de esa pro si ya hay sede/servicio
+          // === PRE-INTERCEPT: “con {nombre}” → proponer horas con esa pro
           if (sessionData.sede && sessionData.selectedServiceEnvKey){
             const maybe = parsePreferredStaffFromText(textRaw)
             if (maybe && isStaffAllowedInLocation(maybe.id, sessionData.sede)){
@@ -1203,7 +1281,6 @@ async function startBot(){
             }
           }
 
-          // Intención de cancelar — saltar IA
           if (isCancelIntent(textRaw) && sessionData.stage!=="awaiting_cancel"){
             await executeCancelAppointment({}, sessionData, phone, sock, jid)
             return
@@ -1211,13 +1288,10 @@ async function startBot(){
 
           // IA normal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
-
-          // Resolver envKey si ya hay sede + label
           if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
             const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
             if (ek) aiObj.session_updates.selectedServiceEnvKey = ek
           }
-
           await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
 
         } catch (error) {
@@ -1237,8 +1311,6 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
       }
     })
   }
-
-  // Si la IA puso label pero no envKey y ya hay sede → resolvemos envKey
   if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
     const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
     if (ek) sessionData.selectedServiceEnvKey = ek
@@ -1268,7 +1340,6 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     case "need_info":
     case "none":
     default:
-      // Si el usuario habló de uñas y la IA no disparó choose_service, lo forzamos amistosamente
       if (!sessionData.selectedServiceEnvKey && /\buñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul/i.test(textRaw)){
         await executeChooseService({ candidates: aiObj?.action_params?.candidates || [] }, sessionData, phone, sock, jid, textRaw)
       } else {
