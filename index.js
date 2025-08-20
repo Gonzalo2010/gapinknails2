@@ -1,10 +1,10 @@
-// index.js — Gapink Nails · v27.3.0 (additive sobre v27.2.0.0)
-// Cambios ADD-ONLY:
-// • Categorías: uñas / pestañas / cejas (detector + menús por sede).
-// • Intercept numérico al elegir servicio (stage "awaiting_service_choice").
-// • Anti-spam del mensaje de error técnico (cooldown 20s).
-// • “pedicura” añadido al detector de pedicura.
-// • System prompt actualizado para categorías (sin quitar reglas previas).
+// index.js — Gapink Nails · v27.2.1
+// Cambios clave respecto a v27.2.0.0:
+// • Pregunta de categoría (uñas/pestañas/cejas) si no está clara antes de listar servicios.
+// • Menús filtrados por categoría y sede (uñas/pestañas/cejas).
+// • Anti-spam para “Disculpa, hubo un error técnico...”
+// • Arreglo de ReferenceError (sessionData en catch).
+// • Mantiene: tildes/ñ en etiquetas, staff por sede, “con {nombre}”, slots válidos, identidad diferida, “.” para silenciar, etc.
 
 import express from "express"
 import pino from "pino"
@@ -262,6 +262,7 @@ function parseEmployees(){
     const bookable = (book||"").toUpperCase()==="BOOKABLE"
     let allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
 
+    // Compat extra: EMP_CENTER_SQ_EMP_* = "all" | "la luz, torremolinos"
     const empKey = "EMP_CENTER_" + k.replace(/^SQ_EMP_/, "")
     const empVal = process.env[empKey]
     if (empVal) {
@@ -333,23 +334,29 @@ function serviceLabelFromEnvKey(envKey){
 }
 function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...servicesForSedeKeyRaw("la_luz")] }
 
-// ====== (ADD) Clasificación de categorías
+// ====== Categorías y clasificación
 const CATEGORY = { NAILS: "uñas", LASHES: "pestañas", BROWS: "cejas" }
+
+// uñas
 const POS_NAIL_ANCHORS = [
   "uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente",
-  "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte"
+  "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte","pedicura","pies","pie"
 ]
+const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash"]
+// pestañas
 const POS_LASH_ANCHORS = [
-  "pesta","pestañ","pestanas","pestañas","lash","extens","volumen","lifting","rizado","laminado pestañas","2d","3d","4d","hibridas","híbridas","retirar pestañas","relleno pestañas"
+  "pesta","pestañ","pestanas","pestañas","lash","extens","volumen",
+  "lifting","rizado","laminado pestañas","2d","3d","4d","hibridas","híbridas",
+  "retirar pestañas","relleno pestañas"
 ]
-const POS_BROW_ANCHORS = [
-  "ceja","cejas","diseño cejas","diseño de cejas","depilacion cejas","depilación cejas","henna","laminado cejas","brow","brow lift","perfilado cejas","tinte cejas"
-]
-const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash","brow"]
 const NEG_NOT_LASHES = ["uña","unas","uñas","manicura","ceja","cejas","pedicura","pie","pies","brow"]
+// cejas
+const POS_BROW_ANCHORS = [
+  "ceja","cejas","diseño cejas","diseño de cejas","depilacion cejas","depilación cejas",
+  "henna","laminado cejas","brow","brow lift","perfilado cejas","tinte cejas"
+]
 const NEG_NOT_BROWS  = ["uña","unas","uñas","manicura","pesta","pestañ","pestanas","pestañas","lash","ojos"]
 
-// (ADD) pedicura con ‘a’ incluida
 function shouldIncludePedicure(userMsg){
   return /\b(pedicur|pedicura|pies|pie)\b/i.test(String(userMsg||""))
 }
@@ -384,23 +391,25 @@ function nailsServicesForSede(sedeKey, userMsg){
   const filtered = list.filter(s=>isNailsLabel(s.norm, allowPedi))
   return uniqueByLabel(filtered)
 }
-// (ADD)
 function lashesServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
   return uniqueByLabel(list.filter(s=>isLashesLabel(s.norm)))
 }
-// (ADD)
 function browsServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
   return uniqueByLabel(list.filter(s=>isBrowsLabel(s.norm)))
 }
-// (ADD)
 function detectCategoryFromText(txt){
   const t = norm(txt||"")
   if (/\b(ceja|cejas|brow)\b/.test(t)) return CATEGORY.BROWS
   if (/\b(pesta|pestañ|pestanas|pestañas|lash|extens|lifting)\b/.test(t)) return CATEGORY.LASHES
-  if (/\b(uñ|unas|uñas|manicura|gel|acrilic|acrilico|acrílico)\b/.test(t)) return CATEGORY.NAILS
+  if (/\b(uñ|unas|uñas|manicura|gel|acrilic|acrilico|acrílico|pedicura|pies|pie)\b/.test(t)) return CATEGORY.NAILS
   return null
+}
+function servicesByCategoryForSede(sedeKey, category, userMsg){
+  if (category === CATEGORY.LASHES) return lashesServicesForSede(sedeKey)
+  if (category === CATEGORY.BROWS)  return browsServicesForSede(sedeKey)
+  return nailsServicesForSede(sedeKey, userMsg)
 }
 
 function scoreServiceRelevance(userMsg, label){
@@ -411,12 +420,10 @@ function scoreServiceRelevance(userMsg, label){
   if (/\bgel\b/.test(u) && l.includes("gel")) score += 2.5
   if (/\bsemi|semipermanente\b/.test(u) && l.includes("semi")) score += 2
   if (/\brelleno\b/.test(u) && (l.includes("uña") || l.includes("manicura") || l.includes("gel") || l.includes("acril"))) score += 2
-  // pestañas / cejas
-  if (/\b(pesta|pestañ|pestanas|pestañas|lash)\b/.test(u) && /\b(pesta|pestañ|pestanas|pestañas|lash)\b/.test(l)) score += 3
-  if (/\b(2d|3d|4d|volumen|lifting|laminado)\b/.test(u) && /\b(2d|3d|4d|volumen|lifting|laminado)\b/.test(l)) score += 2.5
-  if (/\brelleno\b/.test(u) && l.includes("pesta")) score += 2
-  if (/\b(ceja|cejas|brow)\b/.test(u) && /\b(ceja|cejas|brow)\b/.test(l)) score += 3
-  if (/\b(laminado|diseño|henna|tinte|perfilado)\b/.test(u) && /\b(laminado|diseño|henna|tinte|perfilado)\b/.test(l)) score += 2.5
+  if (/\bretir(ar|o)\b/.test(u) && (l.includes("retir")||l.includes("retiro"))) score += 1.5
+  if (/\bpress\b/.test(u) && l.includes("press")) score += 1.2
+  const tokens = ["natural","francesa","frances","decoracion","diseño","extra","exprés","express","completa","nivelacion","nivelación"]
+  for (const t of tokens){ if (u.includes(norm(t)) && l.includes(norm(t))) score += 0.4 }
   const utoks = new Set(u.split(" ").filter(Boolean))
   const ltoks = new Set(l.split(" ").filter(Boolean))
   let overlap=0; for (const t of utoks){ if (ltoks.has(t)) overlap++ }
@@ -655,7 +662,6 @@ async function callAIWithRetries(messages, systemPrompt=""){
   return null
 }
 
-// ====== Fallback local (ADD: categorías + mantener lo anterior)
 function buildLocalFallback(userMessage, sessionData){
   const msg = String(userMessage||"").trim()
   const lower = norm(msg)
@@ -663,7 +669,6 @@ function buildLocalFallback(userMessage, sessionData){
   const yesMatch = /\b(si|sí|ok|vale|confirmo|de\ acuerdo)\b/i.test(msg)
   const cancelMatch = /\b(cancelar|anular|borra|elimina)\b/i.test(lower)
   const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
-  const bookMatch = /\b(reservar|cita|quiero.*(cita|reservar))\b/i.test(lower)
 
   const hasCore = (s)=> s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime
 
@@ -690,15 +695,16 @@ function buildLocalFallback(userMessage, sessionData){
   if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")) return { message:"Vale, te enseño tus citas para cancelar:", action:"cancel_appointment", session_updates:{}, action_params:{} }
   if (listMatch) return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
 
-  // (ADD) Detección de categoría local si aún no hay servicio
+  // 👇 NUEVO: si no hay servicio elegido, primero intentamos detectar categoría; si no, preguntamos explícitamente
   if (!sessionData?.selectedServiceEnvKey){
     const cat = detectCategoryFromText(msg)
     if (cat){
-      return { message:`Elige tu servicio de ${cat}:`, action:"choose_service", session_updates:{ stage:"awaiting_service_choice", pendingCategory: cat }, action_params:{ candidates:[] } }
+      return { message:`Te muestro opciones de ${cat}.`, action:"choose_service", session_updates:{ stage:"awaiting_service_choice", pendingCategory:cat }, action_params:{ candidates:[], category:cat } }
     }
+    return { message:"¿Qué te quieres hacer exactamente: *uñas*, *pestañas* o *cejas*? (puedes escribir el servicio concreto)", action:"need_info", session_updates:{ stage:"awaiting_category" }, action_params:{} }
   }
 
-  return { message:"¿Quieres reservar, cancelar o ver tus citas? Si es para reservar, dime sede y si es de *uñas, pestañas o cejas*.", action:"none", session_updates:{}, action_params:{} }
+  return { message:"¿Quieres reservar, cancelar o ver tus citas?", action:"none", session_updates:{}, action_params:{} }
 }
 
 // ====== Roster para el prompt (IA ve TODO)
@@ -739,15 +745,16 @@ ${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 
 REGLAS CLAVE:
 1) Identidad: NO pidas nombre/email si el número existe (match único). Solo si no existe o hay duplicados.
-2) Categoría: distingue *uñas / pestañas / cejas*. Si el cliente habla de una categoría → "choose_service" de esa categoría. No mezcles categorías.
+2) Categoría: distingue uñas / pestañas / cejas. Si el cliente NO especifica, pide la categoría antes de listar. Si la especifica, lista directamente la correcta.
 3) Sede: si no hay sede, pídela antes de listar servicios.
 4) Si el cliente escribe 1/2/3 para horas → selección directa (usa lastHours).
 5) Cancelar: usa el número del chat para listar y cancelar.
 6) Para crear reserva: sede + servicio + fecha/hora. La identidad se resuelve por teléfono.
-7) “con {nombre}”: forzar propuesta con esa profesional si está permitida en la sede.
+7) “con {nombre}”: forzar propuesta con esa profesional si está permitida en la sede. Si no, ofrece alternativas válidas (otras profesionales de esa sede).
+8) Nunca propongas slots de una profesional no permitida en esa sede.
 
 FORMATO:
-{"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{"category":"uñas|pestañas|cejas","candidates":[{"label":"...","confidence":0.0}]}}`
+{"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{...}}`
 }
 
 async function getAIResponse(userMessage, sessionData, phone) {
@@ -766,6 +773,7 @@ ESTADO:
 - Profesional preferida: ${sessionData?.preferredStaffLabel || 'ninguna'}
 - Fecha/hora pendiente: ${sessionData?.pendingDateTime ? fmtES(parseToEU(sessionData.pendingDateTime)) : 'no seleccionada'}
 - Etapa: ${sessionData?.stage || 'inicial'}
+- Categoría pendiente: ${sessionData?.pendingCategory || '—'}
 - Últimas horas propuestas: ${Array.isArray(sessionData?.lastHours) ? sessionData.lastHours.length + ' opciones' : 'ninguna'}
 `;
 
@@ -779,21 +787,6 @@ ESTADO:
 
   const cleaned = aiText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").replace(/^[^{]*/, "").replace(/[^}]*$/, "").trim()
   try { return JSON.parse(cleaned) } catch { return buildLocalFallback(userMessage, sessionData) }
-}
-
-// ====== Bot principal
-let RECONNECT_SCHEDULED = false
-let RECONNECT_ATTEMPTS = 0
-const QUEUE=new Map()
-function enqueue(key,job){
-  const prev=QUEUE.get(key)||Promise.resolve()
-  const next=prev.then(job,job).finally(()=>{ if (QUEUE.get(key)===next) QUEUE.delete(key) })
-  QUEUE.set(key,next); return next
-}
-async function sendWithPresence(sock, jid, text){
-  try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
-  await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
-  return sock.sendMessage(jid, { text })
 }
 
 // ====== Helpers chat
@@ -816,14 +809,7 @@ function parseNameEmailFromText(txt){
   return { name: name || null, email }
 }
 
-// ====== (ADD) selector por categoría
-function servicesByCategoryForSede(sedeKey, category, userMsg){
-  if (category === CATEGORY.LASHES) return lashesServicesForSede(sedeKey)
-  if (category === CATEGORY.BROWS)  return browsServicesForSede(sedeKey)
-  return nailsServicesForSede(sedeKey, userMsg)
-}
-
-// ====== Menú de uñas/lashes/cejas (EXTENSIÓN ADD-ONLY)
+// ====== Menú de servicios (por categoría)
 function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates, category=CATEGORY.NAILS){
   const list = servicesByCategoryForSede(sedeKey, category, userMsg)
   const localScores = new Map()
@@ -844,24 +830,12 @@ function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates, category=C
   return final.map((s,i)=>({ index:i+1, label:s.label, envKey:s.key }))
 }
 
-// ====== Proponer horas (SIN CAMBIO)
-function proposeSlots({ fromEU, durationMin=60, n=3 }){
-  const out=[]
-  let t = ceilToSlotEU(fromEU.clone())
-  while (out.length<n){
-    if (insideBusinessHours(t, durationMin)) out.push(t.clone())
-    t = t.add(SLOT_MIN, "minute")
-    if (t.hour()>=OPEN.end) { t = nextOpeningFrom(t) }
-  }
-  return out
-}
-
-// ====== Elegir servicio (AMPLIADA con categorías, manteniendo firma)
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
+  // category desde IA / texto / sesión
   const aiCat = (params?.category || "").toLowerCase()
   const detected = detectCategoryFromText(userMsg||"")
   const category = aiCat.includes("ceja") ? CATEGORY.BROWS
-                 : aiCat.includes("pesta")||aiCat.includes("lash") ? CATEGORY.LASHES
+                 : (aiCat.includes("pesta")||aiCat.includes("lash")) ? CATEGORY.LASHES
                  : aiCat.includes("uña") ? CATEGORY.NAILS
                  : sessionData.pendingCategory || detected || CATEGORY.NAILS
 
@@ -889,7 +863,18 @@ async function executeChooseService(params, sessionData, phone, sock, jid, userM
   await sendWithPresence(sock, jid, `Estas son nuestras opciones de **${category}** en ${locationNice(sessionData.sede)}:\n\n${lines}\n\nResponde con el número.`)
 }
 
-// ====== Proponer horas (SIN CAMBIO en firma)
+// ====== Proponer horas
+function proposeSlots({ fromEU, durationMin=60, n=3 }){
+  const out=[]
+  let t = ceilToSlotEU(fromEU.clone())
+  while (out.length<n){
+    if (insideBusinessHours(t, durationMin)) out.push(t.clone())
+    t = t.add(SLOT_MIN, "minute")
+    if (t.hour()>=OPEN.end) { t = nextOpeningFrom(t) }
+  }
+  return out
+}
+
 async function executeProposeTime(_params, sessionData, phone, sock, jid) {
   const nowEU = dayjs().tz(EURO_TZ);
   const baseFrom = nextOpeningFrom(nowEU.add(NOW_MIN_OFFSET_MIN, "minute"));
@@ -938,7 +923,7 @@ async function executeProposeTime(_params, sessionData, phone, sock, jid) {
   await sendWithPresence(sock, jid, `${header}\n${lines}\n\nResponde con el número (1, 2 o 3)`)
 }
 
-// ====== Crear reserva (SIN CAMBIO)
+// ====== Crear reserva
 async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!sessionData.sede) { await sendWithPresence(sock, jid, "Falta seleccionar la sede (Torremolinos o La Luz)"); return; }
   if (!sessionData.selectedServiceEnvKey) { await sendWithPresence(sock, jid, "Falta seleccionar el servicio"); return; }
@@ -963,21 +948,26 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!staffId) { await sendWithPresence(sock, jid, "No hay profesionales disponibles en esa sede"); return; }
 
   // === Identidad justo después de confirmar ===
+  // 1) Si ya la resolvimos (por respuesta del cliente), usarla.
   let customerId = sessionData.identityResolvedCustomerId || null
 
+  // 2) Si no, buscamos por teléfono. Si 0 o 2+, preguntamos ahora y esperamos la respuesta del cliente.
   if (!customerId){
     const { status, customer } = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid) || {}
     if (status === "need_new" || status === "need_pick") {
+      // Se preguntó al cliente y quedamos a la espera. La próxima respuesta completará la reserva.
       return
     }
     customerId = customer?.id || null
   }
 
+  // 3) Si aún no hay customerId pero tenemos nombre/email previos, intentamos crear.
   if (!customerId && (sessionData.name || sessionData.email)){
     const created = await findOrCreateCustomerWithRetry({ name: sessionData.name, email: sessionData.email, phone })
     if (created) customerId = created.id
   }
 
+  // 4) Si sigue sin haber customerId, pedimos identidad (último recurso) y aguardamos.
   if (!customerId){
     sessionData.stage = "awaiting_identity"
     saveSession(phone, sessionData)
@@ -1031,7 +1021,7 @@ Referencia: ${result.booking.id}
   clearSession(phone);
 }
 
-// ====== Listar/cancelar por teléfono (SIN CAMBIO)
+// ====== Listar/cancelar por teléfono
 async function enumerateCitasByPhone(phone){
   const items=[]
   let cid=null
@@ -1098,51 +1088,25 @@ async function executeCancelAppointment(params, sessionData, phone, sock, jid) {
   saveSession(phone, sessionData)
 }
 
-// ====== Mini-web + QR (SIN CAMBIO salvo versión visual)
-const app=express()
-const PORT=process.env.PORT||8080
-let lastQR=null, conectado=false
-app.get("/", (_req,res)=>{
-  const totalAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments`).get()?.count || 0
-  const successAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'confirmed'`).get()?.count || 0
-  const failedAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'failed'`).get()?.count || 0
-  res.send(`<!doctype html><meta charset="utf-8"><style>
-  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa}
-  .card{max-width:640px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
-  .status{padding:12px;border-radius:8px;margin:8px 0}
-  .success{background:#d4edda;color:#155724}
-  .error{background:#f8d7da;color:#721c24}
-  .warning{background:#fff3cd;color:#856404}
-  .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
-  </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.3.0</h1>
-  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
-  ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
-  <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
-  <h3>📊 Estadísticas</h3>
-  <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
-  <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v27.3.0 (add-only):</strong><br>
-    • Categorías uñas/pestañas/cejas<br>
-    • Elección de servicio por número<br>
-    • Anti-spam de error técnico<br>
-  </div>
-  </div>`)
-})
-app.get("/qr.png", async (_req,res)=>{
-  if(!lastQR) return res.status(404).send("No QR")
-  const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
-  res.set("Content-Type","image/png").send(png)
-})
-app.get("/logs", (_req,res)=>{
-  const recent = db.prepare(`SELECT * FROM square_logs ORDER BY timestamp DESC LIMIT 50`).all()
-  res.json({ logs: recent })
-})
+// ====== Bot principal
+let RECONNECT_SCHEDULED = false
+let RECONNECT_ATTEMPTS = 0
+const QUEUE=new Map()
+function enqueue(key,job){
+  const prev=QUEUE.get(key)||Promise.resolve()
+  const next=prev.then(job,job).finally(()=>{ if (QUEUE.get(key)===next) QUEUE.delete(key) })
+  QUEUE.set(key,next); return next
+}
+async function sendWithPresence(sock, jid, text){
+  try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
+  await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
+  return sock.sendMessage(jid, { text })
+}
 
-// ====== Baileys (SIN CAMBIO)
+// ====== Baileys
 async function loadBaileys(){
   const require = createRequire(import.meta.url); let mod=null
-  try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ try{ mod=await import("@whiskeysockets/baileys") }catch{} }
+  try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ mod=await import("@whiskeysockets/baileys") } 
   if(!mod) throw new Error("Baileys incompatible")
   const makeWASocket = mod.makeWASocket || mod.default?.makeWASocket || (typeof mod.default==="function"?mod.default:undefined)
   const useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
@@ -1151,7 +1115,7 @@ async function loadBaileys(){
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
 
-// 👉 Pre-intercept “con {nombre}” (smart) (SIN CAMBIO)
+// 👉 Pre-intercept “con {nombre}” (smart)
 function parsePreferredStaffFromText(text){
   const t = norm(text)
   const m = t.match(/\bcon\s+([a-zñáéíóú]+)\b/i)
@@ -1165,12 +1129,12 @@ function parsePreferredStaffFromText(text){
   return null
 }
 
-// ====== (ADD) Anti-spam error técnico
+// ====== Anti-spam para error técnico
 function shouldSendErrorNow(sessionData){
   const now = Date.now()
-  const last = Number(sessionData.last_error_ts || 0)
-  if (isNaN(last) || now - last > 20000) { // 20s cooldown
-    sessionData.last_error_ts = now
+  const last = Number(sessionData?.last_error_ts || 0)
+  if (isNaN(last) || now - last > 20000) { // 20s
+    if (sessionData) sessionData.last_error_ts = now
     return true
   }
   return false
@@ -1209,8 +1173,9 @@ async function startBot(){
       if (!textRaw) return
 
       await enqueue(phone, async ()=>{
+        let sessionData
         try {
-          let sessionData = loadSession(phone) || {
+          sessionData = loadSession(phone) || {
             greeted: false, sede: null, selectedServiceEnvKey: null, selectedServiceLabel: null,
             preferredStaffId: null, preferredStaffLabel: null, pendingDateTime: null,
             name: null, email: null, last_msg_id: null, lastStaffByIso: {},
@@ -1219,9 +1184,9 @@ async function startBot(){
             lastStaffNamesById: null,
             snooze_until_ms: null,
             identityResolvedCustomerId: null,
-            last_error_ts: 0 // (ADD)
+            last_error_ts: 0
           }
-          if (sessionData.last_msg_id === m.key.id) { saveSession(phone, sessionData); return }
+          if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
 
           // === MUTE BY "." ===
@@ -1283,6 +1248,27 @@ async function startBot(){
             return
           }
 
+          // === NUEVO: PRE-INTERCEPT categoría
+          if (sessionData.stage === "awaiting_category"){
+            const cat = detectCategoryFromText(textRaw)
+            if (!cat){
+              await sendWithPresence(sock, jid, "¿Qué te quieres hacer exactamente: *uñas*, *pestañas* o *cejas*? (o dime el servicio concreto)")
+              saveSession(phone, sessionData)
+              return
+            }
+            sessionData.pendingCategory = cat
+            sessionData.stage = null
+            saveSession(phone, sessionData)
+            if (!sessionData.sede){
+              sessionData.stage = "awaiting_sede_for_services"
+              saveSession(phone, sessionData)
+              await sendWithPresence(sock, jid, `Perfecto, ${cat}. ¿Te viene mejor *Torremolinos* o *La Luz*?`)
+              return
+            }
+            await executeChooseService({ candidates:[], category: cat }, sessionData, phone, sock, jid, textRaw)
+            return
+          }
+
           // === PRE-INTERCEPT: sede si estamos esperando para servicios ===
           if (sessionData.stage==="awaiting_sede_for_services"){
             const sede = parseSede(textRaw)
@@ -1290,16 +1276,19 @@ async function startBot(){
               sessionData.sede = sede
               sessionData.stage = null
               saveSession(phone, sessionData)
-              await executeChooseService({ candidates: [], category: sessionData.pendingCategory }, sessionData, phone, sock, jid, textRaw)
+              await executeChooseService({ candidates: [], category: sessionData.pendingCategory || undefined }, sessionData, phone, sock, jid, textRaw)
               return
             }
           }
 
-          // === (ADD) PRE-INTERCEPT: selección de SERVICIO por número
+          // === PRE-INTERCEPT: selección de servicio por número ===
           if (numMatch && sessionData.stage==="awaiting_service_choice" && Array.isArray(sessionData.serviceChoices) && sessionData.serviceChoices.length){
             const idx = Number(numMatch[1]) - 1
             const pick = sessionData.serviceChoices[idx]
-            if (!pick){ await sendWithPresence(sock, jid, "No encontré esa opción. Prueba con el número de la lista."); saveSession(phone, sessionData); return }
+            if (!pick){
+              await sendWithPresence(sock, jid, "No encontré esa opción. Prueba con el número de la lista.")
+              return
+            }
             sessionData.selectedServiceLabel = pick.label
             sessionData.selectedServiceEnvKey = resolveEnvKeyFromLabelAndSede(pick.label, sessionData.sede) || pick.envKey || null
             sessionData.stage = null
@@ -1345,7 +1334,7 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT: “con {nombre}” → proponer horas con esa pro (SIN CAMBIO)
+          // === PRE-INTERCEPT: “con {nombre}” → proponer horas con esa pro
           if (sessionData.sede && sessionData.selectedServiceEnvKey){
             const maybe = parsePreferredStaffFromText(textRaw)
             if (maybe && isStaffAllowedInLocation(maybe.id, sessionData.sede)){
@@ -1362,7 +1351,7 @@ async function startBot(){
             return
           }
 
-          // IA normal
+          // ==== IA normal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
           if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
             const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
@@ -1372,11 +1361,10 @@ async function startBot(){
 
         } catch (error) {
           if (BOT_DEBUG) console.error(error)
-          // (ADD) anti spam del error técnico
-          if (shouldSendErrorNow(sessionData)){
+          if (shouldSendErrorNow(sessionData || {})){
             await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
           }
-          saveSession(phone, sessionData)
+          saveSession(phone, sessionData || {})
         }
       })
     })
@@ -1396,13 +1384,12 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     if (ek) sessionData.selectedServiceEnvKey = ek
   }
 
-  const fallbackUsedBool = !!aiObj.__fallback_used
   insertAIConversation.run({
     phone, message_id: m.key.id, user_message: textRaw,
     ai_response: safeJSONStringify(aiObj), timestamp: new Date().toISOString(),
     session_data: safeJSONStringify(sessionData),
     ai_error: (typeof aiObj.__ai_error === "string" || aiObj.__ai_error == null) ? (aiObj.__ai_error ?? null) : safeJSONStringify(aiObj.__ai_error),
-    fallback_used: Number(fallbackUsedBool)
+    fallback_used: Number(!!aiObj.__fallback_used)
   })
   saveSession(phone, sessionData)
 
@@ -1420,18 +1407,66 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     case "need_info":
     case "none":
     default:
-      if (!sessionData.selectedServiceEnvKey && detectCategoryFromText(textRaw)){
-        await executeChooseService({ candidates: aiObj?.action_params?.candidates || [], category: detectCategoryFromText(textRaw) }, sessionData, phone, sock, jid, textRaw)
-      } else if (!sessionData.selectedServiceEnvKey && /\buñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul|pesta|ceja|brow|lash/i.test(textRaw)){
-        await executeChooseService({ candidates: aiObj?.action_params?.candidates || [] }, sessionData, phone, sock, jid, textRaw)
-      } else {
-        await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
+      // 👇 NUEVO: si aún no hay servicio elegido, intentamos detectar categoría; si no, preguntamos
+      if (!sessionData.selectedServiceEnvKey){
+        const cat = detectCategoryFromText(textRaw)
+        if (cat){
+          await executeChooseService({ candidates: aiObj?.action_params?.candidates || [], category: cat }, sessionData, phone, sock, jid, textRaw)
+          return
+        }
+        sessionData.stage = "awaiting_category"
+        saveSession(phone, sessionData)
+        await sendWithPresence(sock, jid, "¿Qué te quieres hacer exactamente: *uñas*, *pestañas* o *cejas*? (también puedes decir el servicio)")
+        return
       }
+      await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
   }
 }
 
+// ====== Mini-web + QR
+const app=express()
+const PORT=process.env.PORT||8080
+let lastQR=null, conectado=false
+app.get("/", (_req,res)=>{
+  const totalAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments`).get()?.count || 0
+  const successAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'confirmed'`).get()?.count || 0
+  const failedAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'failed'`).get()?.count || 0
+  res.send(`<!doctype html><meta charset="utf-8"><style>
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa}
+  .card{max-width:640px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
+  .status{padding:12px;border-radius:8px;margin:8px 0}
+  .success{background:#d4edda;color:#155724}
+  .error{background:#f8d7da;color:#721c24}
+  .warning{background:#fff3cd;color:#856404}
+  .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
+  </style><div class="card">
+  <h1>🩷 Gapink Nails Bot v27.2.1</h1>
+  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
+  ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
+  <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
+  <h3>📊 Estadísticas</h3>
+  <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
+  <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
+    <strong>🚀 Mejoras v27.2.1:</strong><br>
+    • Pregunta de categoría (uñas/pestañas/cejas) antes de listar si no está clara<br>
+    • Interceptores de *awaiting_category* y continuidad hacia sede → menú<br>
+    • Anti-repetición del mensaje de error técnico<br>
+  </div>
+  </div>`)
+})
+app.get("/qr.png", async (_req,res)=>{
+  if(!lastQR) return res.status(404).send("No QR")
+  const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
+  res.set("Content-Type","image/png").send(png)
+})
+app.get("/logs", (_req,res)=>{
+  const recent = db.prepare(`SELECT * FROM square_logs ORDER BY timestamp DESC LIMIT 50`).all()
+  res.json({ logs: recent })
+})
+
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v27.3.0`)
+let conectado=false
+console.log(`🩷 Gapink Nails Bot v27.2.1`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
