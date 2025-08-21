@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v27.5.4
+// index.js — Gapink Nails · v27.5.4.0
 // Cambios vs v27.5.3:
 // • FIX crítico: el servidor Express se inicia UNA sola vez (evita EADDRINUSE).
 // • Mejora UX: en “awaiting_staff_alt” acepta nombres fuera de la lista si son válidos para la sede.
