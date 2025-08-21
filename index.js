@@ -1,11 +1,10 @@
-// index.js — Gapink Nails · v27.3.1-catfix
-// Fixes clave añadidos en esta versión:
-// • Pregunta primero “¿Qué te quieres hacer: uñas, pestañas o cejas?” si no hay categoría.
-// • Menú de servicios se filtra por categoría (uñas / pestañas / cejas). No más menú de uñas cuando piden cejas/pestañas.
-// • Pre-intercepts: reconoce categoría en texto libre y la guarda en sesión.
-// • Arreglo de “sessionData is not defined” (no se usan variables fuera de scope).
-// • Sin duplicado de `conectado` (solo se declara una vez).
-// • Mantiene todas tus funciones originales. Solo se han ampliado.
+// index.js — Gapink Nails · v27.3.2-catfix2
+// Fixes de esta versión:
+// • Cambio de categoría en caliente dentro de "awaiting_service_choice" (uñas ⇄ pestañas ⇄ cejas).
+// • Menú correcto tras "Quiero cejas/pestañas" aunque estuviera mostrando uñas.
+// • Selección de servicio por número robusta (soporta "1...", "1.", etc.).
+// • Pedicura filtrada fuera de uñas salvo que el cliente la pida (detección mejorada).
+// • Mantiene reglas de staff permitido, identidad tardía y propuesta de horas con profesional preferida.
 
 // ====== Imports
 import express from "express"
@@ -338,27 +337,28 @@ function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...ser
 // ====== Clasificación de "uñas"
 const POS_NAIL_ANCHORS = [
   "uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente",
-  "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte","pedicur","pies"
+  "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte"
 ]
 const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash"]
+const PEDI_RE = /\b(pedicur\w*|pies?)\b/i // ← mejor detección de pedicura
 
 // ====== NUEVO: Clasificación por categoría
 const CATEGORY_VALUES = ["uñas","pestañas","cejas"]
 function detectCategory(text){
   const t = norm(text||"")
-  if (/\b(pesta|pestañ|eyelash|lifting|lash|2d|3d|mega|volumen|tinte)\b/.test(t)) return "pestañas"
-  if (/\b(ceja|cejas|henna|laminad|perfilad|diseñ|depilaci)\b/.test(t)) return "cejas"
-  if (POS_NAIL_ANCHORS.some(a=>t.includes(norm(a)))) return "uñas"
+  if (/\b(pesta|pestañ|eyelash|lifting|lash|volumen|2d|3d|mega|megavolumen|tinte|rizado)\b/.test(t)) return "pestañas"
+  if (/\b(ceja|cejas|henna|laminad|perfilad|diseñ|depilaci|brow)\b/.test(t)) return "cejas"
+  if (POS_NAIL_ANCHORS.some(a=>t.includes(norm(a))) || /\buñas?\b/.test(t)) return "uñas"
   return null
 }
 function shouldIncludePedicure(userMsg){
-  return /\b(pedicur|pies|pie)\b/i.test(String(userMsg||""))
+  return PEDI_RE.test(String(userMsg||""))
 }
 function isNailsLabel(labelNorm, allowPedicure){
   if (NEG_NOT_NAILS.some(n=>labelNorm.includes(norm(n)))) return false
-  const hasPos = POS_NAIL_ANCHORS.some(p=>labelNorm.includes(norm(p)))
+  const hasPos = POS_NAIL_ANCHORS.some(p=>labelNorm.includes(norm(p))) || /uñ|manicura|gel|acril|semi/.test(labelNorm)
   if (!hasPos) return false
-  const isPedi = /\b(pedicur|pies|pie)\b/.test(labelNorm)
+  const isPedi = PEDI_RE.test(labelNorm)
   if (isPedi && !allowPedicure) return false
   return true
 }
@@ -377,10 +377,10 @@ function nailsServicesForSede(sedeKey, userMsg){
   const filtered = list.filter(s=>isNailsLabel(s.norm, allowPedi))
   return uniqueByLabel(filtered)
 }
-// ====== NUEVO: Filtros pestañas/cejas
+// ====== Filtros pestañas/cejas
 function lashesServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
-  const anchors = ["pesta", "pestañ", "eyelash", "lash", "lifting", "rizado", "volumen", "2d", "3d", "megavolumen", "tinte"]
+  const anchors = ["pesta","pestañ","eyelash","lash","lifting","rizado","volumen","2d","3d","megavolumen","tinte"]
   return uniqueByLabel(list.filter(s=>anchors.some(a=>s.norm.includes(norm(a)))))
 }
 function browsServicesForSede(sedeKey){
@@ -496,7 +496,7 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
   }
   if (DRY_RUN) return { success: true, booking: { id:`TEST_SIM_${Date.now()}`, __sim:true } }
   const sv = await getServiceIdAndVersion(envServiceKey)
-  if (!sv?.id || !sv?.version) return { success: false, error: `No se pudo obtener servicio ${envServiceKey}` }
+  if (!sv?.id || !sv?.version) return { success: false, error: `No se pudo obtener servicio ${envKey}` }
   const startISO = startEU.tz("UTC").toISOString()
   const idempotencyKey = stableKey({ loc:locationToId(locationKey), sv:sv.id, startISO, customerId, teamMemberId })
   let lastError = null
@@ -684,7 +684,7 @@ ${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 
 REGLAS CLAVE:
 1) Identidad: NO pidas nombre/email si el número existe (match único). Solo si no existe o hay duplicados.
-2) “Uñas” ambiguo → acción "choose_service". Solo servicios de uñas. Pedicura solo si el cliente la menciona. 
+2) “Uñas” ambiguo → acción "choose_service". Solo uñas. Pedicura solo si el cliente la menciona.
 3) Sede: si no hay sede, pídela antes de listar servicios.
 4) Si el cliente escribe 1/2/3 para horas → selección directa (usa lastHours).
 5) Cancelar: usa el número del chat para listar y cancelar.
@@ -766,7 +766,6 @@ function buildLocalFallback(userMessage, sessionData){
     return { message:"¿Qué te quieres hacer: *uñas*, *pestañas* o *cejas*?", action:"need_info", session_updates:{ stage:"awaiting_category" }, action_params:{} }
   }
 
-  // Si dijo uñas explícitamente y no hay servicio seleccionado, mueve a choose_service
   if ((sessionData?.category==="uñas" || cat==="uñas") && !sessionData?.selectedServiceEnvKey){
     return { message:"Elige tu servicio ✨", action:"choose_service", session_updates:{ category:"uñas", stage:"awaiting_service_choice" }, action_params:{ candidates:[], category:"uñas" } }
   }
@@ -1099,17 +1098,17 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.3.1</h1>
+  <h1>🩷 Gapink Nails Bot v27.3.2</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v27.3.1:</strong><br>
-    • Pregunta categoría antes del menú.<br>
-    • Menús por categoría (uñas/pestañas/cejas).<br>
-    • Evita errores de sesión y duplicados.<br>
+    <strong>🚀 Mejoras v27.3.2:</strong><br>
+    • Cambio de categoría en caliente.<br>
+    • Selección de servicio por número robusta.<br>
+    • Pedicura no se cuela en uñas si no la piden.<br>
   </div>
   </div>`)
 })
@@ -1192,7 +1191,7 @@ async function startBot(){
             lastStaffNamesById: null,
             snooze_until_ms: null,
             identityResolvedCustomerId: null,
-            category: null // NUEVO
+            category: null
           }
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
@@ -1216,17 +1215,16 @@ async function startBot(){
 
           // === PRE-INTERCEPT: categoría ===
           if (sessionData.stage === "awaiting_category"){
-            const cat = detectCategory(textRaw) || (CATEGORY_VALUES.find(x => norm(textRaw).includes(norm(x))) || null)
-            if (!cat){
+            const cat0 = detectCategory(textRaw) || (CATEGORY_VALUES.find(x => norm(textRaw).includes(norm(x))) || null)
+            if (!cat0){
               await sendWithPresence(sock, jid, "Dime si quieres *uñas*, *pestañas* o *cejas* 😊")
               saveSession(phone, sessionData)
               return
             }
-            sessionData.category = cat
+            sessionData.category = cat0
             sessionData.stage = null
             saveSession(phone, sessionData)
-            // tras elegir categoría, pedimos sede o mostramos menú
-            await executeChooseService({ category: cat, candidates: [] }, sessionData, phone, sock, jid, textRaw)
+            await executeChooseService({ category: cat0, candidates: [] }, sessionData, phone, sock, jid, textRaw)
             return
           }
 
@@ -1272,14 +1270,44 @@ async function startBot(){
             return
           }
 
-          // === PRE-INTERCEPT: sede si estamos esperando para servicios ===
+          // === PRE-INTERCEPT: sede pendiente para servicios ===
           if (sessionData.stage==="awaiting_sede_for_services"){
             const sede = parseSede(textRaw)
+            const maybeCat = detectCategory(textRaw)
+            if (maybeCat) sessionData.pendingCategory = maybeCat
             if (sede){
               sessionData.sede = sede
               sessionData.stage = null
               saveSession(phone, sessionData)
               await executeChooseService({ candidates: [], category: (sessionData.pendingCategory || sessionData.category) }, sessionData, phone, sock, jid, textRaw)
+              return
+            }
+          }
+
+          // === NUEVO PRE-INTERCEPT: selección de servicio o CAMBIO DE CATEGORÍA en el menú
+          if (sessionData.stage==="awaiting_service_choice" && Array.isArray(sessionData.serviceChoices) && sessionData.serviceChoices.length){
+            // Cambio de categoría por texto libre
+            const catSwap = detectCategory(textRaw)
+            if (catSwap && catSwap !== sessionData.category){
+              sessionData.category = catSwap
+              saveSession(phone, sessionData)
+              await executeChooseService({ category: catSwap, candidates: [] }, sessionData, phone, sock, jid, textRaw)
+              return
+            }
+            // Selección por número
+            if (numMatch){
+              const n = Number(numMatch[1])
+              const choice = sessionData.serviceChoices.find(x=>x.index===n)
+              if (!choice){
+                await sendWithPresence(sock, jid, "No encontré esa opción. Responde con el número de la lista.")
+                return
+              }
+              sessionData.selectedServiceLabel = choice.label
+              sessionData.selectedServiceEnvKey = resolveEnvKeyFromLabelAndSede(choice.label, sessionData.sede)
+              sessionData.stage = null
+              saveSession(phone, sessionData)
+              await sendWithPresence(sock, jid, `Perfecto, ${applySpanishDiacritics(choice.label)}. Te propongo horarios ⏱️`)
+              await executeProposeTime({}, sessionData, phone, sock, jid)
               return
             }
           }
@@ -1353,7 +1381,6 @@ async function startBot(){
           // IA normal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
 
-          // Si la IA cambia sede y ya hay label
           if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
             const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
             if (ek) aiObj.session_updates.selectedServiceEnvKey = ek
@@ -1424,7 +1451,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v27.3.1`)
+console.log(`🩷 Gapink Nails Bot v27.3.2`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
