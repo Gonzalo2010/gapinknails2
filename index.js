@@ -1,11 +1,10 @@
-// index.js — Gapink Nails · v27.7.0 (estable)
-// Cambios clave vs v27.6.0:
-// - Si se muestran alternativas (no hay huecos con la profesional preferida) y el cliente elige 1/2/3,
-//   se reserva con quien SÍ tiene el hueco (no con la preferida), evitando errores.
-// - Sonda de disponibilidad exacta para fijar teamMemberId del slot elegido.
-// - Alternativas: se muestran TODAS las profesionales válidas por sede.
-// - Flujo por etapas: nunca dos preguntas a la vez. DeepSeek para NLU con fallback seguro.
-// - DRY_RUN si falta Square token. Sin EADDRINUSE, sin strings rotos.
+// index.js — Gapink Nails · v27.8.0
+// Cambios clave vs v27.7.0:
+// - Alternativas: lista TODAS las profesionales válidas por sede (sin recortes) usando EMP_CENTER_* y SQ_EMP_*.
+// - Nombres de profesionales capitalizados para mostrar (Carmen, Rocio, Cristina...).
+// - Compatibilidad con mapping EMP_CENTER_* para sedes, además de flags de SQ_EMP_*.
+// - Lógica de reserva respeta “alternativas del equipo”: asigna quien tiene el hueco real.
+// - Flujo por etapas (una pregunta a la vez). DeepSeek para NLU con fallback seguro. DRY_RUN si falta token.
 
 import express from "express"
 import pino from "pino"
@@ -61,7 +60,14 @@ const onlyDigits = s => String(s||"").replace(/\D+/g,"")
 const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
 const norm = s => rm(s).toLowerCase().replace(/[+.,;:()/_-]/g," ").replace(/[^\p{Letter}\p{Number}\s]/gu," ").replace(/\s+/g," ").trim()
 
+function titleCase(str){ return String(str||"").toLowerCase().replace(/\b([a-záéíóúñ])/g, (m)=>m.toUpperCase()) }
+function humanizeStaffKey(keyPart){
+  // "CARMEN_BELEN" -> "Carmen Belen"
+  const pretty = titleCase(String(keyPart||"").replace(/_/g," ").trim())
+  return pretty
+}
 function applySpanishDiacritics(label){
+  // Para servicios/palabras comunes; no tocamos nombres propios salvo normalizaciones básicas
   let x = String(label||"")
   x = x.replace(/\bunas\b/gi, m => m[0] === 'U' ? 'Uñas' : 'uñas')
   x = x.replace(/\bpestan(as?|)\b/gi, (m, suf) => (m[0]==='P'?'Pestañ':'pestañ') + (suf||''))
@@ -225,14 +231,29 @@ const insertSquareLog = db.prepare(`INSERT INTO square_logs
 (phone, action, request_data, response_data, error_data, timestamp, success)
 VALUES (@phone, @action, @request_data, @response_data, @error_data, @timestamp, @success)`)
 
-// ====== Empleadas y servicios
+// ====== EMP_CENTER_* → centros por persona (para listar alternativas completas)
+function parseCenterMap(){
+  const map = new Map() // nameKey -> Set(["torremolinos","la_luz"])
+  for (const [k,v] of Object.entries(process.env)) {
+    if (!k.startsWith("EMP_CENTER_")) continue
+    const nameKey = k.replace("EMP_CENTER_","").trim() // p.ej. "CRISTINA", "ROCIO_CHICA"
+    const centers = String(v||"").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean)
+    const normCenter = c => (c==="la luz" ? "la_luz" : c)
+    const set = new Set(centers.map(normCenter))
+    map.set(nameKey, set)
+  }
+  return map
+}
+const CENTER_MAP = parseCenterMap()
+
+// ====== Empleadas (SQ_EMP_*)
 function deriveLabelsFromEnvKey(envKey){
-  const raw = envKey.replace(/^SQ_EMP_/, "")
-  const toks = raw.split("_").map(t=>norm(t)).filter(Boolean)
-  const uniq = Array.from(new Set(toks))
-  const labels = [...uniq]
-  if (uniq.length>1) labels.push(uniq.join(" "))
-  return labels
+  const keyPart = envKey.replace(/^SQ_EMP_/,"")
+  const display = humanizeStaffKey(keyPart)              // para mostrar
+  const alt1 = norm(display)                             // alias normalizado
+  const alt2 = norm(keyPart.replace(/_/g," "))           // alias por key
+  const uniq = Array.from(new Set([display, alt1, alt2])).filter(Boolean)
+  return uniq
 }
 function parseEmployees(){
   const out=[]
@@ -243,18 +264,12 @@ function parseEmployees(){
     const bookable = (book||"").toUpperCase()==="BOOKABLE"
     let allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
 
-    // Sedes específicas opcionales
-    const empKey = "EMP_CENTER_" + k.replace(/^SQ_EMP_/, "")
-    const empVal = process.env[empKey]
-    if (empVal) {
-      const centers = String(empVal).split(",").map(s=>s.trim().toLowerCase()).filter(Boolean)
-      if (centers.some(c => c === "all")) {
-        allow = ["ALL"]
-      } else {
-        const normCenter = c => (c==="la luz" ? "la_luz" : c)
-        const ids = centers.map(c => locationToId(normCenter(c))).filter(Boolean)
-        if (ids.length) allow = ids
-      }
+    // Si hay EMP_CENTER_* para este nombre, usamos esa info para sedes
+    const centerSet = CENTER_MAP.get(k.replace(/^SQ_EMP_/,""))
+    if (centerSet && centerSet.size) {
+      // Convertimos nombres a IDs
+      const ids = Array.from(centerSet).map(c => locationToId(c)).filter(Boolean)
+      allow = ids.length ? ids : allow
     }
 
     const labels = deriveLabelsFromEnvKey(k)
@@ -263,19 +278,20 @@ function parseEmployees(){
   return out
 }
 const EMPLOYEES = parseEmployees()
+
 function staffLabelFromId(id){
   const e = EMPLOYEES.find(x=>x.id===id)
-  return e?.labels?.[0] || (id ? `Prof. ${String(id).slice(-4)}` : null)
+  return e?.labels?.[0] || (id ? `Profesional ${String(id).slice(-4)}` : null)
 }
 function isStaffAllowedInLocation(staffId, locKey){
   const e = EMPLOYEES.find(x=>x.id===staffId)
-  if (!e || !e.bookable) return false
+  if (!e) return false
   const locId = locationToId(locKey)
   return e.allow.includes("ALL") || e.allow.includes(locId)
 }
 function pickStaffForLocation(locKey, preferId=null){
   const locId = locationToId(locKey)
-  const isAllowed = e => e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId))
+  const isAllowed = e => (e.allow.includes("ALL") || e.allow.includes(locId)) && (e.bookable || true)
   if (preferId){
     const e = EMPLOYEES.find(x=>x.id===preferId)
     if (e && isAllowed(e)) return e.id
@@ -285,10 +301,21 @@ function pickStaffForLocation(locKey, preferId=null){
 }
 function allStaffNamesForSede(locKey){
   const locId = locationToId(locKey)
-  return EMPLOYEES
-    .filter(e => e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
-    .map(e => staffLabelFromId(e.id))
-    .filter(Boolean)
+  const names = new Set()
+  // 1) Desde SQ_EMP_* (ignora bookable para mostrar)
+  EMPLOYEES.forEach(e=>{
+    if (e.allow.includes("ALL") || e.allow.includes(locId)) {
+      const disp = e.labels[0]
+      if (disp) names.add(disp)
+    }
+  })
+  // 2) Desde EMP_CENTER_* explícito
+  for (const [nameKey, centers] of CENTER_MAP.entries()){
+    const has = centers.has(locKey)
+    const asId = centers.has("ALL")
+    if (has || asId) names.add(humanizeStaffKey(nameKey))
+  }
+  return Array.from(names)
 }
 
 // ====== Aliases de staff
@@ -327,7 +354,6 @@ function findStaffByAliasToken(tokenNorm){
 }
 
 // ====== Servicios
-function titleCase(str){ return String(str||"").toLowerCase().replace(/\b([a-z])/g, (m)=>m.toUpperCase()) }
 function cleanDisplayLabel(label){
   const s = String(label||"").replace(/^\s*(luz|la\s*luz)\s+/i,"").trim()
   return applySpanishDiacritics(s)
@@ -352,11 +378,8 @@ function serviceLabelFromEnvKey(envKey){
 }
 function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...servicesForSedeKeyRaw("la_luz")] }
 
-// ====== Categorías
-const POS_NAIL_ANCHORS = [
-  "uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente",
-  "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte"
-]
+// ====== Categorías (igual que v27.7.0)
+const POS_NAIL_ANCHORS = ["uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente","esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte"]
 const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash"]
 const PEDI_RE = /\b(pedicur\w*|pies?)\b/i
 const ALLOW_LIP_IN_BROWS = !/^false$/i.test(process.env.ALLOW_LIP_IN_BROWS || "true")
@@ -458,7 +481,7 @@ function resolveEnvKeyFromLabelAndSede(label, sedeKey){
   return list.find(s=>s.label.toLowerCase()===String(label||"").toLowerCase())?.key || null
 }
 
-// ====== IA
+// ====== IA (DeepSeek)
 async function callAIOnce(messages, systemPrompt = "") {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
@@ -521,12 +544,12 @@ ${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 REGLAS CLAVE:
 1) Identidad: NO pidas nombre/email si el número existe (match único). Solo si no existe o hay duplicados.
 2) Categoría primero: si el cliente no especifica, pregunta “¿uñas, pestañas, cejas o depilación?”.
-3) “Uñas” ambiguo → acción "choose_service". Solo uñas. Pedicura solo si el cliente la menciona.
+3) “Uñas” ambiguo → acción "choose_service". Pedicura solo si el cliente la menciona.
 4) Sede: si no hay sede, pídela antes de listar servicios.
 5) Si el cliente escribe 1/2/3 para horas → selección directa (usa lastHours).
 6) Cancelar: usa el número del chat para listar y cancelar.
 7) Para crear reserva: sede + servicio + fecha/hora. La identidad se resuelve por teléfono.
-8) Si el cliente dice “con {nombre}”: usar esa profesional. Si no está permitida en la sede, dilo y ofrece alternativas.
+8) “con {nombre}”: usar esa profesional. Si no atiende en la sede, dilo y ofrece TODAS las alternativas válidas en la sede.
 
 FORMATO:
 {"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{...}}`
@@ -654,7 +677,7 @@ async function sendWithPresence(sock, jid, text){
   return sock.sendMessage(jid, { text })
 }
 
-// ====== Helpers chat
+// ====== Chat helpers
 function isCancelIntent(text){
   const lower = norm(text)
   return /\b(cancelar|anular|borrar)\b/.test(lower) && /\b(cita|reserva|pr[oó]xima|mi)\b/.test(lower)
@@ -727,7 +750,7 @@ async function executeChooseService(params, sessionData, phone, sock, jid, userM
   await sendWithPresence(sock, jid, `Estas son nuestras opciones de **${incomingCat}** en ${locationNice(sessionData.sede)}:\n\n${lines}\n\nResponde con el número.`)
 }
 
-// ====== Disponibilidad
+// ====== Disponibilidad y servicios Square
 function proposeSlots({ fromEU, durationMin=60, n=3 }){
   const out=[]
   let t = ceilToSlotEU(fromEU.clone())
@@ -1081,19 +1104,14 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
 
   const iso = startEU.format("YYYY-MM-DDTHH:mm")
 
-  // NUEVO: si los horarios mostrados NO eran “con preferida”, ignoramos preferida y usamos
-  // el staff que realmente tenga ese hueco. Si Square no lo da, lo sondeamos; si no aparece, asignamos equipo.
   const staffFromIso = sessionData?.lastStaffByIso?.[iso] || null
   let staffId = null
 
   if (sessionData.lastProposeUsedPreferred) {
-    // Eran horarios con preferida -> respetar preferida si existe; si el slot traía staff concreto, usarlo.
     staffId = staffFromIso || sessionData.preferredStaffId || null
   } else {
-    // Eran alternativas del equipo -> reservar con quien pueda atender ese hueco.
     staffId = staffFromIso || null
     if (!staffId) {
-      // Sonda exacta para ese minuto para intentar obtener el teamMemberId correcto.
       const probe = await searchAvailabilityGeneric({
         locationKey: sessionData.sede,
         envServiceKey: sessionData.selectedServiceEnvKey,
@@ -1103,10 +1121,7 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
       const match = probe.find(x => x.date.isSame(startEU, "minute"))
       if (match?.staffId && isStaffAllowedInLocation(match.staffId, sessionData.sede)) staffId = match.staffId
     }
-    if (!staffId) {
-      // Asignar alguien del equipo válido en sede (para evitar caída).
-      staffId = pickStaffForLocation(sessionData.sede, null)
-    }
+    if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
   }
 
   if (!staffId || !isStaffAllowedInLocation(staffId, sessionData.sede)) {
@@ -1252,7 +1267,7 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.7.0</h1>
+  <h1>🩷 Gapink Nails Bot v27.8.0</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
@@ -1389,7 +1404,6 @@ async function startBot(){
                 await executeProposeTime({}, sessionData, phone, sock, jid); return
               }
               sessionData.pendingDateTime = pick.tz(EURO_TZ).toISOString()
-              // OJO: no forzamos preferred aquí si venían alternativas.
               if (sessionData.lastProposeUsedPreferred && staffFromIso){
                 sessionData.preferredStaffId = staffFromIso
                 sessionData.preferredStaffLabel = staffLabelFromId(staffFromIso)
@@ -1461,12 +1475,9 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v27.7.0`)
-const appServer = app.listen(process.env.PORT||8080, ()=>{
-  startBot().catch(console.error)
-})
+console.log(`🩷 Gapink Nails Bot v27.8.0`)
+const appServer = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 
-// Señales
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
 process.on("SIGTERM", ()=>{ try{ appServer.close(()=>process.exit(0)) }catch{ process.exit(0) } })
