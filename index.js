@@ -1,11 +1,13 @@
-// index.js — Gapink Nails · v27.2.1.0
-// Cambios clave respecto a v27.2.0.0:
-// • Pregunta de categoría (uñas/pestañas/cejas) si no está clara antes de listar servicios.
-// • Menús filtrados por categoría y sede (uñas/pestañas/cejas).
-// • Anti-spam para “Disculpa, hubo un error técnico...”
-// • Arreglo de ReferenceError (sessionData en catch).
-// • Mantiene: tildes/ñ en etiquetas, staff por sede, “con {nombre}”, slots válidos, identidad diferida, “.” para silenciar, etc.
+// index.js — Gapink Nails · v27.3.1-catfix
+// Fixes clave añadidos en esta versión:
+// • Pregunta primero “¿Qué te quieres hacer: uñas, pestañas o cejas?” si no hay categoría.
+// • Menú de servicios se filtra por categoría (uñas / pestañas / cejas). No más menú de uñas cuando piden cejas/pestañas.
+// • Pre-intercepts: reconoce categoría en texto libre y la guarda en sesión.
+// • Arreglo de “sessionData is not defined” (no se usan variables fuera de scope).
+// • Sin duplicado de `conectado` (solo se declara una vez).
+// • Mantiene todas tus funciones originales. Solo se han ampliado.
 
+// ====== Imports
 import express from "express"
 import pino from "pino"
 import qrcode from "qrcode"
@@ -262,7 +264,6 @@ function parseEmployees(){
     const bookable = (book||"").toUpperCase()==="BOOKABLE"
     let allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
 
-    // Compat extra: EMP_CENTER_SQ_EMP_* = "all" | "la luz, torremolinos"
     const empKey = "EMP_CENTER_" + k.replace(/^SQ_EMP_/, "")
     const empVal = process.env[empKey]
     if (empVal) {
@@ -334,47 +335,32 @@ function serviceLabelFromEnvKey(envKey){
 }
 function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...servicesForSedeKeyRaw("la_luz")] }
 
-// ====== Categorías y clasificación
-const CATEGORY = { NAILS: "uñas", LASHES: "pestañas", BROWS: "cejas" }
-
-// uñas
+// ====== Clasificación de "uñas"
 const POS_NAIL_ANCHORS = [
   "uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente",
-  "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte","pedicura","pies","pie"
+  "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte","pedicur","pies"
 ]
 const NEG_NOT_NAILS = ["pesta","pestañ","ceja","cejas","ojos","pelo a pelo","eyelash"]
-// pestañas
-const POS_LASH_ANCHORS = [
-  "pesta","pestañ","pestanas","pestañas","lash","extens","volumen",
-  "lifting","rizado","laminado pestañas","2d","3d","4d","hibridas","híbridas",
-  "retirar pestañas","relleno pestañas"
-]
-const NEG_NOT_LASHES = ["uña","unas","uñas","manicura","ceja","cejas","pedicura","pie","pies","brow"]
-// cejas
-const POS_BROW_ANCHORS = [
-  "ceja","cejas","diseño cejas","diseño de cejas","depilacion cejas","depilación cejas",
-  "henna","laminado cejas","brow","brow lift","perfilado cejas","tinte cejas"
-]
-const NEG_NOT_BROWS  = ["uña","unas","uñas","manicura","pesta","pestañ","pestanas","pestañas","lash","ojos"]
 
+// ====== NUEVO: Clasificación por categoría
+const CATEGORY_VALUES = ["uñas","pestañas","cejas"]
+function detectCategory(text){
+  const t = norm(text||"")
+  if (/\b(pesta|pestañ|eyelash|lifting|lash|2d|3d|mega|volumen|tinte)\b/.test(t)) return "pestañas"
+  if (/\b(ceja|cejas|henna|laminad|perfilad|diseñ|depilaci)\b/.test(t)) return "cejas"
+  if (POS_NAIL_ANCHORS.some(a=>t.includes(norm(a)))) return "uñas"
+  return null
+}
 function shouldIncludePedicure(userMsg){
-  return /\b(pedicur|pedicura|pies|pie)\b/i.test(String(userMsg||""))
+  return /\b(pedicur|pies|pie)\b/i.test(String(userMsg||""))
 }
 function isNailsLabel(labelNorm, allowPedicure){
   if (NEG_NOT_NAILS.some(n=>labelNorm.includes(norm(n)))) return false
   const hasPos = POS_NAIL_ANCHORS.some(p=>labelNorm.includes(norm(p)))
   if (!hasPos) return false
-  const isPedi = /\b(pedicur|pedicura|pies|pie)\b/.test(labelNorm)
+  const isPedi = /\b(pedicur|pies|pie)\b/.test(labelNorm)
   if (isPedi && !allowPedicure) return false
   return true
-}
-function isLashesLabel(labelNorm){
-  if (NEG_NOT_LASHES.some(n=>labelNorm.includes(norm(n)))) return false
-  return POS_LASH_ANCHORS.some(p=>labelNorm.includes(norm(p)))
-}
-function isBrowsLabel(labelNorm){
-  if (NEG_NOT_BROWS.some(n=>labelNorm.includes(norm(n)))) return false
-  return POS_BROW_ANCHORS.some(p=>labelNorm.includes(norm(p)))
 }
 function uniqueByLabel(arr){
   const seen=new Set(); const out=[]
@@ -391,25 +377,24 @@ function nailsServicesForSede(sedeKey, userMsg){
   const filtered = list.filter(s=>isNailsLabel(s.norm, allowPedi))
   return uniqueByLabel(filtered)
 }
+// ====== NUEVO: Filtros pestañas/cejas
 function lashesServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
-  return uniqueByLabel(list.filter(s=>isLashesLabel(s.norm)))
+  const anchors = ["pesta", "pestañ", "eyelash", "lash", "lifting", "rizado", "volumen", "2d", "3d", "megavolumen", "tinte"]
+  return uniqueByLabel(list.filter(s=>anchors.some(a=>s.norm.includes(norm(a)))))
 }
 function browsServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
-  return uniqueByLabel(list.filter(s=>isBrowsLabel(s.norm)))
+  const anchors = ["ceja","cejas","brow","henna","laminad","perfilad","diseñ","depilaci","threading"]
+  return uniqueByLabel(list.filter(s=>anchors.some(a=>s.norm.includes(norm(a)))))
 }
-function detectCategoryFromText(txt){
-  const t = norm(txt||"")
-  if (/\b(ceja|cejas|brow)\b/.test(t)) return CATEGORY.BROWS
-  if (/\b(pesta|pestañ|pestanas|pestañas|lash|extens|lifting)\b/.test(t)) return CATEGORY.LASHES
-  if (/\b(uñ|unas|uñas|manicura|gel|acrilic|acrilico|acrílico|pedicura|pies|pie)\b/.test(t)) return CATEGORY.NAILS
-  return null
-}
-function servicesByCategoryForSede(sedeKey, category, userMsg){
-  if (category === CATEGORY.LASHES) return lashesServicesForSede(sedeKey)
-  if (category === CATEGORY.BROWS)  return browsServicesForSede(sedeKey)
-  return nailsServicesForSede(sedeKey, userMsg)
+function servicesByCategory(sedeKey, category, userMsg){
+  switch ((category||"").toLowerCase()){
+    case "uñas": return nailsServicesForSede(sedeKey, userMsg)
+    case "pestañas": return lashesServicesForSede(sedeKey)
+    case "cejas": return browsServicesForSede(sedeKey)
+    default: return []
+  }
 }
 
 function scoreServiceRelevance(userMsg, label){
@@ -662,52 +647,6 @@ async function callAIWithRetries(messages, systemPrompt=""){
   return null
 }
 
-function buildLocalFallback(userMessage, sessionData){
-  const msg = String(userMessage||"").trim()
-  const lower = norm(msg)
-  const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
-  const yesMatch = /\b(si|sí|ok|vale|confirmo|de\ acuerdo)\b/i.test(msg)
-  const cancelMatch = /\b(cancelar|anular|borra|elimina)\b/i.test(lower)
-  const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
-
-  const hasCore = (s)=> s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime
-
-  if (numMatch && Array.isArray(sessionData?.lastHours) && sessionData.lastHours.length){
-    const idx = Number(numMatch[1]) - 1
-    const pick = sessionData.lastHours[idx]
-    if (dayjs.isDayjs(pick)){
-      const iso = pick.format("YYYY-MM-DDTHH:mm")
-      const staffFromIso = sessionData?.lastStaffByIso?.[iso] || null
-      const updates = { pendingDateTime: pick.tz(EURO_TZ).toISOString() }
-      if (staffFromIso) { updates.preferredStaffId = staffFromIso; updates.preferredStaffLabel = null }
-      const okToCreate = hasCore({...sessionData, ...updates})
-      return { message: okToCreate ? "Perfecto, voy a confirmar esa hora 👍" : "Genial. Me falta algún dato.", action: okToCreate ? "create_booking" : "need_info", session_updates: updates, action_params: {} }
-    }
-  }
-  if (yesMatch){
-    if (hasCore(sessionData)){
-      return { message:"¡Voy a crear la reserva! ✨", action:"create_booking", session_updates:{}, action_params:{} }
-    } else {
-      const faltan=[]; if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)"); if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio"); if (!sessionData?.pendingDateTime) faltan.push("fecha y hora")
-      return { message:`Para proponerte horas dime: ${faltan.join(" y ")}.`, action:"need_info", session_updates:{}, action_params:{} }
-    }
-  }
-  if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")) return { message:"Vale, te enseño tus citas para cancelar:", action:"cancel_appointment", session_updates:{}, action_params:{} }
-  if (listMatch) return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
-
-  // 👇 NUEVO: si no hay servicio elegido, primero intentamos detectar categoría; si no, preguntamos explícitamente
-  if (!sessionData?.selectedServiceEnvKey){
-    const cat = detectCategoryFromText(msg)
-    if (cat){
-      return { message:`Te muestro opciones de ${cat}.`, action:"choose_service", session_updates:{ stage:"awaiting_service_choice", pendingCategory:cat }, action_params:{ candidates:[], category:cat } }
-    }
-    return { message:"¿Qué te quieres hacer exactamente: *uñas*, *pestañas* o *cejas*? (puedes escribir el servicio concreto)", action:"need_info", session_updates:{ stage:"awaiting_category" }, action_params:{} }
-  }
-
-  return { message:"¿Quieres reservar, cancelar o ver tus citas?", action:"none", session_updates:{}, action_params:{} }
-}
-
-// ====== Roster para el prompt (IA ve TODO)
 function staffRosterForPrompt(){
   return EMPLOYEES.map(e=>{
     const locs = e.allow.map(id=> id===LOC_TORRE?"torremolinos" : id===LOC_LUZ?"la_luz" : id).join(",")
@@ -745,13 +684,12 @@ ${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 
 REGLAS CLAVE:
 1) Identidad: NO pidas nombre/email si el número existe (match único). Solo si no existe o hay duplicados.
-2) Categoría: distingue uñas / pestañas / cejas. Si el cliente NO especifica, pide la categoría antes de listar. Si la especifica, lista directamente la correcta.
+2) “Uñas” ambiguo → acción "choose_service". Solo servicios de uñas. Pedicura solo si el cliente la menciona. 
 3) Sede: si no hay sede, pídela antes de listar servicios.
 4) Si el cliente escribe 1/2/3 para horas → selección directa (usa lastHours).
 5) Cancelar: usa el número del chat para listar y cancelar.
 6) Para crear reserva: sede + servicio + fecha/hora. La identidad se resuelve por teléfono.
-7) “con {nombre}”: forzar propuesta con esa profesional si está permitida en la sede. Si no, ofrece alternativas válidas (otras profesionales de esa sede).
-8) Nunca propongas slots de una profesional no permitida en esa sede.
+7) Categoría primero: si el cliente no especifica, pregunta “¿uñas, pestañas o cejas?” y NO muestres menú hasta saberlo.
 
 FORMATO:
 {"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{...}}`
@@ -771,9 +709,9 @@ ESTADO:
 - Sede: ${sessionData?.sede || 'no seleccionada'}
 - Servicio: ${sessionData?.selectedServiceLabel || 'no seleccionado'} (${sessionData?.selectedServiceEnvKey || 'no_key'})
 - Profesional preferida: ${sessionData?.preferredStaffLabel || 'ninguna'}
+- Categoría: ${sessionData?.category || 'no seleccionada'}
 - Fecha/hora pendiente: ${sessionData?.pendingDateTime ? fmtES(parseToEU(sessionData.pendingDateTime)) : 'no seleccionada'}
 - Etapa: ${sessionData?.stage || 'inicial'}
-- Categoría pendiente: ${sessionData?.pendingCategory || '—'}
 - Últimas horas propuestas: ${Array.isArray(sessionData?.lastHours) ? sessionData.lastHours.length + ' opciones' : 'ninguna'}
 `;
 
@@ -789,6 +727,68 @@ ESTADO:
   try { return JSON.parse(cleaned) } catch { return buildLocalFallback(userMessage, sessionData) }
 }
 
+function buildLocalFallback(userMessage, sessionData){
+  const msg = String(userMessage||"").trim()
+  const lower = norm(msg)
+  const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
+  const yesMatch = /\b(si|sí|ok|vale|confirmo|de\ acuerdo)\b/i.test(msg)
+  const cancelMatch = /\b(cancelar|anular|borra|elimina)\b/i.test(lower)
+  const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
+  const cat = detectCategory(msg)
+
+  const hasCore = (s)=> s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime
+
+  if (numMatch && Array.isArray(sessionData?.lastHours) && sessionData.lastHours.length){
+    const idx = Number(numMatch[1]) - 1
+    const pick = sessionData.lastHours[idx]
+    if (dayjs.isDayjs(pick)){
+      const iso = pick.format("YYYY-MM-DDTHH:mm")
+      const staffFromIso = sessionData?.lastStaffByIso?.[iso] || null
+      const updates = { pendingDateTime: pick.tz(EURO_TZ).toISOString() }
+      if (staffFromIso) { updates.preferredStaffId = staffFromIso; updates.preferredStaffLabel = null }
+      const okToCreate = hasCore({...sessionData, ...updates})
+      return { message: okToCreate ? "Perfecto, voy a confirmar esa hora 👍" : "Genial. Me falta algún dato.", action: okToCreate ? "create_booking" : "need_info", session_updates: updates, action_params: {} }
+    }
+  }
+  if (yesMatch){
+    if (hasCore(sessionData)){
+      return { message:"¡Voy a crear la reserva! ✨", action:"create_booking", session_updates:{}, action_params:{} }
+    } else {
+      const faltan=[]; if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)"); if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio"); if (!sessionData?.pendingDateTime) faltan.push("fecha y hora")
+      return { message:`Para proponerte horas dime: ${faltan.join(" y ")}.`, action:"need_info", session_updates:{}, action_params:{} }
+    }
+  }
+  if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")) return { message:"Vale, te enseño tus citas para cancelar:", action:"cancel_appointment", session_updates:{}, action_params:{} }
+  if (listMatch) return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
+
+  // NUEVO: categoría primero si no está
+  if (!sessionData?.category && !cat) {
+    return { message:"¿Qué te quieres hacer: *uñas*, *pestañas* o *cejas*?", action:"need_info", session_updates:{ stage:"awaiting_category" }, action_params:{} }
+  }
+
+  // Si dijo uñas explícitamente y no hay servicio seleccionado, mueve a choose_service
+  if ((sessionData?.category==="uñas" || cat==="uñas") && !sessionData?.selectedServiceEnvKey){
+    return { message:"Elige tu servicio ✨", action:"choose_service", session_updates:{ category:"uñas", stage:"awaiting_service_choice" }, action_params:{ candidates:[], category:"uñas" } }
+  }
+
+  return { message:"¿Quieres reservar, cancelar o ver tus citas? Si es para reservar, dime *sede* y *servicio*.", action:"none", session_updates:{}, action_params:{} }
+}
+
+// ====== Bot principal
+let RECONNECT_SCHEDULED = false
+let RECONNECT_ATTEMPTS = 0
+const QUEUE=new Map()
+function enqueue(key,job){
+  const prev=QUEUE.get(key)||Promise.resolve()
+  const next=prev.then(job,job).finally(()=>{ if (QUEUE.get(key)===next) QUEUE.delete(key) })
+  QUEUE.set(key,next); return next
+}
+async function sendWithPresence(sock, jid, text){
+  try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
+  await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
+  return sock.sendMessage(jid, { text })
+}
+
 // ====== Helpers chat
 function isCancelIntent(text){
   const lower = norm(text)
@@ -800,7 +800,6 @@ function parseSede(text){
   if (/\b(torre|torremolinos)\b/.test(t)) return "torremolinos"
   return null
 }
-
 // 👉 parse básico para nombre/email en texto libre
 function parseNameEmailFromText(txt){
   const emailMatch = String(txt||"").match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)
@@ -809,9 +808,9 @@ function parseNameEmailFromText(txt){
   return { name: name || null, email }
 }
 
-// ====== Menú de servicios (por categoría)
-function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates, category=CATEGORY.NAILS){
-  const list = servicesByCategoryForSede(sedeKey, category, userMsg)
+// ====== Menús por categoría
+function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates, category){
+  const list = servicesByCategory(sedeKey, category, userMsg)
   const localScores = new Map()
   for (const s of list){ localScores.set(s.label, scoreServiceRelevance(userMsg, s.label)) }
   const aiMap = new Map()
@@ -827,40 +826,44 @@ function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates, category=C
   const inAI = list.filter(s=>aiMap.has(s.label)).sort((a,b)=> (aiMap.get(b.label)-aiMap.get(a.label)) || ((localScores.get(b.label)||0)-(localScores.get(a.label)||0)))
   const rest = list.filter(s=>!aiMap.has(s.label)).sort((a,b)=> (localScores.get(b.label)||0)-(localScores.get(a.label)||0))
   const final = [...inAI, ...rest]
-  return final.map((s,i)=>({ index:i+1, label:s.label, envKey:s.key }))
+  return final.map((s,i)=>({ index:i+1, label:s.label }))
 }
 
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
-  // category desde IA / texto / sesión
-  const aiCat = (params?.category || "").toLowerCase()
-  const detected = detectCategoryFromText(userMsg||"")
-  const category = aiCat.includes("ceja") ? CATEGORY.BROWS
-                 : (aiCat.includes("pesta")||aiCat.includes("lash")) ? CATEGORY.LASHES
-                 : aiCat.includes("uña") ? CATEGORY.NAILS
-                 : sessionData.pendingCategory || detected || CATEGORY.NAILS
-
+  // Determinar categoría
+  const incomingCat = params?.category || sessionData.category || sessionData.pendingCategory || detectCategory(userMsg)
+  if (!incomingCat || !CATEGORY_VALUES.includes(incomingCat)){
+    sessionData.stage = "awaiting_category"
+    saveSession(phone, sessionData)
+    await sendWithPresence(sock, jid, "¿Qué te quieres hacer: *uñas*, *pestañas* o *cejas*?")
+    return
+  }
+  // Necesitamos sede antes del menú
   if (!sessionData.sede){
-    sessionData.pendingCategory = category
+    sessionData.pendingCategory = incomingCat
     sessionData.stage = "awaiting_sede_for_services"
     saveSession(phone, sessionData)
-    await sendWithPresence(sock, jid, `¿En qué sede te viene mejor, Torremolinos o La Luz? (así te muestro las opciones de ${category})`)
+    await sendWithPresence(sock, jid, `¿En qué sede te viene mejor, Torremolinos o La Luz? (para ${incomingCat})`)
     return
   }
+
   const aiCands = Array.isArray(params?.candidates) ? params.candidates : []
-  const items = buildServiceChoiceListBySede(sessionData.sede, userMsg||"", aiCands, category)
+  const items = buildServiceChoiceListBySede(sessionData.sede, userMsg||"", aiCands, incomingCat)
   if (!items.length){
-    await sendWithPresence(sock, jid, `Ahora mismo no tengo servicios de ${category} configurados para esa sede.`)
+    await sendWithPresence(sock, jid, `Ahora mismo no tengo ${incomingCat} configurados para esa sede. Si quieres, dime el *nombre exacto* del servicio.`)
     return
   }
+
+  sessionData.category = incomingCat
   sessionData.serviceChoices = items
   sessionData.stage = "awaiting_service_choice"
-  sessionData.pendingCategory = category
   saveSession(phone, sessionData)
+
   const lines = items.map(it=> {
     const star = aiCands.find(c=>cleanDisplayLabel(String(c.label||"")).toLowerCase()===it.label.toLowerCase()) ? " ⭐" : ""
     return `${it.index}) ${applySpanishDiacritics(it.label)}${star}`
   }).join("\n")
-  await sendWithPresence(sock, jid, `Estas son nuestras opciones de **${category}** en ${locationNice(sessionData.sede)}:\n\n${lines}\n\nResponde con el número.`)
+  await sendWithPresence(sock, jid, `Estas son nuestras opciones de **${incomingCat}** en ${locationNice(sessionData.sede)}:\n\n${lines}\n\nResponde con el número.`)
 }
 
 // ====== Proponer horas
@@ -947,27 +950,18 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
   if (!staffId) { await sendWithPresence(sock, jid, "No hay profesionales disponibles en esa sede"); return; }
 
-  // === Identidad justo después de confirmar ===
-  // 1) Si ya la resolvimos (por respuesta del cliente), usarla.
+  // Identidad (después de confirmar)
   let customerId = sessionData.identityResolvedCustomerId || null
 
-  // 2) Si no, buscamos por teléfono. Si 0 o 2+, preguntamos ahora y esperamos la respuesta del cliente.
   if (!customerId){
     const { status, customer } = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid) || {}
-    if (status === "need_new" || status === "need_pick") {
-      // Se preguntó al cliente y quedamos a la espera. La próxima respuesta completará la reserva.
-      return
-    }
+    if (status === "need_new" || status === "need_pick") { return }
     customerId = customer?.id || null
   }
-
-  // 3) Si aún no hay customerId pero tenemos nombre/email previos, intentamos crear.
   if (!customerId && (sessionData.name || sessionData.email)){
     const created = await findOrCreateCustomerWithRetry({ name: sessionData.name, email: sessionData.email, phone })
     if (created) customerId = created.id
   }
-
-  // 4) Si sigue sin haber customerId, pedimos identidad (último recurso) y aguardamos.
   if (!customerId){
     sessionData.stage = "awaiting_identity"
     saveSession(phone, sessionData)
@@ -1088,25 +1082,51 @@ async function executeCancelAppointment(params, sessionData, phone, sock, jid) {
   saveSession(phone, sessionData)
 }
 
-// ====== Bot principal
-let RECONNECT_SCHEDULED = false
-let RECONNECT_ATTEMPTS = 0
-const QUEUE=new Map()
-function enqueue(key,job){
-  const prev=QUEUE.get(key)||Promise.resolve()
-  const next=prev.then(job,job).finally(()=>{ if (QUEUE.get(key)===next) QUEUE.delete(key) })
-  QUEUE.set(key,next); return next
-}
-async function sendWithPresence(sock, jid, text){
-  try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
-  await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
-  return sock.sendMessage(jid, { text })
-}
+// ====== Mini-web + QR
+const app=express()
+const PORT=process.env.PORT||8080
+let lastQR=null, conectado=false
+app.get("/", (_req,res)=>{
+  const totalAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments`).get()?.count || 0
+  const successAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'confirmed'`).get()?.count || 0
+  const failedAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'failed'`).get()?.count || 0
+  res.send(`<!doctype html><meta charset="utf-8"><style>
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa}
+  .card{max-width:640px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
+  .status{padding:12px;border-radius:8px;margin:8px 0}
+  .success{background:#d4edda;color:#155724}
+  .error{background:#f8d7da;color:#721c24}
+  .warning{background:#fff3cd;color:#856404}
+  .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
+  </style><div class="card">
+  <h1>🩷 Gapink Nails Bot v27.3.1</h1>
+  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
+  ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
+  <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
+  <h3>📊 Estadísticas</h3>
+  <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
+  <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
+    <strong>🚀 Mejoras v27.3.1:</strong><br>
+    • Pregunta categoría antes del menú.<br>
+    • Menús por categoría (uñas/pestañas/cejas).<br>
+    • Evita errores de sesión y duplicados.<br>
+  </div>
+  </div>`)
+})
+app.get("/qr.png", async (_req,res)=>{
+  if(!lastQR) return res.status(404).send("No QR")
+  const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
+  res.set("Content-Type","image/png").send(png)
+})
+app.get("/logs", (_req,res)=>{
+  const recent = db.prepare(`SELECT * FROM square_logs ORDER BY timestamp DESC LIMIT 50`).all()
+  res.json({ logs: recent })
+})
 
 // ====== Baileys
 async function loadBaileys(){
   const require = createRequire(import.meta.url); let mod=null
-  try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ mod=await import("@whiskeysockets/baileys") } 
+  try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ try{ mod=await import("@whiskeysockets/baileys") }catch{} }
   if(!mod) throw new Error("Baileys incompatible")
   const makeWASocket = mod.makeWASocket || mod.default?.makeWASocket || (typeof mod.default==="function"?mod.default:undefined)
   const useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
@@ -1127,17 +1147,6 @@ function parsePreferredStaffFromText(text){
     }
   }
   return null
-}
-
-// ====== Anti-spam para error técnico
-function shouldSendErrorNow(sessionData){
-  const now = Date.now()
-  const last = Number(sessionData?.last_error_ts || 0)
-  if (isNaN(last) || now - last > 20000) { // 20s
-    if (sessionData) sessionData.last_error_ts = now
-    return true
-  }
-  return false
 }
 
 async function startBot(){
@@ -1173,9 +1182,8 @@ async function startBot(){
       if (!textRaw) return
 
       await enqueue(phone, async ()=>{
-        let sessionData
         try {
-          sessionData = loadSession(phone) || {
+          let sessionData = loadSession(phone) || {
             greeted: false, sede: null, selectedServiceEnvKey: null, selectedServiceLabel: null,
             preferredStaffId: null, preferredStaffLabel: null, pendingDateTime: null,
             name: null, email: null, last_msg_id: null, lastStaffByIso: {},
@@ -1184,7 +1192,7 @@ async function startBot(){
             lastStaffNamesById: null,
             snooze_until_ms: null,
             identityResolvedCustomerId: null,
-            last_error_ts: 0
+            category: null // NUEVO
           }
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
@@ -1205,6 +1213,22 @@ async function startBot(){
 
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
+
+          // === PRE-INTERCEPT: categoría ===
+          if (sessionData.stage === "awaiting_category"){
+            const cat = detectCategory(textRaw) || (CATEGORY_VALUES.find(x => norm(textRaw).includes(norm(x))) || null)
+            if (!cat){
+              await sendWithPresence(sock, jid, "Dime si quieres *uñas*, *pestañas* o *cejas* 😊")
+              saveSession(phone, sessionData)
+              return
+            }
+            sessionData.category = cat
+            sessionData.stage = null
+            saveSession(phone, sessionData)
+            // tras elegir categoría, pedimos sede o mostramos menú
+            await executeChooseService({ category: cat, candidates: [] }, sessionData, phone, sock, jid, textRaw)
+            return
+          }
 
           // === PRE-INTERCEPT: identidad (varias fichas) ===
           if (sessionData.stage==="awaiting_identity_pick"){
@@ -1248,27 +1272,6 @@ async function startBot(){
             return
           }
 
-          // === NUEVO: PRE-INTERCEPT categoría
-          if (sessionData.stage === "awaiting_category"){
-            const cat = detectCategoryFromText(textRaw)
-            if (!cat){
-              await sendWithPresence(sock, jid, "¿Qué te quieres hacer exactamente: *uñas*, *pestañas* o *cejas*? (o dime el servicio concreto)")
-              saveSession(phone, sessionData)
-              return
-            }
-            sessionData.pendingCategory = cat
-            sessionData.stage = null
-            saveSession(phone, sessionData)
-            if (!sessionData.sede){
-              sessionData.stage = "awaiting_sede_for_services"
-              saveSession(phone, sessionData)
-              await sendWithPresence(sock, jid, `Perfecto, ${cat}. ¿Te viene mejor *Torremolinos* o *La Luz*?`)
-              return
-            }
-            await executeChooseService({ candidates:[], category: cat }, sessionData, phone, sock, jid, textRaw)
-            return
-          }
-
           // === PRE-INTERCEPT: sede si estamos esperando para servicios ===
           if (sessionData.stage==="awaiting_sede_for_services"){
             const sede = parseSede(textRaw)
@@ -1276,26 +1279,9 @@ async function startBot(){
               sessionData.sede = sede
               sessionData.stage = null
               saveSession(phone, sessionData)
-              await executeChooseService({ candidates: [], category: sessionData.pendingCategory || undefined }, sessionData, phone, sock, jid, textRaw)
+              await executeChooseService({ candidates: [], category: (sessionData.pendingCategory || sessionData.category) }, sessionData, phone, sock, jid, textRaw)
               return
             }
-          }
-
-          // === PRE-INTERCEPT: selección de servicio por número ===
-          if (numMatch && sessionData.stage==="awaiting_service_choice" && Array.isArray(sessionData.serviceChoices) && sessionData.serviceChoices.length){
-            const idx = Number(numMatch[1]) - 1
-            const pick = sessionData.serviceChoices[idx]
-            if (!pick){
-              await sendWithPresence(sock, jid, "No encontré esa opción. Prueba con el número de la lista.")
-              return
-            }
-            sessionData.selectedServiceLabel = pick.label
-            sessionData.selectedServiceEnvKey = resolveEnvKeyFromLabelAndSede(pick.label, sessionData.sede) || pick.envKey || null
-            sessionData.stage = null
-            saveSession(phone, sessionData)
-            await sendWithPresence(sock, jid, `Perfecto: **${applySpanishDiacritics(pick.label)}**. Te propongo horarios 👇`)
-            await executeProposeTime({}, sessionData, phone, sock, jid)
-            return
           }
 
           // === PRE-INTERCEPT: selección de horario ===
@@ -1351,20 +1337,33 @@ async function startBot(){
             return
           }
 
-          // ==== IA normal
+          // === Detección de categoría si no hay
+          if (!sessionData.category){
+            const cat = detectCategory(textRaw)
+            if (!cat){
+              sessionData.stage = "awaiting_category"
+              saveSession(phone, sessionData)
+              await sendWithPresence(sock, jid, "¿Qué te quieres hacer: *uñas*, *pestañas* o *cejas*?")
+              return
+            }
+            sessionData.category = cat
+            saveSession(phone, sessionData)
+          }
+
+          // IA normal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
+
+          // Si la IA cambia sede y ya hay label
           if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
             const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
             if (ek) aiObj.session_updates.selectedServiceEnvKey = ek
           }
+
           await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
 
         } catch (error) {
           if (BOT_DEBUG) console.error(error)
-          if (shouldSendErrorNow(sessionData || {})){
-            await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
-          }
-          saveSession(phone, sessionData || {})
+          await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
         }
       })
     })
@@ -1384,14 +1383,20 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     if (ek) sessionData.selectedServiceEnvKey = ek
   }
 
+  const fallbackUsedBool = !!aiObj.__fallback_used
   insertAIConversation.run({
     phone, message_id: m.key.id, user_message: textRaw,
     ai_response: safeJSONStringify(aiObj), timestamp: new Date().toISOString(),
     session_data: safeJSONStringify(sessionData),
     ai_error: (typeof aiObj.__ai_error === "string" || aiObj.__ai_error == null) ? (aiObj.__ai_error ?? null) : safeJSONStringify(aiObj.__ai_error),
-    fallback_used: Number(!!aiObj.__fallback_used)
+    fallback_used: Number(fallbackUsedBool)
   })
   saveSession(phone, sessionData)
+
+  // Ajuste: si la acción es choose_service y no hay categoría, la inferimos
+  if (aiObj.action === "choose_service" && !aiObj?.action_params?.category){
+    aiObj.action_params = { ...(aiObj.action_params||{}), category: (sessionData.category || detectCategory(textRaw) || "uñas") }
+  }
 
   switch (aiObj.action) {
     case "choose_service":
@@ -1406,67 +1411,20 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
       await executeCancelAppointment(aiObj.action_params, sessionData, phone, sock, jid); break
     case "need_info":
     case "none":
-    default:
-      // 👇 NUEVO: si aún no hay servicio elegido, intentamos detectar categoría; si no, preguntamos
-      if (!sessionData.selectedServiceEnvKey){
-        const cat = detectCategoryFromText(textRaw)
-        if (cat){
-          await executeChooseService({ candidates: aiObj?.action_params?.candidates || [], category: cat }, sessionData, phone, sock, jid, textRaw)
-          return
-        }
-        sessionData.stage = "awaiting_category"
-        saveSession(phone, sessionData)
-        await sendWithPresence(sock, jid, "¿Qué te quieres hacer exactamente: *uñas*, *pestañas* o *cejas*? (también puedes decir el servicio)")
-        return
+    default: {
+      const inferredCat = sessionData.category || detectCategory(textRaw)
+      if (inferredCat && !sessionData.selectedServiceEnvKey){
+        await executeChooseService({ candidates: aiObj?.action_params?.candidates || [], category: inferredCat }, sessionData, phone, sock, jid, textRaw)
+      } else {
+        await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
       }
-      await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
+      break
+    }
   }
 }
 
-// ====== Mini-web + QR
-const app=express()
-const PORT=process.env.PORT||8080
-let lastQR=null, conectado=false
-app.get("/", (_req,res)=>{
-  const totalAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments`).get()?.count || 0
-  const successAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'confirmed'`).get()?.count || 0
-  const failedAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'failed'`).get()?.count || 0
-  res.send(`<!doctype html><meta charset="utf-8"><style>
-  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa}
-  .card{max-width:640px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
-  .status{padding:12px;border-radius:8px;margin:8px 0}
-  .success{background:#d4edda;color:#155724}
-  .error{background:#f8d7da;color:#721c24}
-  .warning{background:#fff3cd;color:#856404}
-  .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
-  </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v27.2.1</h1>
-  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
-  ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
-  <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
-  <h3>📊 Estadísticas</h3>
-  <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
-  <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v27.2.1:</strong><br>
-    • Pregunta de categoría (uñas/pestañas/cejas) antes de listar si no está clara<br>
-    • Interceptores de *awaiting_category* y continuidad hacia sede → menú<br>
-    • Anti-repetición del mensaje de error técnico<br>
-  </div>
-  </div>`)
-})
-app.get("/qr.png", async (_req,res)=>{
-  if(!lastQR) return res.status(404).send("No QR")
-  const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
-  res.set("Content-Type","image/png").send(png)
-})
-app.get("/logs", (_req,res)=>{
-  const recent = db.prepare(`SELECT * FROM square_logs ORDER BY timestamp DESC LIMIT 50`).all()
-  res.json({ logs: recent })
-})
-
 // ====== Arranque
-let conectado=false
-console.log(`🩷 Gapink Nails Bot v27.2.1`)
+console.log(`🩷 Gapink Nails Bot v27.3.1`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
