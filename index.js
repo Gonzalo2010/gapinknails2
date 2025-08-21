@@ -97,8 +97,9 @@ function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torr
 
 // ====== Horario helpers
 function isHolidayEU(d){
-  const dd=String(d.date()).padStart(2,"0"), mm=String(d.month()+1).padStart(2,"0")
-  return HOLIDAYS_EXTRA.includes(${dd}/${mm})
+  const dd = String(d.date()).padStart(2,"0");
+  const mm = String(d.month()+1).padStart(2,"0");
+  return HOLIDAYS_EXTRA.includes(`${dd}/${mm}`);
 }
 function insideBusinessHours(d,dur){
   const t=d.clone()
