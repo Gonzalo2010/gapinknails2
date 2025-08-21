@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v27.2.1
+// index.js — Gapink Nails · v27.2.1.0
 // Cambios clave respecto a v27.2.0.0:
 // • Pregunta de categoría (uñas/pestañas/cejas) si no está clara antes de listar servicios.
 // • Menús filtrados por categoría y sede (uñas/pestañas/cejas).
