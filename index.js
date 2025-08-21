@@ -82,13 +82,15 @@ function applySpanishDiacritics(label){
   return x
 }
 function normalizePhoneES(raw){
-  const d=onlyDigits(raw); if(!d) return null
-  if (raw.startsWith("+") && d.length>=8 && d.length<=15) return +${d}
-  if (d.startsWith("34") && d.length===11) return +${d}
-  if (d.length===9) return +34${d}
-  if (d.startsWith("00")) return +${d.slice(2)}
-  return +${d}
+  const d = onlyDigits(raw); 
+  if (!d) return null;
+  if (raw.startsWith("+") && d.length >= 8 && d.length <= 15) return `+${d}`;
+  if (d.startsWith("34") && d.length === 11) return `+${d}`;
+  if (d.length === 9) return `+34${d}`;
+  if (d.startsWith("00")) return `+${d.slice(2)}`;
+  return `+${d}`;
 }
+
 function locationToId(key){ return key==="la_luz" ? LOC_LUZ : LOC_TORRE }
 function idToLocKey(id){ return id===LOC_LUZ ? "la_luz" : id===LOC_TORRE ? "torremolinos" : null }
 function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torremolinos" }
