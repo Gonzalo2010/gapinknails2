@@ -1,9 +1,8 @@
-// index.js — Gapink Nails · v27.5.2
-// Cambios vs v27.5.1:
-// • Cambio rápido de categoría dentro de la pantalla de servicios (p.ej. “de pestañas”).
-// • Al pedir “con {nombre}” no permitido en la sede: listado numerado de alternativas y estado awaiting_staff_alt.
-// • Acepta número o nombre (con o sin “con”) para elegir alternativa. Repropone horas con esa profesional.
-// • Mantiene todos los fixes de sintaxis/plantillas y el fix de no forzar preferida al confirmar.
+// index.js — Gapink Nails · v27.5.3
+// Cambios vs v27.5.2:
+// • Se elimina la duplicidad de buildServiceChoiceListBySede (SyntaxError corregido).
+// • Mantiene: cambio de categoría “al vuelo” y flujo de alternativas de staff numeradas.
+// • Fixes de sintaxis, plantillas y DeepSeek header.
 
 import express from "express"
 import pino from "pino"
@@ -136,7 +135,7 @@ function fmtES(d){
 function enumerateHours(list){ return list.map((d,i)=>({ index:i+1, iso:d.format("YYYY-MM-DDTHH:mm"), pretty:fmtES(d) })) }
 function stableKey(parts){ const raw=Object.values(parts).join("|"); return createHash("sha256").update(raw).digest("hex").slice(0,48) }
 
-// ====== JSON seguro
+// ====== JSON y TZ
 function safeJSONStringify(value){
   const seen = new WeakSet()
   try{
@@ -150,8 +149,6 @@ function safeJSONStringify(value){
     })
   }catch{ try { return String(value) } catch { return "[Unserializable]" } }
 }
-
-// ====== TZ
 function parseToEU(input){
   if (dayjs.isDayjs(input)) return input.clone().tz(EURO_TZ)
   const s = String(input||"")
@@ -217,7 +214,7 @@ const insertSquareLog = db.prepare(`INSERT INTO square_logs
 (phone, action, request_data, response_data, error_data, timestamp, success)
 VALUES (@phone, @action, @request_data, @response_data, @error_data, @timestamp, @success)`)
 
-// ====== Empleadas/servicios
+// ====== Empleadas y servicios
 function deriveLabelsFromEnvKey(envKey){
   const raw = envKey.replace(/^SQ_EMP_/, "")
   const toks = raw.split("_").map(t=>norm(t)).filter(Boolean)
@@ -235,6 +232,7 @@ function parseEmployees(){
     const bookable = (book||"").toUpperCase()==="BOOKABLE"
     let allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
 
+    // Centros alternativos (EMP_CENTER_*), usar ALL o mapear a IDs de sede
     const empKey = "EMP_CENTER_" + k.replace(/^SQ_EMP_/, "")
     const empVal = process.env[empKey]
     if (empVal) {
@@ -287,6 +285,7 @@ function parseStaffAliases(){
       return map
     }catch{ return map }
   }
+  // CSV: "desi:TM123, lara:TM456"
   raw.split(",").map(s=>s.trim()).filter(Boolean).forEach(pair=>{
     const [a,b] = pair.split(":").map(x=>x?.trim())
     if (a && b) map.set(norm(a), b)
@@ -308,7 +307,7 @@ function findStaffByAliasToken(tokenNorm){
   return null
 }
 
-// ====== Servicios
+// Servicios (env)
 function titleCase(str){ return String(str||"").toLowerCase().replace(/\b([a-z])/g, (m)=>m.toUpperCase()) }
 function cleanDisplayLabel(label){
   const s = String(label||"").replace(/^\s*(luz|la\s*luz)\s+/i,"").trim()
@@ -334,7 +333,7 @@ function serviceLabelFromEnvKey(envKey){
 }
 function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...servicesForSedeKeyRaw("la_luz")] }
 
-// ====== Clasificación
+// ====== Clasificación por categorías
 const POS_NAIL_ANCHORS = [
   "uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente",
   "esculpida","esculpidas","press on","press-on","tips","francesa","frances","baby boomer","encapsulado","encapsulados","nivelacion","nivelación","esmaltado","esmalte"
@@ -369,18 +368,22 @@ function uniqueByLabel(arr){
   }
   return out
 }
+
+// — Uñas
 function nailsServicesForSede(sedeKey, userMsg){
   const allowPedi = shouldIncludePedicure(userMsg)
   const list = servicesForSedeKeyRaw(sedeKey)
   const filtered = list.filter(s=>isNailsLabel(s.norm, allowPedi))
   return uniqueByLabel(filtered)
 }
+// — Pestañas
 const LASH_EXCLUDE = ["foto","depil","láser","laser","pierna","axila","pubis","brazo","ingle","ingles","facial completo"]
 function lashesServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
   const anchors = ["pesta","pestañ","eyelash","lash","lifting","rizado","volumen","2d","3d","megavolumen","tinte","mega"]
   return uniqueByLabel(list.filter(s => anchors.some(a=>s.norm.includes(norm(a))) && !LASH_EXCLUDE.some(x=>s.norm.includes(norm(x)))))
 }
+// — Cejas
 const BROW_POS = ["ceja","cejas","brow","henna","laminad","perfilad","microblad","microshad","hairstroke","polvo","powder","ombr","retoque","hilo","threading","diseñ"]
 const BROW_EXCLUDE_ZONES = ["pierna","piernas","axila","axilas","pubis","ingle","ingles","bikini","brazos","espalda","facial completo","piernas completas","medias piernas"]
 function isBrowLabel(lbl){
@@ -395,6 +398,7 @@ function browsServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
   return uniqueByLabel(list.filter(s => isBrowLabel(s.norm)))
 }
+// — Depilación
 const DEPIL_POS = ["depil","cera","cerado","fotodepil","láser","laser","ipl","fotodep","hilo","wax"]
 const DEPIL_ALIAS_ZONES = ["pierna","piernas","axila","axilas","pubis","perianal","ingle","ingles","bikini","brazos","espalda","labio","facial","ceja","cejas","mentón","patillas","abdomen","pecho","hombros","nuca","glúteos"]
 function isDepilLabel(lbl){
@@ -408,6 +412,7 @@ function depilacionServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
   return uniqueByLabel(list.filter(s => isDepilLabel(s.norm)))
 }
+// — Selector por categoría
 function servicesByCategory(sedeKey, category, userMsg){
   switch ((category||"").toLowerCase()){
     case "uñas": return nailsServicesForSede(sedeKey, userMsg)
@@ -459,7 +464,7 @@ function resolveEnvKeyFromLabelAndSede(label, sedeKey){
   return list.find(s=>s.label.toLowerCase()===String(label||"").toLowerCase())?.key || null
 }
 
-// ====== IA
+// ====== IA HTTP
 async function callAIOnce(messages, systemPrompt = "") {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
@@ -595,8 +600,6 @@ function saveSession(phone,s){
 function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
 
 // ====== Cola y envío
-let RECONNECT_SCHEDULED = false
-let RECONNECT_ATTEMPTS = 0
 const QUEUE=new Map()
 function enqueue(key,job){
   const prev=QUEUE.get(key)||Promise.resolve()
@@ -626,8 +629,7 @@ function parseNameEmailFromText(txt){
   const name = String(txt||"").replace(email||"", "").replace(/(email|correo)[:\s]*/ig,"").trim()
   return { name: name || null, email }
 }
-
-// Extra: detectar staff en texto libre (sin "con")
+// detectar staff libre (sin “con”)
 function findStaffFromFreeText(txt){
   const words = norm(txt).split(" ").filter(Boolean)
   for (const w of words){
@@ -637,28 +639,7 @@ function findStaffFromFreeText(txt){
   return null
 }
 
-// ====== Menús por categoría
-function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates, category){
-  const list = servicesByCategory(sedeKey, category, userMsg)
-  const localScores = new Map()
-  for (const s of list){ localScores.set(s.label, titleCaseScore(userMsg, s.label)) }
-  const aiMap = new Map()
-  if (Array.isArray(aiCandidates)){
-    for (const c of aiCandidates){
-      const label = String(cleanDisplayLabel(c.label||"")).trim(); if (!label) continue
-      const conf = Number(c.confidence ?? 0)
-      const prev = localScores.get(label) ?? 0
-      localScores.set(label, prev + Math.max(0, conf*3))
-      aiMap.set(label, conf)
-    }
-  }
-  const inAI = list.filter(s=>aiMap.has(s.label)).sort((a,b)=> (aiMap.get(b.label)-aiMap.get(a.label)) || ((localScores.get(b.label)||0)-(localScores.get(a.label)||0)))
-  const rest = list.filter(s=>!aiMap.has(s.label)).sort((a,b)=> (localScores.get(b.label)||0)-(localScores.get(a.label)||0))
-  const final = [...inAI, ...rest]
-  return final.map((s,i)=>({ index:i+1, label:s.label }))
-}
-
-// ====== Proponer horas
+// ====== Proponer horas & disponibilidad
 function proposeSlots({ fromEU, durationMin=60, n=3 }){
   const out=[]
   let t = ceilToSlotEU(fromEU.clone())
@@ -732,7 +713,7 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
   }catch{ return [] }
 }
 
-// ====== Square booking
+// ====== Square booking helpers
 async function getServiceIdAndVersion(envKey){
   const raw = process.env[envKey]; if (!raw) return null
   let [id, ver] = String(raw).split("|"); ver=ver?Number(ver):null
@@ -851,7 +832,7 @@ ESTADO:
   try { return JSON.parse(cleaned) } catch { return buildLocalFallback(userMessage, sessionData) }
 }
 
-// ====== Estados y acciones
+// ====== Acciones
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
   const incomingCat = params?.category || sessionData.category || sessionData.pendingCategory || detectCategory(userMsg)
   if (!incomingCat || !["uñas","pestañas","cejas","depilación"].includes(incomingCat)){
@@ -935,7 +916,7 @@ async function executeProposeTime(_params, sessionData, phone, sock, jid) {
   await sendWithPresence(sock, jid, `${header}\n${lines}\n\nResponde con el número (1, 2 o 3)`)
 }
 
-// ====== Crear reserva (mantiene fix de preferida)
+// ====== Crear reserva
 async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!sessionData.sede) { await sendWithPresence(sock, jid, "Falta seleccionar la sede (Torremolinos o La Luz)"); return; }
   if (!sessionData.selectedServiceEnvKey) { await sendWithPresence(sock, jid, "Falta seleccionar el servicio"); return; }
@@ -1078,7 +1059,7 @@ async function findOrCreateCustomerWithRetry({ name, email, phone }){
   return null
 }
 
-// ====== Estados auxiliares: staff alternativas
+// ====== Staff alternativas helper
 function buildAltStaffListForSede(locKey){
   const locId = locationToId(locKey)
   return EMPLOYEES
@@ -1097,7 +1078,6 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
         }
       })
     }
-    // Resolver clave de servicio si falta
     if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
       const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
       if (ek) sessionData.selectedServiceEnvKey = ek
@@ -1142,7 +1122,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   }
 }
 
-// ====== Baileys & Bot
+// ====== Baileys loader + parse “con {nombre}”
 async function loadBaileys(){
   const require = createRequire(import.meta.url); let mod=null
   try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ try{ mod=await import("@whiskeysockets/baileys") }catch{} }
@@ -1153,8 +1133,6 @@ async function loadBaileys(){
   const Browsers = mod.Browsers || mod.default?.Browsers || { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
-
-// 👉 parse “con {nombre}”
 function parsePreferredStaffFromText(text){
   const t = norm(text)
   const m = t.match(/\bcon\s+([a-zñáéíóú]+)\b/i)
@@ -1163,6 +1141,74 @@ function parsePreferredStaffFromText(text){
   return findStaffByAliasToken(token)
 }
 
+// ====== Listar/cancelar
+async function enumerateCitasByPhone(phone){
+  const items=[]
+  let cid=null
+  try{
+    const e164=normalizePhoneES(phone)
+    const s=await square.customersApi.searchCustomers({ query:{ filter:{ phoneNumber:{ exact:e164 } } } })
+    cid=(s?.result?.customers||[])[0]?.id||null
+  }catch{}
+  if (cid){
+    try{
+      const resp=await square.bookingsApi.listBookings(undefined, undefined, cid)
+      const list=resp?.result?.bookings||[]
+      const nowISO=new Date().toISOString()
+      const seen = new Set()
+      for (const b of list){
+        if (!b?.startAt || b.startAt<nowISO) continue
+        if (seen.has(b.id)) continue
+        seen.add(b.id)
+        const start=dayjs(b.startAt).tz(EURO_TZ)
+        const seg=(b.appointmentSegments||[{}])[0]
+        items.push({
+          index:items.length+1,
+          id:b.id,
+          fecha_iso:start.format("YYYY-MM-DD"),
+          pretty:fmtES(start),
+          sede: locationNice(idToLocKey(b.locationId)||""),
+          profesional: staffLabelFromId(seg?.teamMemberId) || "Profesional",
+        })
+      }
+      items.sort((a,b)=> (a.fecha_iso.localeCompare(b.fecha_iso)) || (a.pretty.localeCompare(b.pretty)))
+    }catch(e){}
+  }
+  return items
+}
+async function executeListAppointments(_params, _sessionData, phone, sock, jid) {
+  const appointments = await enumerateCitasByPhone(phone);
+  if (!appointments.length) { await sendWithPresence(sock, jid, "No tienes citas programadas. ¿Quieres agendar una?"); return; }
+  const message = `Tus próximas citas (asociadas a tu número):\n\n${appointments.map(apt => 
+    `${apt.index}) ${apt.pretty}\n📍 ${apt.sede}\n👩‍💼 ${apt.profesional}\n`
+  ).join("\n")}`;
+  await sendWithPresence(sock, jid, message);
+}
+async function executeCancelAppointment(params, sessionData, phone, sock, jid) {
+  const appointments = await enumerateCitasByPhone(phone);
+  if (!appointments.length) { await sendWithPresence(sock, jid, "No encuentro citas futuras asociadas a tu número. ¿Quieres que te ayude a reservar?"); return; }
+  const appointmentIndex = params?.appointmentIndex;
+  if (!appointmentIndex) {
+    sessionData.cancelList = appointments
+    sessionData.stage = "awaiting_cancel"
+    saveSession(phone, sessionData)
+    const message = `Estas son tus próximas citas (por tu número). ¿Cuál quieres cancelar?\n\n${appointments.map(apt => 
+      `${apt.index}) ${apt.pretty} - ${apt.sede}`
+    ).join("\n")}\n\nResponde con el número`
+    await sendWithPresence(sock, jid, message);
+    return;
+  }
+  const appointment = appointments.find(apt => apt.index === appointmentIndex);
+  if (!appointment) { await sendWithPresence(sock, jid, "No encontré esa cita. ¿Puedes verificar el número?"); return; }
+  const success = await cancelBooking(appointment.id);
+  if (success) { await sendWithPresence(sock, jid, `✅ Cita cancelada: ${appointment.pretty} en ${appointment.sede}`) }
+  else { await sendWithPresence(sock, jid, "No pude cancelar la cita. Por favor contacta directamente al salón.") }
+  delete sessionData.cancelList
+  sessionData.stage = null
+  saveSession(phone, sessionData)
+}
+
+// ====== Bot: start + mini web
 async function startBot(){
   try{
     const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
@@ -1172,11 +1218,11 @@ async function startBot(){
     const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:Browsers.macOS("Desktop"), syncFullHistory:false })
     globalThis.sock=sock
 
-    let lastQR=null, conectado=false
+    let lastQR=null
     sock.ev.on("connection.update", ({connection,qr})=>{
-      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
-      if (connection==="open"){ lastQR=null; conectado=true; }
-      if (connection==="close"){ conectado=false; setTimeout(()=>startBot().catch(console.error), 2000) }
+      if (qr){ lastQR=qr; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
+      if (connection==="open"){ lastQR=null }
+      if (connection==="close"){ setTimeout(()=>startBot().catch(console.error), 2000) }
     })
     sock.ev.on("creds.update", saveCreds)
 
@@ -1208,7 +1254,7 @@ async function startBot(){
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
 
-          // Silencio temporal con "."
+          // Silenciar con "."
           const trimmed = textRaw.trim()
           const nowEU = dayjs().tz(EURO_TZ)
           if (trimmed === ".") {
@@ -1225,7 +1271,7 @@ async function startBot(){
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
 
-          // === CAMBIO DE CATEGORÍA mientras muestra lista de servicios
+          // === CAMBIO DE CATEGORÍA mientras lista servicios
           const newCat = detectCategory(textRaw)
           if (sessionData.stage==="awaiting_service_choice" && newCat && newCat !== sessionData.category){
             sessionData.category = newCat
@@ -1235,7 +1281,7 @@ async function startBot(){
             return
           }
 
-          // === Alternativas de staff (elegir por número o nombre)
+          // === Alternativas de staff
           if (sessionData.stage==="awaiting_staff_alt" && Array.isArray(sessionData.staffAltOptions) && sessionData.staffAltOptions.length){
             let chosen = null
             if (numMatch){
@@ -1327,10 +1373,9 @@ async function startBot(){
             return
           }
 
-          // === Selección de servicio por número
+          // === Selección de servicio por número o por nombre exacto
           if (sessionData.stage==="awaiting_service_choice" && Array.isArray(sessionData.serviceChoices) && sessionData.serviceChoices.length){
             if (!numMatch){
-              // además de número, admite que el usuario escriba el nombre del servicio exacto
               const byName = sessionData.serviceChoices.find(it => norm(it.label) === norm(textRaw))
               if (byName){
                 const ek2 = resolveEnvKeyFromLabelAndSede(byName.label, sessionData.sede)
@@ -1404,7 +1449,7 @@ async function startBot(){
             }
           }
 
-          // === “con {nombre}” → preferencia
+          // === “con {nombre}” o nombre suelto → preferencia
           if (sessionData.sede && sessionData.selectedServiceEnvKey){
             const maybe = parsePreferredStaffFromText(textRaw) || findStaffFromFreeText(textRaw)
             if (maybe){
@@ -1416,9 +1461,7 @@ async function startBot(){
                 await executeProposeTime({}, sessionData, phone, sock, jid)
                 return
               } else {
-                // Construir alternativas válidas en la sede y pedir elección
-                const altsRaw = buildAltStaffListForSede(sessionData.sede)
-                  .filter(x => x.id !== maybe.id)
+                const altsRaw = buildAltStaffListForSede(sessionData.sede).filter(x => x.id !== maybe.id)
                 const unique = []
                 const seen = new Set()
                 for (const a of altsRaw){
@@ -1440,12 +1483,11 @@ async function startBot(){
 
           // === Intento de cancelar por intención
           if (isCancelIntent(textRaw) && sessionData.stage!=="awaiting_cancel"){
-            const { executeListAppointments: _l } = await import("node:module").then(()=>({})) // no-op para mantener estructura
             await executeCancelAppointment({}, sessionData, phone, sock, jid)
             return
           }
 
-          // === Si aún no hay categoría y el mensaje no especifica, preguntar
+          // === Si no hay categoría y el mensaje no especifica
           if (!sessionData.category && !detectCategory(textRaw) && !sessionData.selectedServiceEnvKey){
             sessionData.stage = "awaiting_category"
             saveSession(phone, sessionData)
@@ -1484,13 +1526,14 @@ async function startBot(){
       .warning{background:#fff3cd;color:#856404}
       .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
       </style><div class="card">
-      <h1>🩷 Gapink Nails Bot v27.5.2</h1>
+      <h1>🩷 Gapink Nails Bot v27.5.3</h1>
       <div class="status ${sock.user ? 'success' : 'error'}">Estado WhatsApp: ${sock.user ? "✅ Conectado" : "❌ Desconectado"}</div>
       <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
       <h3>📊 Estadísticas</h3>
       <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
       <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-        <strong>🚀 Mejoras v27.5.2:</strong><br>
+        <strong>🚀 Mejoras v27.5.3:</strong><br>
+        • Corrección de función duplicada.<br>
         • Cambio de categoría en la lista de servicios (“de pestañas/cejas/depilación”).<br>
         • Alternativas de staff con selección por número o nombre.<br>
       </div>
@@ -1505,82 +1548,15 @@ async function startBot(){
       const recent = db.prepare(`SELECT * FROM square_logs ORDER BY timestamp DESC LIMIT 50`).all()
       res.json({ logs: recent })
     })
-    app.listen(PORT, ()=>console.log(`🩷 Gapink Nails Bot v27.5.2 — Web ${PORT}`))
+    app.listen(PORT, ()=>console.log(`🩷 Gapink Nails Bot v27.5.3 — Web ${PORT}`))
 
   }catch(e){ 
     setTimeout(() => startBot().catch(console.error), 5000) 
   }
 }
 
-// ====== Listar/cancelar
-async function enumerateCitasByPhone(phone){
-  const items=[]
-  let cid=null
-  try{
-    const e164=normalizePhoneES(phone)
-    const s=await square.customersApi.searchCustomers({ query:{ filter:{ phoneNumber:{ exact:e164 } } } })
-    cid=(s?.result?.customers||[])[0]?.id||null
-  }catch{}
-  if (cid){
-    try{
-      const resp=await square.bookingsApi.listBookings(undefined, undefined, cid)
-      const list=resp?.result?.bookings||[]
-      const nowISO=new Date().toISOString()
-      const seen = new Set()
-      for (const b of list){
-        if (!b?.startAt || b.startAt<nowISO) continue
-        if (seen.has(b.id)) continue
-        seen.add(b.id)
-        const start=dayjs(b.startAt).tz(EURO_TZ)
-        const seg=(b.appointmentSegments||[{}])[0]
-        items.push({
-          index:items.length+1,
-          id:b.id,
-          fecha_iso:start.format("YYYY-MM-DD"),
-          pretty:fmtES(start),
-          sede: locationNice(idToLocKey(b.locationId)||""),
-          profesional: staffLabelFromId(seg?.teamMemberId) || "Profesional",
-        })
-      }
-      items.sort((a,b)=> (a.fecha_iso.localeCompare(b.fecha_iso)) || (a.pretty.localeCompare(b.pretty)))
-    }catch(e){}
-  }
-  return items
-}
-async function executeListAppointments(_params, _sessionData, phone, sock, jid) {
-  const appointments = await enumerateCitasByPhone(phone);
-  if (!appointments.length) { await sendWithPresence(sock, jid, "No tienes citas programadas. ¿Quieres agendar una?"); return; }
-  const message = `Tus próximas citas (asociadas a tu número):\n\n${appointments.map(apt => 
-    `${apt.index}) ${apt.pretty}\n📍 ${apt.sede}\n👩‍💼 ${apt.profesional}\n`
-  ).join("\n")}`;
-  await sendWithPresence(sock, jid, message);
-}
-async function executeCancelAppointment(params, sessionData, phone, sock, jid) {
-  const appointments = await enumerateCitasByPhone(phone);
-  if (!appointments.length) { await sendWithPresence(sock, jid, "No encuentro citas futuras asociadas a tu número. ¿Quieres que te ayude a reservar?"); return; }
-  const appointmentIndex = params?.appointmentIndex;
-  if (!appointmentIndex) {
-    sessionData.cancelList = appointments
-    sessionData.stage = "awaiting_cancel"
-    saveSession(phone, sessionData)
-    const message = `Estas son tus próximas citas (por tu número). ¿Cuál quieres cancelar?\n\n${appointments.map(apt => 
-      `${apt.index}) ${apt.pretty} - ${apt.sede}`
-    ).join("\n")}\n\nResponde con el número`
-    await sendWithPresence(sock, jid, message);
-    return;
-  }
-  const appointment = appointments.find(apt => apt.index === appointmentIndex);
-  if (!appointment) { await sendWithPresence(sock, jid, "No encontré esa cita. ¿Puedes verificar el número?"); return; }
-  const success = await cancelBooking(appointment.id);
-  if (success) { await sendWithPresence(sock, jid, `✅ Cita cancelada: ${appointment.pretty} en ${appointment.sede}`) }
-  else { await sendWithPresence(sock, jid, "No pude cancelar la cita. Por favor contacta directamente al salón.") }
-  delete sessionData.cancelList
-  sessionData.stage = null
-  saveSession(phone, sessionData)
-}
-
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v27.5.2`)
+console.log(`🩷 Gapink Nails Bot v27.5.3`)
 startBot().catch(console.error)
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
