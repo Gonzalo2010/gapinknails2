@@ -1,4 +1,4 @@
-// index.js — Gapink Nails Bot · v28.3.1 (fix preferencia de profesional en horas + confirmación))
+// index.js — Gapink Nails Bot · v28.3.1 (fix preferencia de profesional en horas + confirmación)
 
 // ============== IMPORTS ==============
 import express from "express"
