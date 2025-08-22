@@ -1,4 +1,4 @@
-// index.js — Gapink Nails Bot · v28.3.0
+// index.js — Gapink Nails Bot · v28.3.1 (fix preferencia de profesional en horas + confirmación)
 
 // ============== IMPORTS ==============
 import express from "express"
@@ -83,7 +83,7 @@ async function aiWithRetries(messages, system = ""){
 
 // Reescritura amable (fallback local si falla)
 async function aiRewrite(text){
-  const sys = "Reescribe el texto para WhatsApp en español, cercano y claro. Mantén la intención."
+  const sys = "Reescribe el texto para WhatsApp en español, cercano, claro y breve. Mantén la intención."
   const out = await aiWithRetries([{ role:"user", content: text }], sys)
   return out || text
 }
@@ -446,7 +446,7 @@ function depilacionServicesForSede(sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
   return uniqueByLabel(list.filter(s => isDepilLabel(s.norm)))
 }
-// Extra categorías (ligeras): mapea por palabras
+// Extra categorías (ligeras)
 function simpleFilterBy(words, sedeKey){
   const list = servicesForSedeKeyRaw(sedeKey)
   return uniqueByLabel(list.filter(s => words.some(w => s.norm.includes(norm(w)))))
@@ -543,7 +543,7 @@ async function getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid){
   }
   if (matches.length === 0){
     sessionData.stage = "awaiting_identity"
-    saveSession(sessionData.customer_phone || phone, sessionData)
+    saveSession(phone, sessionData)
     await sock.sendMessage(jid, { text: await aiRewrite("Para terminar, no encuentro tu ficha. Dime tu *nombre completo* y (opcional) tu *email* 😊") })
     return { status:"need_new" }
   }
@@ -818,10 +818,12 @@ async function startPickDayFlow(sessionData, phone, sock, jid){
   const opts = days.map((d,i)=>`${i+1}) ${fmtES(d).split(' ').slice(0,2).join(' ')}`).join("\n")
   await sendWithPresence(sock, jid, await aiRewrite(`¿Qué *día* te viene mejor?\n${opts}\n\nResponde con el número.`))
 }
-async function proposeHoursForDay(sessionData, phone, sock, jid){
+async function proposeHoursForDay(sessionData, phone, sock, jid, options = { forcePreferred:false }){
   const day = sessionData.chosenDayISO ? dayjs(sessionData.chosenDayISO).tz(EURO_TZ) : nextOpeningFrom(dayjs().tz(EURO_TZ))
   const from = day.hour(OPEN.start).minute(0).second(0).millisecond(0)
   let slots=[]
+  let usedPreferred = false
+
   if (sessionData.preferredStaffId && isStaffAllowedInLocation(sessionData.preferredStaffId, sessionData.sede)){
     const staffSlots = await searchAvailabilityForStaff({
       locationKey: sessionData.sede,
@@ -829,9 +831,12 @@ async function proposeHoursForDay(sessionData, phone, sock, jid){
       staffId: sessionData.preferredStaffId,
       fromEU: from, days: 1, n: 6, distinctDays:false
     })
-    slots = staffSlots
+    if (staffSlots.length){
+      slots = staffSlots
+      usedPreferred = true
+    }
   }
-  if (!slots.length){
+  if (!slots.length && !options.forcePreferred){
     const generic = await searchAvailabilityGeneric({
       locationKey: sessionData.sede,
       envServiceKey: sessionData.selectedServiceEnvKey,
@@ -843,17 +848,23 @@ async function proposeHoursForDay(sessionData, phone, sock, jid){
     const fallback = proposeSlots({ fromEU: from, durationMin:60, n:3 }).map(d=>({date:d, staffId:null}))
     slots = fallback
   }
+
   const hoursEnum = enumerateHours(slots.map(s=>s.date))
   const map = {}; for (const s of slots) map[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
   sessionData.lastHours = slots.map(s=>s.date)
   sessionData.lastStaffByIso = map
+  sessionData.lastProposeUsedPreferred = usedPreferred
   sessionData.stage = "awaiting_time"
   saveSession(phone, sessionData)
+
   const lines = hoursEnum.map(h=>{
     const sid = map[h.iso]; const tag = sid ? ` — ${staffLabelFromId(sid)}` : ""
     return `${h.index}) ${h.pretty}${tag}`
   }).join("\n")
-  await sendWithPresence(sock, jid, await aiRewrite(`Horarios disponibles (ese día):\n${lines}\n\nResponde con el número.`))
+  const header = usedPreferred
+    ? `Horarios con ${sessionData.preferredStaffLabel}:`
+    : `Horarios disponibles (ese día):`
+  await sendWithPresence(sock, jid, await aiRewrite(`${header}\n${lines}\n\nResponde con el número.`))
 }
 
 // ============== CREAR RESERVA ==============
@@ -866,11 +877,33 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!insideBusinessHours(startEU, 60)) { await sendWithPresence(sock, jid, await aiRewrite("Esa hora está fuera del horario (L-V 09:00–20:00)")); return; }
 
   const iso = startEU.format("YYYY-MM-DDTHH:mm")
-  let staffId = sessionData.lastProposeUsedPreferred ? (sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null)
-                                                    : (sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null)
+  let staffId = null
 
-  if (staffId && !isStaffAllowedInLocation(staffId, sessionData.sede)) {
-    staffId = null
+  // 💡 Preferencia explícita manda
+  if (sessionData.preferredStaffId && isStaffAllowedInLocation(sessionData.preferredStaffId, sessionData.sede)) {
+    // ¿Está ese mismo minuto con esa profesional?
+    const probeStaff = await searchAvailabilityForStaff({
+      locationKey: sessionData.sede,
+      envServiceKey: sessionData.selectedServiceEnvKey,
+      staffId: sessionData.preferredStaffId,
+      fromEU: startEU.clone().subtract(1,"minute"),
+      days: 1, n: 20
+    })
+    const matchStaff = probeStaff.find(x => x.date.isSame(startEU,"minute"))
+    if (matchStaff){
+      staffId = sessionData.preferredStaffId
+    } else {
+      // No está esa hora con la pro pedida → re-proponer solo con ella
+      await sendWithPresence(sock, jid, await aiRewrite(`Justo a esa hora no veo hueco con ${sessionData.preferredStaffLabel}. Te paso opciones de ese día con ${sessionData.preferredStaffLabel} 👇`))
+      await proposeHoursForDay(sessionData, phone, sock, jid, { forcePreferred:true })
+      return
+    }
+  }
+
+  // Si no hay preferida o no coincide exacto, usar mapa del slot o cualquier permitido
+  if (!staffId){
+    staffId = sessionData.lastStaffByIso?.[iso] || null
+    if (staffId && !isStaffAllowedInLocation(staffId, sessionData.sede)) staffId = null
   }
   if (!staffId) {
     const probe = await searchAvailabilityGeneric({ locationKey: sessionData.sede, envServiceKey: sessionData.selectedServiceEnvKey, fromEU: startEU.clone().subtract(1, "minute"), days: 1, n: 10 })
@@ -1092,7 +1125,7 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v28.3.0</h1>
+  <h1>🩷 Gapink Nails Bot v28.3.1</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
@@ -1126,7 +1159,7 @@ async function loadBaileys(){
 async function startBot(){
   try{
     const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
-    if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
+    if(!fs.existsSync("auth_info")) fs.mkdirkdir("auth_info",{recursive:true})
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
     const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:Browsers.macOS("Desktop"), syncFullHistory:false })
@@ -1185,18 +1218,30 @@ async function startBot(){
           }
           if (isFromMe) { saveSession(phone, sessionData); return }
 
+          const lower = norm(textRaw)
+          const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
+
           // Preferencia “con {nombre}”
           const maybeStaff = parsePreferredStaffFromText(textRaw)
           if (maybeStaff) {
-            if (!sessionData.sede){
-              // No tenemos sede aún → pedimos sede primero
-            }
             sessionData.preferredStaffId = maybeStaff.id
             sessionData.preferredStaffLabel = staffLabelFromId(maybeStaff.id)
             saveSession(phone, sessionData)
+            // Si estamos eligiendo hora, re-proponemos horas solo con esa profesional
+            if (sessionData.stage === "awaiting_time"){
+              if (!isStaffAllowedInLocation(maybeStaff.id, sessionData.sede)){
+                const names = allowedStaffNamesForSede(sessionData.sede)
+                await sendWithPresence(sock, jid, await aiRewrite(`Esa profesional no atiende en ${locationNice(sessionData.sede)}. En esa sede están: ${names.join(", ")}. Dime con quién prefieres.`))
+                return
+              }
+              await sendWithPresence(sock, jid, await aiRewrite(`Perfecto, te muestro horas con ${sessionData.preferredStaffLabel} ese día:`))
+              await proposeHoursForDay(sessionData, phone, sock, jid, { forcePreferred:true })
+              return
+            }
           }
 
-          // ====== GUARDIAS DE ETAPA: UNA PREGUNTA A LA VEZ ======
+          // ====== GUARDIAS DE ETAPA ======
+
           // Sede para listar servicios
           if (sessionData.stage === "awaiting_sede_for_services") {
             const sede = parseSede(textRaw)
@@ -1227,7 +1272,6 @@ async function startBot(){
           }
 
           // Identidad: varias fichas
-          const numMatch = norm(textRaw).match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
           if (sessionData.stage==="awaiting_identity_pick"){
             if (!numMatch){ await sendWithPresence(sock, jid, await aiRewrite("Responde con el número de tu ficha (1, 2, …).")); return }
             const n = Number(numMatch[1])
@@ -1331,7 +1375,6 @@ async function startBot(){
           }
 
           // ====== FLUJO PRINCIPAL ======
-          // Si aún no hay categoría y el mensaje no especifica, preguntar
           const catDetected = detectCategory(textRaw)
           if (!sessionData.category && !catDetected && !sessionData.selectedServiceEnvKey){
             sessionData.stage = "awaiting_category"
@@ -1400,7 +1443,7 @@ function safeListen(){
   }
 }
 
-console.log(`🩷 Gapink Nails Bot v28.3.0`)
+console.log(`🩷 Gapink Nails Bot v28.3.1`)
 safeListen()
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
