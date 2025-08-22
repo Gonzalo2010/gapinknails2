@@ -1,4 +1,4 @@
-// index.js — Gapink Bot · v30.2.0
+// index.js — Gapink Bot · v30.2.0.0
 // Mejora: menú de depilación SIEMPRE visible (con fuzzy match a Square), soporte texto libre en elección,
 // flujo mañana/tarde + esta/próxima semana, QR web, sin "doctor".
 
