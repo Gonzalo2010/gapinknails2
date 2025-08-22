@@ -1,4 +1,4 @@
-// index.js — Gapink Nails Bot · v28.3.1 (fix preferencia de profesional en horas + confirmación)
+// index.js — Gapink Nails Bot · v29.0.0 (QR fix + panel QR autorefresco + reconexión sólida)
 
 // ============== IMPORTS ==============
 import express from "express"
@@ -1112,36 +1112,59 @@ function parsePreferredStaffFromText(text){
 const app=express()
 const PORT=process.env.PORT||8080
 let lastQR=null, conectado=false
+
 app.get("/", (_req,res)=>{
   const totalAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments`).get()?.count || 0
   const successAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'confirmed'`).get()?.count || 0
   const failedAppts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'failed'`).get()?.count || 0
-  res.send(`<!doctype html><meta charset="utf-8"><style>
-  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa}
-  .card{max-width:640px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.1);background:white}
-  .status{padding:12px;border-radius:8px;margin:8px 0}
-  .success{background:#d4edda;color:#155724}
-  .error{background:#f8d7da;color:#721c24}
-  .warning{background:#fff3cd;color:#856404}
-  .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
-  </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v28.3.1</h1>
-  <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
-  ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
-  <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
-  <h3>📊 Estadísticas</h3>
-  <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
+
+  res.send(`<!doctype html><meta charset="utf-8">
+  <meta http-equiv="refresh" content="6">
+  <style>
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f6f7fb;margin:0}
+  .card{max-width:720px;width:90vw;padding:28px;border-radius:20px;box-shadow:0 8px 32px rgba(2,6,23,.12);background:white}
+  .row{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+  .status{padding:10px 14px;border-radius:10px;margin:10px 0;font-weight:600}
+  .success{background:#dcfce7;color:#065f46}
+  .error{background:#fee2e2;color:#991b1b}
+  .warning{background:#fff7ed;color:#9a3412}
+  .stat{display:inline-block;margin:6px 8px;padding:8px 12px;background:#eef2ff;color:#1e3a8a;border-radius:10px}
+  .qr{display:grid;place-items:center;margin:16px 0}
+  .note{color:#475569;font-size:14px}
+  code{background:#0f172a;color:#e2e8f0;padding:2px 6px;border-radius:6px}
+  </style>
+  <div class="card">
+    <h1>🩷 Gapink Nails Bot <small style="font-size:14px;color:#64748b">v29.0.0</small></h1>
+    <div class="row">
+      <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
+      <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
+    </div>
+    ${!conectado&&lastQR?`<div class="qr"><img src="/qr.png" width="300" height="300" style="border-radius:12px;box-shadow:0 6px 24px rgba(2,6,23,.15)"></div>
+    <div class="note">Escanea con WhatsApp > <b>Dispositivos vinculados</b>. Esta página refresca sola.</div>`:
+    (!conectado?`<div class="note">Esperando QR…</div>`:`<div class="note">Tu sesión está activa. ✅</div>`)}
+    <h3>📊 Estadísticas</h3>
+    <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
+    <p class="note">Tip: si necesitas re-vincular, borra <code>auth_info/</code> y refresca esta página.</p>
   </div>`)
 })
 app.get("/qr.png", async (_req,res)=>{
   if(!lastQR) return res.status(404).send("No QR")
-  const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
-  res.set("Content-Type","image/png").send(png)
+  try{
+    const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
+    res.set("Content-Type","image/png").send(png)
+  }catch(e){
+    res.status(500).send("QR error")
+  }
+})
+app.get("/qr.txt", (_req,res)=>{
+  if(!lastQR) return res.status(404).send("No QR")
+  res.type("text/plain").send(lastQR)
 })
 app.get("/logs", (_req,res)=>{
   const recent = db.prepare(`SELECT * FROM square_logs ORDER BY timestamp DESC LIMIT 50`).all()
   res.json({ logs: recent })
 })
+app.get("/health", (_req,res)=>res.json({ ok:true, connected:conectado, hasQR: !!lastQR }))
 
 // ============== BAILEYS (WhatsApp) ==============
 async function loadBaileys(){
@@ -1159,17 +1182,34 @@ async function loadBaileys(){
 async function startBot(){
   try{
     const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
-    if(!fs.existsSync("auth_info")) fs.mkdirkdir("auth_info",{recursive:true})
+
+    // ⚠️ FIX: crear carpeta auth correctamente (typo arreglado)
+    if (!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
+
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
-    const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:Browsers.macOS("Desktop"), syncFullHistory:false })
+    const sock = makeWASocket({
+      logger:pino({level:"silent"}),
+      printQRInTerminal:false, // lo pintamos nosotros
+      auth:state,
+      version,
+      browser:Browsers.macOS("Desktop"),
+      syncFullHistory:false
+    })
     globalThis.sock=sock
 
-    sock.ev.on("connection.update", ({connection,qr})=>{
-      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
-      if (connection==="open"){ lastQR=null; conectado=true; RECONNECT_ATTEMPTS=0; RECONNECT_SCHEDULED=false; }
-      if (connection==="close"){ 
-        conectado=false; 
+    sock.ev.on("connection.update", ({connection,qr,lastDisconnect})=>{
+      if (qr){
+        lastQR=qr; conectado=false
+        try{ qrcodeTerminal.generate(qr,{small:true}) }catch{}
+      }
+      if (connection==="open"){
+        lastQR=null; conectado=true; RECONNECT_ATTEMPTS=0; RECONNECT_SCHEDULED=false
+        if (BOT_DEBUG) console.log("WhatsApp conectado ✅")
+      }
+      if (connection==="close"){
+        conectado=false
+        if (BOT_DEBUG) console.log("WhatsApp desconectado ❌", lastDisconnect?.error?.message||"")
         if (!RECONNECT_SCHEDULED){
           RECONNECT_SCHEDULED = true
           const delay = Math.min(30000, 1500 * Math.pow(2, RECONNECT_ATTEMPTS++))
@@ -1184,6 +1224,9 @@ async function startBot(){
       const m=messages?.[0]; 
       if (!m?.message) return
       const jid = m.key.remoteJid
+      // Ignora grupos y estados
+      if (/@g\.us$/.test(jid) || /status@broadcast$/.test(jid)) return
+
       const isFromMe = !!m.key.fromMe
       const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
       const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
@@ -1422,6 +1465,7 @@ async function startBot(){
       })
     })
   }catch(e){ 
+    if (BOT_DEBUG) console.error("startBot error:", e?.message||e)
     setTimeout(() => startBot().catch(console.error), 5000) 
   }
 }
@@ -1443,7 +1487,7 @@ function safeListen(){
   }
 }
 
-console.log(`🩷 Gapink Nails Bot v28.3.1`)
+console.log(`🩷 Gapink Nails Bot v29.0.0`)
 safeListen()
 
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
