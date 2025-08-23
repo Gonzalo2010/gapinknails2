@@ -1,10 +1,4 @@
-// index.js — Gapink Nails · v30.2.1 “IA Full Menu + Clean Categories + Cat Persist”
-// Cambios v30.2.1:
-// • Persistimos la categoría (ej. depilation) cuando el usuario dice “con {nombre}”.
-// • Al elegir sede tras pedir staff, el menú usa esa categoría persistida (sin caer a uñas).
-// • buildServiceChoiceListBySedeAI(sedeKey, userMsg, overrideCat) para forzar categoría.
-// • Resto: mantiene mejoras previas (duraciones reales, staff por sede, etc.).
-
+// index.js — Gapink Nails · v31.0.0 “IA en todo + Staff Unknown + Categoría Bloqueada”
 import express from "express"
 import pino from "pino"
 import qrcode from "qrcode"
@@ -188,7 +182,7 @@ CREATE TABLE IF NOT EXISTS square_logs (
 
 const insertAppt = db.prepare(`INSERT INTO appointments
 (id,customer_name,customer_phone,customer_square_id,location_key,service_env_key,service_label,duration_min,start_iso,end_iso,staff_id,status,created_at,square_booking_id,square_error,retry_count)
-VALUES (@id,@customer_name,@customer_phone,@customer_square_id,@location_key,@service_env_key,@service_label,@duration_min,@start_iso,@end_iso,@staff_id,@status,@created_at,@square_booking_id,@square_error,@retry_count)`)
+VALUES (@id,@customer_name,@customer_phone,@customer_square_id,@location_key,@service_env_key,@service_label,@duration_min,@start_iso,@end_iso,@staff_id,@status,@created_at,@square_booking_id,@retry_count)`)
 
 const insertAIConversation = db.prepare(`INSERT OR REPLACE INTO ai_conversations
 (phone, message_id, user_message, ai_response, timestamp, session_data, ai_error, fallback_used)
@@ -295,9 +289,9 @@ function serviceLabelFromEnvKey(envKey){
 }
 function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...servicesForSedeKeyRaw("la_luz")] }
 
-// ====== Categorías (con negativos estrictos)
+// ====== Categorías
 const CATEGORIES = {
-  nails:{ key:"nails", nice:"uñas", anchorsPos:["uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente","esculpida","esculpidas","press","tips","francesa","baby boomer","encapsulado","nivelacion","nivelación","pedicur","pies","pie","esmalt","reconstruccion","uña rota","quit","relleno"], anchorsNeg:["pesta","pestañ","ceja","labio","facial","depil","fotodepil","laser","láser","endosphere","maderoterapia","masaje","hidra lips","hydra lips","eyeliner","microblading","micropigment"] },
+  nails:{ key:"nails", nice:"uñas", anchorsPos:["uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente","esculpida","esculpidas","press","tips","francesa","baby boomer","encapsulado","nivelacion","nivelación","pedicur","pies","pie","esmalt","reconstruccion","uña rota","quit","relleno"], anchorsNeg:["pesta","pestañ","ceja","labio","facial","depil","fotodepil","laser","láser","endosphere","maderoterapia","masaje","hydra lips","eyeliner","microblading","micropigment"] },
   depilation:{ key:"depilation", nice:"depilación", anchorsPos:["depil","fotodepil","laser","láser","axilas","ingles","inglés","labio","piernas","brazos","pubis","perianal","nasal","fosas"], anchorsNeg:["uña","acril","gel","microblading","micropigment","pesta","facial","masaje","maderoterapia","endosphere"] },
   micropigmentation:{ key:"micropig", nice:"micropigmentación", anchorsPos:["microblading","micropigment","hairstroke","polvo","eyeliner","labios","aquarela","hydra lips","retoque"], anchorsNeg:["uña","depil","laser","pesta","facial","masaje"] },
   lashes:{ key:"lashes", nice:"pestañas", anchorsPos:["pesta","pestañ","extension","extensión","lifting","tinte","relleno","2d","3d","pelo a pelo"], anchorsNeg:["uña","depil","labio","microblading","micropigment","facial","masaje"] },
@@ -326,9 +320,17 @@ function isLabelInCategoryHeuristic(labelNorm, catKey, allowPedicure){
   const bad = cat.anchorsNeg.some(a=>labelNorm.includes(norm(a)))
   return ok && !bad
 }
-function uniqueByLabel(arr){ const seen=new Set(); const out=[]; for (const s of arr){ const key = s.label.toLowerCase(); if (seen.has(key)) continue; seen.add(key); out.push(s) } return out }
+function uniqueByLabel(arr){
+  const seen=new Set(); const out=[]
+  for (const s of arr){
+    const key = s.label.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key); out.push(s)
+  }
+  return out
+}
 
-// ====== IA helpers (detección/filtro categoría)
+// ====== IA helpers
 async function callAIOnce(messages, systemPrompt = "") {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
@@ -390,7 +392,7 @@ async function aiFilterServicesByCategory(sedeKey, catKey){
   return []
 }
 
-// ====== Construcción de menús por sede/categoría (IA + heurística)
+// ====== Menús por sede/categoría (IA + heurística)
 function scoreServiceRelevance(userMsg, label){
   const u = norm(userMsg), l = norm(label); let score = 0
   if (/\b(uñas|unas)\b/.test(u) && /\b(uñas|unas|manicura)\b/.test(l)) score += 3
@@ -399,8 +401,7 @@ function scoreServiceRelevance(userMsg, label){
   if (/\bgel\b/.test(u) && l.includes("gel")) score += 2.5
   if (/\bsemi|semipermanente\b/.test(u) && l.includes("semi")) score += 2
   if (/\brelleno\b/.test(u) && (l.includes("uña") || l.includes("manicura") || l.includes("gel") || l.includes("acril"))) score += 2
-  if (/\bretir(ar|o)\b/.test(u) && (l.includes("retir")||l.includes("retiro")||l.includes("quitar"))) score += 1.5
-  if (/\bpress\b/.test(u) && l.includes("press")) score += 1.2
+  if (/\bretir(ar|o)|quitar\b/.test(u) && (l.includes("retir")||l.includes("retiro")||l.includes("quitar"))) score += 1.5
   if (/\bdepil|fotodepil|laser|láser\b/.test(u) && /\b(axilas|ingles|inglés|labio|piernas|brazos|pubis|perianal|nasales?)\b/.test(l)) score += 2.5
   if (/\bmicroblading|micropigment|hairstroke|eyeliner|aquarela|labios\b/.test(u) && /\b(micro|hair|eyeliner|labios|aquarela|polvo)\b/.test(l)) score += 2.5
   if (/\bpestañ|pesta|lifting|tinte|2d|3d\b/.test(u) && /\b(pesta|lifting|tinte|2d|3d)\b/.test(l)) score += 2.5
@@ -423,10 +424,17 @@ async function buildServiceChoiceListBySedeAI(sedeKey, userMsg, overrideCat=null
   const aiList = await aiFilterServicesByCategory(sedeKey, catKey)
   const heur = servicesForSedeKeyRaw(sedeKey).filter(s=>isLabelInCategoryHeuristic(s.norm, catKey, allowPedi))
 
+  // Intersección preferente IA+heurística
   const aiSet = new Set(aiList.map(s=>s.label))
-  const finalBase = heur.filter(s=> aiSet.has(s.label))
-  const pool = finalBase.length ? finalBase : heur
+  let pool = heur.filter(s=> aiSet.has(s.label))
+  if (!pool.length) pool = heur
 
+  // Deduplicar por etiqueta
+  const byLabel = new Map()
+  for (const s of pool){ const k = s.label.toLowerCase(); if (!byLabel.has(k)) byLabel.set(k, s) }
+  pool = Array.from(byLabel.values())
+
+  // Scoring
   const localScores = new Map()
   for (const s of pool){ localScores.set(s.label, scoreServiceRelevance(userMsg, s.label)) }
   const aiBoost = new Set(aiList.map(s=>s.label))
@@ -435,7 +443,8 @@ async function buildServiceChoiceListBySedeAI(sedeKey, userMsg, overrideCat=null
     const lb = (localScores.get(b.label)||0) + (aiBoost.has(b.label)?1.0:0)
     return lb - la
   })
-  return final.slice(0,25).map((s,i)=>({ index:i+1, label:s.label, key:s.key, cat:catKey }))
+
+  return final.slice(0,20).map((s,i)=>({ index:i+1, label:s.label, key:s.key, cat:catKey }))
 }
 
 // ====== Duración real de servicio
@@ -631,7 +640,7 @@ async function searchAvailabilityGeneric({ locationKey, envServiceKey, fromEU, d
   }catch{ return [] }
 }
 
-// ====== IA prompt para la orquestación
+// ====== IA prompt orquestación
 function staffRosterForPrompt(){
   return EMPLOYEES.map(e=>{
     const locs = e.allow.includes("ALL") ? "torremolinos, la_luz" : e.allow.map(id=> idToLocKey(id)).filter(Boolean).join(",")
@@ -671,14 +680,14 @@ CATEGORÍAS:
 
 REGLAS CLAVE:
 1) Identidad: NO pidas nombre/email si el número existe (match único). Solo si no existe o hay duplicados.
-2) Para cualquier petición de servicio: acción "choose_service" si falta servicio concreto; muestra SOLO servicios de la categoría correcta y SÓLO de la sede elegida. Si no hay sede, pídela.
-3) Sede: si no hay sede, pídela antes de listar servicios. EXCEPCIÓN: si el cliente pide “con {nombre}” y esa profesional SOLO trabaja en una sede → fija esa sede.
-4) Si el cliente escribe 1/2/3 para horas → selección directa (usa lastHours).
-5) Cancelar: usa el número del chat para listar y cancelar.
+2) Si falta servicio concreto: acción "choose_service"; muestra SOLO servicios de la categoría correcta y SÓLO de la sede elegida. Si no hay sede, pídela. Si ya se mostró un menú, respeta la categoría previa (no cambies).
+3) “con {nombre}”: 
+   - Si existe y atiende en la sede → fija preferredStaffId y "propose_times".
+   - Si existe pero NO atiende en esa sede → dilo y ofrece alternativas válidas (otras pros de esa sede) o su sede disponible.
+   - Si NO existe → dilo y sugiere profesionales disponibles en la sede. No inventes nombres.
+4) 1/2/3 en horas → selección directa (usa lastHours).
+5) Cancelar: usa el número del chat para listar/cancelar.
 6) Crear reserva: sede + servicio + fecha/hora (identidad por teléfono).
-
-STAFF:
-- “con {nombre}”: mapear a profesional existente (alias incluidos). Si no atiende en esa sede, decirlo y ofrecer alternativas o su(s) sede(s) disponible(s). Si trabaja en una sola sede y no hay sede aún, fijarla.
 
 FORMATO:
 {"message":"...","action":"propose_times|create_booking|list_appointments|cancel_appointment|choose_service|need_info|none","session_updates":{...},"action_params":{...}}`
@@ -695,6 +704,7 @@ ESTADO:
 - Sede: ${sessionData?.sede || 'no seleccionada'}
 - Servicio: ${sessionData?.selectedServiceLabel || 'no seleccionado'} (${sessionData?.selectedServiceEnvKey || 'no_key'})
 - Profesional preferida: ${sessionData?.preferredStaffLabel || 'ninguna'}
+- Categoría fija: ${sessionData?.lockedCategory || sessionData?.pendingCategory || 'ninguna'}
 - Fecha/hora pendiente: ${sessionData?.pendingDateTime ? fmtES(parseToEU(sessionData.pendingDateTime)) : 'no seleccionada'}
 - Etapa: ${sessionData?.stage || 'inicial'}
 - Últimas horas propuestas: ${Array.isArray(sessionData?.lastHours) ? sessionData.lastHours.length + ' opciones' : 'ninguna'}
@@ -714,7 +724,8 @@ function buildLocalFallback(userMessage, sessionData){
   const yesMatch = /\b(si|sí|ok|vale|confirmo|de\ acuerdo)\b/i.test(msg)
   const cancelMatch = /\b(cancelar|anular|borra|elimina)\b/i.test(lower)
   const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
-  const cat = detectCategoryHeuristic(msg) || "nails"
+  const preferCat = sessionData?.lockedCategory || sessionData?.pendingCategory
+  const cat = preferCat || detectCategoryHeuristic(msg) || "nails"
   const hasCore = (s)=> s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime
   if (numMatch && Array.isArray(sessionData?.lastHours) && sessionData.lastHours.length){
     const idx = Number(numMatch[1]) - 1
@@ -766,10 +777,18 @@ function parsePreferredStaffFromText(text){
   for (const e of EMPLOYEES){ for (const lbl of e.labels){ if (norm(lbl).includes(token)) return e } }
   return null
 }
+function extractUnknownStaffToken(text){
+  const t = norm(text)
+  const m = t.match(/\bcon\s+([a-zñáéíóú]+)\b/i)
+  if (!m) return null
+  const token = m[1]
+  for (const e of EMPLOYEES){ for (const lbl of e.labels){ if (norm(lbl).includes(token)) return null } }
+  return token // no encontrada
+}
 
-// ====== Menús por categoría (IA + heurística)
+// ====== Menús por categoría
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
-  const forcedCat = params?.cat || sessionData?.pendingCategory || null
+  const forcedCat = params?.cat || sessionData?.lockedCategory || sessionData?.pendingCategory || null
   if (!sessionData.sede){
     sessionData.pendingCategory = forcedCat || (await aiDetectCategory(userMsg||"")) || "nails"
     sessionData.stage = "awaiting_sede_for_services"
@@ -784,6 +803,7 @@ async function executeChooseService(params, sessionData, phone, sock, jid, userM
   }
   sessionData.serviceChoices = items
   sessionData.stage = "awaiting_service_choice"
+  sessionData.lockedCategory = items[0]?.cat || forcedCat || sessionData.lockedCategory || null
   saveSession(phone, sessionData)
   const lines = items.map(it=> `${it.index}) ${applySpanishDiacritics(it.label)}`).join("\n")
   const catNice = items?.[0]?.cat ? (CATEGORIES[items[0].cat]?.nice || items[0].cat) : "servicios"
@@ -1020,14 +1040,14 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v30.2.1</h1>
+  <h1>🩷 Gapink Nails Bot v31.0.0</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejora clave:</strong> Menús por categoría persistente tras “con {nombre}”.
+    <strong>🚀 Mejora clave:</strong> IA interpreta todo, nombres desconocidos (“con Ana”) guiados a staff válido sin cambiar de categoría.
   </div>
   </div>`)
 })
@@ -1107,7 +1127,8 @@ async function startBot(){
             lastStaffNamesById: null,
             snooze_until_ms: null,
             identityResolvedCustomerId: null,
-            pendingStaffId: null, pendingStaffLabel: null
+            pendingStaffId: null, pendingStaffLabel: null,
+            lockedCategory: null
           }
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
@@ -1159,7 +1180,7 @@ async function startBot(){
               sessionData.sede = sede
               sessionData.stage = null
               saveSession(phone, sessionData)
-              await executeChooseService({ cat: sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
+              await executeChooseService({ cat: sessionData.lockedCategory || sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
               return
             }
           }
@@ -1184,7 +1205,7 @@ async function startBot(){
               if (sessionData.selectedServiceEnvKey){
                 await executeProposeTime({}, sessionData, phone, sock, jid)
               } else {
-                await executeChooseService({ cat: sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
+                await executeChooseService({ cat: sessionData.lockedCategory || sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
               }
               return
             }
@@ -1227,11 +1248,31 @@ async function startBot(){
             }
           }
 
-          // “con {nombre}”
+          // “con {nombre}” → conocido / desconocido
           const maybeStaff = parsePreferredStaffFromText(textRaw)
+          const unknownToken = extractUnknownStaffToken(textRaw)
+          if (unknownToken){
+            // NO existe ese nombre
+            const preferCat = sessionData.lockedCategory || sessionData.pendingCategory || (await aiDetectCategory(textRaw))
+            if (!sessionData.sede){
+              sessionData.pendingCategory = preferCat
+              sessionData.stage = "awaiting_sede_for_services"
+              saveSession(phone, sessionData)
+              await sendWithPresence(sock, jid, `No encuentro a "${unknownToken}" en nuestro equipo. ¿En qué sede te viene mejor (Torremolinos o La Luz)? Te sugiero profesionales disponibles allí.`)
+              return
+            }else{
+              const disponibles = EMPLOYEES.filter(e=>isStaffAllowedInLocation(e.id, sessionData.sede)).map(e=>staffLabelFromId(e.id)).filter(Boolean)
+              const lista = disponibles.slice(0,6).join(", ") || "ahora mismo no hay agenda activa"
+              await sendWithPresence(sock, jid, `No encuentro a "${unknownToken}" en nuestro equipo. En ${locationNice(sessionData.sede)} tengo: ${lista}.`)
+              if (!sessionData.selectedServiceEnvKey){
+                await executeChooseService({ cat: preferCat }, sessionData, phone, sock, jid, textRaw)
+              }
+              return
+            }
+          }
           if (maybeStaff){
-            // Detectamos y persistimos categoría aquí (FIX v30.2.1)
-            sessionData.pendingCategory = await aiDetectCategory(textRaw)
+            // Detectamos y persistimos categoría sin romperla
+            sessionData.pendingCategory = sessionData.lockedCategory || sessionData.pendingCategory || await aiDetectCategory(textRaw)
             const locKeys = allowedLocKeysForStaff(maybeStaff.id)
             if (!sessionData.sede){
               if (locKeys.length === 1){
@@ -1242,7 +1283,7 @@ async function startBot(){
                 if (sessionData.selectedServiceEnvKey){
                   await executeProposeTime({}, sessionData, phone, sock, jid)
                 } else {
-                  await executeChooseService({ cat: sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
+                  await executeChooseService({ cat: sessionData.lockedCategory || sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
                 }
                 return
               } else if (locKeys.length > 1){
@@ -1264,7 +1305,7 @@ async function startBot(){
                 if (sessionData.selectedServiceEnvKey){
                   await executeProposeTime({}, sessionData, phone, sock, jid)
                 } else {
-                  await executeChooseService({ cat: sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
+                  await executeChooseService({ cat: sessionData.lockedCategory || sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
                 }
                 return
               } else {
@@ -1281,8 +1322,9 @@ async function startBot(){
             return
           }
 
-          // IA principal
+          // IA principal (siempre)
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
+          // Si IA cambió la sede pero ya teníamos servicio por etiqueta, alinea envKey
           if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
             const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
             if (ek) aiObj.session_updates.selectedServiceEnvKey = ek
@@ -1296,6 +1338,11 @@ async function startBot(){
       })
     })
   }catch(e){ setTimeout(() => startBot().catch(console.error), 5000) }
+}
+
+function resolveEnvKeyFromLabelAndSede(label, sedeKey){
+  const list = servicesForSedeKeyRaw(sedeKey)
+  return list.find(s=>s.label.toLowerCase()===String(label||"").toLowerCase())?.key || null
 }
 
 async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
@@ -1336,7 +1383,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     case "none":
     default:
       if (!sessionData.selectedServiceEnvKey && /uñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul|depil|fotodepil|laser|láser|micropig|microblad|pesta|facial|dermapen|limpieza|masaje|madero|endosphere/i.test(textRaw)){
-        await executeChooseService({ cat: aiObj?.action_params?.cat || sessionData?.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
+        await executeChooseService({ cat: sessionData.lockedCategory || sessionData.pendingCategory || aiObj?.action_params?.cat || null }, sessionData, phone, sock, jid, textRaw)
       } else {
         await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
       }
@@ -1344,7 +1391,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Servidor
-console.log(`🩷 Gapink Nails Bot v30.2.1`)
+console.log(`🩷 Gapink Nails Bot v31.0.0`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
