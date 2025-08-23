@@ -1,8 +1,9 @@
-// index.js — Gapink Nails · v30.0.1 “MultiCat + SmartStaff (fix)”
-// Cambios clave vs v30.0.0:
-// • FIX: Eliminada la duplicación de `staffRosterForPrompt()` que rompía el arranque (SyntaxError).
-// • Resto: categorías (uñas, depilación, micropigmentación, pestañas, facial, corporal),
-//   “con {nombre}” sin sede (autoselección o pregunta), staff por sede, disponibilidad y reserva real en Square.
+// index.js — Gapink Nails · v30.0.2 “Cristina Fix + SmartStaff”
+// Cambios v30.0.2:
+// • FIX: parseEmployees() ahora marca BOOKABLE por defecto si hay EMP_CENTER_* o locs válidos.
+// • Mejor mapeo de sedes permitidas desde EMP_CENTER_* -> IDs de Square.
+// • Mensaje de alternativa cuando la pro no atiende en esa sede conserva lista de sedes donde sí atiende.
+// • Resto: multi-categoría (uñas, depilación, micropigmentación, pestañas, facial, corporal), preferencia “con {nombre}”, disponibilidad y reserva real en Square.
 
 import express from "express"
 import pino from "pino"
@@ -248,37 +249,53 @@ function deriveLabelsFromEnvKey(envKey){
   if (uniq.length>1) labels.push(uniq.join(" "))
   return labels
 }
+
+// 🔧 FIX: Mejor comprensión de “bookable” y sedes permitidas
 function parseEmployees(){
   const out=[]
   for (const [k,v] of Object.entries(process.env)) {
     if (!k.startsWith("SQ_EMP_")) continue
-    const [id, book, locs] = String(v||"").split("|")
+    const [id, bookRaw, locsRaw] = String(v||"").split("|")
     if (!id) continue
-    const bookable = (book||"").toUpperCase()==="BOOKABLE"
-    let allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
 
     const empKey = "EMP_CENTER_" + k.replace(/^SQ_EMP_/, "")
-    const empVal = process.env[empKey]
-    if (empVal) {
-      const centers = String(empVal).split(",").map(s=>s.trim().toLowerCase()).filter(Boolean)
-      if (centers.some(c => c === "all")) {
-        allow = ["ALL"]
-      } else {
-        const normCenter = c => (c==="la luz" ? "la_luz" : c)
-        const ids = centers
-          .map(c => normCenter(c))
-          .map(centerKey => locationToId(centerKey))
-          .filter(Boolean)
-        if (ids.length) allow = ids
-      }
+    const centersStr = process.env[empKey] || ""
+    const centers = centersStr.split(",").map(s=>s.trim()).filter(Boolean)
+
+    // 1) Allowed locations (IDs)
+    let allowIds = []
+    // Prefer EMP_CENTER_* (nombres de sede)
+    if (centers.length){
+      const normCenter = c => (c.toLowerCase()==="la luz" ? "la_luz" : c.toLowerCase())
+      allowIds = centers
+        .map(normCenter)
+        .map(centerKey => locationToId(centerKey))
+        .filter(Boolean)
+    }
+    // Si no hay EMP_CENTER_*, usamos locsRaw (IDs de Square)
+    if (!allowIds.length && locsRaw && locsRaw !== "NO_LOCS"){
+      allowIds = String(locsRaw).split(",").map(s=>s.trim()).filter(Boolean)
     }
 
+    // 2) Bookable:
+    //    - Si dice NO_BOOKABLE => false
+    //    - Si dice BOOKABLE => true
+    //    - Si no dice nada pero hay EMP_CENTER_* o locs válidos => true
+    //    - Si nada de lo anterior => false (fantasma/no operativa)
+    let bookable
+    const flag = (bookRaw||"").toUpperCase()
+    if (flag === "NO_BOOKABLE") bookable = false
+    else if (flag === "BOOKABLE") bookable = true
+    else bookable = allowIds.length > 0 // <- por defecto reservable si sabemos dónde trabaja
+
     const labels = deriveLabelsFromEnvKey(k)
-    out.push({ envKey:k, id, bookable, allow, labels })
+    out.push({ envKey:k, id, bookable, allow: allowIds.length ? allowIds : [], labels })
   }
   return out
 }
+
 const EMPLOYEES = parseEmployees()
+
 function staffLabelFromId(id){
   const e = EMPLOYEES.find(x=>x.id===id)
   return e?.labels?.[0] || (id ? `Prof. ${String(id).slice(-4)}` : null)
@@ -657,7 +674,7 @@ REGLAS CLAVE:
 REGLAS ESPECÍFICAS PROFESIONALES:
 A) Si el usuario dice "con {nombre}", intenta mapear {nombre} a una profesional usando Nombres/aliases (ignora mayúsculas/tildes). 
    - Si existe y es reservable en la sede elegida → pon "preferredStaffId" y "preferredStaffLabel" y luego "action":"propose_times".
-   - Si NO existe para esa sede o no es reservable → responde en "message" que no está disponible en esa sede y ofrece alternativas válidas (otras profesionales de esa sede).
+   - Si NO existe para esa sede o no es reservable → responde en "message" que no está disponible en esa sede y ofrece alternativas válidas (otras profesionales de esa sede) **o su(s) sede(s) disponible(s)**.
    - Si NO hay sede todavía pero la pro trabaja en una sola sede → fija esa sede en session_updates.sede.
    - Si trabaja en varias sedes → pregunta la sede en message.
 
@@ -719,7 +736,7 @@ function buildLocalFallback(userMessage, sessionData){
     if (hasCore(sessionData)){
       return { message:"¡Voy a crear la reserva! ✨", action:"create_booking", session_updates:{}, action_params:{} }
     } else {
-      const faltan=[]; if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)"); if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio"); if (!sessionData?.pendingDateTime) faltan.push("fecha y hora")
+      const faltan=[]; if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)"); if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio"; if (!sessionData?.pendingDateTime) faltan.push("fecha y hora")
       return { message:`Para proponerte horas dime: ${faltan.join(" y ")}.`, action:"need_info", session_updates:{}, action_params:{} }
     }
   }
@@ -815,6 +832,12 @@ function proposeSlots({ fromEU, durationMin=60, n=3 }){
     if (t.hour()>=OPEN.end) { t = nextOpeningFrom(t) }
   }
   return out
+}
+
+async function sendWithPresence(sock, jid, text){
+  try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
+  await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
+  return sock.sendMessage(jid, { text })
 }
 
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
@@ -1061,16 +1084,16 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v30.0.1</h1>
+  <h1>🩷 Gapink Nails Bot v30.0.2</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v30.0.1:</strong><br>
-    • Fix de función duplicada que impedía iniciar Node.<br>
-    • Todo el cerebro multi-categoría y SmartStaff sigue intacto.<br>
+    <strong>🚀 Mejoras v30.0.2:</strong><br>
+    • Staff BOOKABLE por defecto si hay centros/locs (Cristina ya opera en Torremolinos).<br>
+    • Mensajes más útiles cuando la pro no atiende en una sede.<br>
   </div>
   </div>`)
 })
@@ -1110,14 +1133,7 @@ function parsePreferredStaffFromText(text){
   return null
 }
 
-// ====== Presencia al escribir
-async function sendWithPresence(sock, jid, text){
-  try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
-  await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
-  return sock.sendMessage(jid, { text })
-}
-
-// ====== Bot principal
+// ====== Cola y arranque
 let RECONNECT_SCHEDULED = false
 let RECONNECT_ATTEMPTS = 0
 const QUEUE=new Map()
@@ -1127,6 +1143,7 @@ function enqueue(key,job){
   QUEUE.set(key,next); return next
 }
 
+// ====== Bot principal
 async function startBot(){
   try{
     const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
@@ -1175,7 +1192,7 @@ async function startBot(){
           if (sessionData.last_msg_id === m.key.id) return
           sessionData.last_msg_id = m.key.id
 
-          // === MUTE BY "." ===
+          // Modo silencio "." 6h
           const trimmed = textRaw.trim()
           const nowEU = dayjs().tz(EURO_TZ)
           if (trimmed === ".") {
@@ -1192,7 +1209,7 @@ async function startBot(){
           const lower = norm(textRaw)
           const numMatch = lower.match(/^(?:opcion|opción)?\s*([1-9]\d*)\b/)
 
-          // === PRE-INTERCEPT: identidad (varias fichas) ===
+          // === identidad (varias fichas) ===
           if (sessionData.stage==="awaiting_identity_pick"){
             if (!numMatch){
               await sendWithPresence(sock, jid, "Responde con el número de tu ficha (1, 2, ...).")
@@ -1212,7 +1229,7 @@ async function startBot(){
             return
           }
 
-          // === PRE-INTERCEPT: identidad (crear nueva) ===
+          // === identidad (crear nueva) ===
           if (sessionData.stage==="awaiting_identity"){
             const { name, email } = parseNameEmailFromText(textRaw)
             if (!name && !email){
@@ -1234,7 +1251,7 @@ async function startBot(){
             return
           }
 
-          // === PRE-INTERCEPT: sede para servicios ===
+          // === sede pendiente para servicios
           if (sessionData.stage==="awaiting_sede_for_services"){
             const sede = parseSede(textRaw)
             if (sede){
@@ -1246,12 +1263,14 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT: esperando sede por staff (“con {nombre}”)
+          // === sede pendiente para staff (“con {nombre}”)
           if (sessionData.stage==="awaiting_sede_for_staff" && sessionData.pendingStaffId){
             const sede = parseSede(textRaw)
             if (sede){
-              if (!isStaffAllowedInLocation(sessionData.pendingStaffId, sede)){
-                await sendWithPresence(sock, jid, `Esa profesional no atiende en ${locationNice(sede)}. Dime Torremolinos o La Luz.`)
+              const locKeys = allowedLocKeysForStaff(sessionData.pendingStaffId)
+              if (!locKeys.includes(sede)){
+                const niceAvail = locKeys.map(locationNice).join(" o ")
+                await sendWithPresence(sock, jid, `${staffLabelFromId(sessionData.pendingStaffId)} no atiende en ${locationNice(sede)}. Puede en ${niceAvail}.`)
                 return
               }
               sessionData.sede = sede
@@ -1270,7 +1289,7 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT: selección de horario ===
+          // === selección de horario
           if (numMatch && Array.isArray(sessionData.lastHours) && sessionData.lastHours.length && (!sessionData.stage || sessionData.stage==="awaiting_time")){
             const idx = Number(numMatch[1]) - 1
             const pick = sessionData.lastHours[idx]
@@ -1291,7 +1310,7 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT: selección para cancelar ===
+          // === selección para cancelar
           if (numMatch && sessionData.stage==="awaiting_cancel" && Array.isArray(sessionData.cancelList) && sessionData.cancelList.length){
             const n = Number(numMatch[1])
             const chosen = sessionData.cancelList.find(apt=>apt.index===n)
@@ -1306,7 +1325,7 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT MEJORADO: “con {nombre}”
+          // === “con {nombre}”
           const maybeStaff = parsePreferredStaffFromText(textRaw)
           if (maybeStaff){
             const locKeys = allowedLocKeysForStaff(maybeStaff.id)
@@ -1345,8 +1364,9 @@ async function startBot(){
                 }
                 return
               } else {
+                const niceAvail = allowedLocKeysForStaff(maybeStaff.id).map(locationNice).join(" o ") || "—"
                 const alt = EMPLOYEES.filter(e=>isStaffAllowedInLocation(e.id, sessionData.sede)).slice(0,3).map(e=>staffLabelFromId(e.id)).filter(Boolean)
-                await sendWithPresence(sock, jid, `${staffLabelFromId(maybeStaff.id)} no atiende en ${locationNice(sessionData.sede)}. Disponibles: ${alt.join(", ")}.`)
+                await sendWithPresence(sock, jid, `${staffLabelFromId(maybeStaff.id)} no atiende en ${locationNice(sessionData.sede)}. Puede en ${niceAvail}. En esta sede tengo: ${alt.join(", ")}.`)
                 return
               }
             }
@@ -1357,7 +1377,7 @@ async function startBot(){
             return
           }
 
-          // IA normal
+          // === IA normal
           const aiObj = await getAIResponse(textRaw, sessionData, phone)
           if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
             const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
@@ -1423,9 +1443,10 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   }
 }
 
-// ====== Arranque
-console.log(`🩷 Gapink Nails Bot v30.0.1`)
-app.listen(PORT, ()=>{ startBot().catch(console.error) })
+// ====== Mini API + servidor
+const appServer=app
+console.log(`🩷 Gapink Nails Bot v30.0.2`)
+appServer.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
 process.on("SIGTERM", ()=>{ process.exit(0) })
