@@ -1,14 +1,11 @@
-// index.js — Gapink Omnibot · v30.0.0
-// Cambios clave vs v27.x:
-// • IA en TODO el flujo: decide acción (choose_service / propose_times / create_booking / list / cancel / need_info).
-// • Categorías nativas: uñas, depilación, micropigmentación, pestañas, facial, masajes (detecta por texto).
-// • Listado de servicios filtrado por categoría + sede. Selección por número funcional.
-// • “con {nombre}”: mapea aliases -> profesional real, valida por sede, y propone huecos con esa persona.
-// • Empleados: si no pone "NO_BOOKABLE", se asume bookable. Respeta EMP_CENTER_* para sedes permitidas.
-// • Propuesta/creación: guarda el teamMemberId exacto del slot. Nunca ofrece staff no permitido.
-// • Fixes: paréntesis en faltan[], insertAppt 16/16, no duplicar funciones, normalize ES (tildes, ñ).
-// • Log y DB: más robusto. Silencio 6h con “.” como antes.
-// • Square: crea/cancela bookings reales. DRY_RUN para modo simulación.
+// index.js — Gapink Omnibot · v31.0.0
+// Cambios v31:
+// • Override de centros por staff según lista proporcionada (Málaga / Torremolinos).
+// • Alias robustos: “patri”→Patricia, “cristi”↔“cristina”, “rocio chica”, etc.
+// • Parser “con {nombre}” multi-palabra y ranking: primero bookable + permitido en sede.
+// • Etiquetas bonitas para nombres (Rocío, Carmen Belén, Johana, etc.).
+// • Mantiene IA full-funnel, categorías y Square booking real.
+// • Corrige casos de selección por número, paréntesis y 16/16 columnas en insertAppt.
 
 import express from "express"
 import pino from "pino"
@@ -87,6 +84,7 @@ function applySpanishDiacritics(label){
   })
   return x
 }
+function titleCase(str){ return String(str||"").toLowerCase().replace(/\b([a-z])/g, (m)=>m.toUpperCase()) }
 function normalizePhoneES(raw){
   const d=onlyDigits(raw); if(!d) return null
   if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
@@ -212,7 +210,7 @@ CREATE TABLE IF NOT EXISTS square_logs (
 );
 `)
 
-// ✅ 16 columnas ↔ 16 valores
+// 16 columnas ↔ 16 valores
 const insertAppt = db.prepare(`INSERT INTO appointments
 (id,customer_name,customer_phone,customer_square_id,location_key,service_env_key,service_label,duration_min,start_iso,end_iso,staff_id,status,created_at,square_booking_id,square_error,retry_count)
 VALUES (@id,@customer_name,@customer_phone,@customer_square_id,@location_key,@service_env_key,@service_label,@duration_min,@start_iso,@end_iso,@staff_id,@status,@created_at,@square_booking_id,@square_error,@retry_count)`)
@@ -224,6 +222,71 @@ VALUES (@phone, @message_id, @user_message, @ai_response, @timestamp, @session_d
 const insertSquareLog = db.prepare(`INSERT INTO square_logs
 (phone, action, request_data, response_data, error_data, timestamp, success)
 VALUES (@phone, @action, @request_data, @response_data, @error_data, @timestamp, @success)`)
+
+// ====== Overrides de staff por centro (según lista)
+const STAFF_CENTER_OVERRIDES = (() => {
+  const map = new Map()
+  const set = (name, sedes) => map.set(norm(name), sedes.map(k => k === "la_luz" ? "la_luz" : "torremolinos"))
+  // Málaga
+  set("Rocio", ["la_luz"])
+  set("Rocío", ["la_luz"])
+  set("Rocio chica", ["la_luz","torremolinos"])
+  set("Rocío chica", ["la_luz","torremolinos"])
+  set("Carmen Belén", ["la_luz"])
+  set("Carmen Belen", ["la_luz"])
+  set("PATRI", ["la_luz"])
+  set("Patri", ["la_luz"])
+  set("Ganna", ["la_luz"])
+  set("Maria", ["la_luz"])
+  set("María", ["la_luz"])
+  set("Anaira", ["la_luz"])
+  set("Cristi", ["la_luz","torremolinos"])
+  set("Cristina", ["la_luz","torremolinos"]) // tratamos cristi/cristina como equivalentes
+  // Torremolinos
+  set("Ginna", ["torremolinos"])
+  set("Daniela", ["torremolinos"])
+  set("Desi", ["torremolinos"])
+  set("Jamaica", ["torremolinos"])
+  set("Johana", ["torremolinos"])
+  set("Edurne", ["torremolinos"])
+  set("Sudemis", ["torremolinos"])
+  set("Tania", ["torremolinos"])
+  set("Chabely", ["torremolinos"])
+  set("Elisabeth", ["torremolinos"])
+  // Rocío chica ya puesto como ambas
+  return map
+})()
+
+// Nombre bonito por alias
+const STAFF_PRETTY_NAME = new Map([
+  [norm("Rocio"), "Rocío"], [norm("Rocío"), "Rocío"],
+  [norm("Rocio chica"), "Rocío Chica"], [norm("Rocío chica"), "Rocío Chica"],
+  [norm("Carmen Belén"), "Carmen Belén"], [norm("Carmen Belen"), "Carmen Belén"],
+  [norm("Patri"), "Patri"], [norm("PATRI"), "Patri"],
+  [norm("Ganna"), "Ganna"],
+  [norm("Maria"), "María"], [norm("María"), "María"],
+  [norm("Anaira"), "Anaira"],
+  [norm("Cristi"), "Cristi"], [norm("Cristina"), "Cristina"],
+  [norm("Ginna"), "Ginna"],
+  [norm("Daniela"), "Daniela"],
+  [norm("Desi"), "Desi"],
+  [norm("Jamaica"), "Jamaica"],
+  [norm("Johana"), "Johana"],
+  [norm("Edurne"), "Edurne"],
+  [norm("Sudemis"), "Sudemis"],
+  [norm("Tania"), "Tania"],
+  [norm("Chabely"), "Chabely"],
+  [norm("Elisabeth"), "Elisabeth"],
+])
+
+// Alias extra por envKey base (se aplican además de labels)
+const STAFF_ALIAS_EXTRA = {
+  "CRISTINA": ["cristi","cristina"],
+  "PATRICIA": ["patri"],
+  "CARMEN_BELEN": ["carmen belen","carmen","belen","belén"],
+  "ROCIO_CHICA": ["rocio chica","rocío chica","chica"],
+  "ROCIO": ["rocio","rocío"],
+}
 
 // ====== Sesión
 function loadSession(phone){
@@ -254,17 +317,20 @@ function deriveLabelsFromEnvKey(envKey){
   if (uniq.length>1) labels.push(uniq.join(" "))
   return labels
 }
+
 function parseEmployees(){
   const out=[]
   for (const [k,v] of Object.entries(process.env)) {
     if (!k.startsWith("SQ_EMP_")) continue
     const [id, book, locs] = String(v||"").split("|")
     if (!id) continue
+    const baseKey = k.replace(/^SQ_EMP_/, "")
     // Por defecto: BOOKABLE salvo que sea "NO_BOOKABLE"
     const bookable = String(book||"").toUpperCase() !== "NO_BOOKABLE"
     let allow = (locs||"").split(",").map(s=>s.trim()).filter(Boolean)
 
-    const empKey = "EMP_CENTER_" + k.replace(/^SQ_EMP_/, "")
+    // EMP_CENTER_* manda por encima
+    const empKey = "EMP_CENTER_" + baseKey
     const empVal = process.env[empKey]
     if (empVal) {
       const centers = String(empVal).split(",").map(s=>s.trim().toLowerCase()).filter(Boolean)
@@ -279,19 +345,40 @@ function parseEmployees(){
         if (ids.length) allow = ids
       }
     }
-
-    // Si no hay sedes indicadas, permite todas (las validará searchAvailability)
     if (!allow.length) allow = ["ALL"]
 
+    // Labels + alias extra
     const labels = deriveLabelsFromEnvKey(k)
-    out.push({ envKey:k, id, bookable, allow, labels })
+    const extras = STAFF_ALIAS_EXTRA[baseKey] || []
+    const aliases = Array.from(new Set([...labels, ...extras]))
+
+    // Override de sedes por alias (según lista)
+    let overrideAllow = null
+    for (const a of aliases) {
+      const ov = STAFF_CENTER_OVERRIDES.get(norm(a))
+      if (ov && ov.length) {
+        overrideAllow = new Set([...(overrideAllow||[]), ...ov.map(key => locationToId(key))])
+      }
+    }
+    const finalAllow = overrideAllow ? Array.from(overrideAllow) : allow
+
+    // Display name bonito si lo tenemos
+    let displayName = null
+    for (const a of aliases) {
+      const pretty = STAFF_PRETTY_NAME.get(norm(a))
+      if (pretty) { displayName = pretty; break }
+    }
+    if (!displayName) displayName = titleCase((aliases[0]||"").replace(/_/g," "))
+
+    out.push({ envKey:k, id, bookable, allow: finalAllow, labels: aliases, displayName })
   }
   return out
 }
 const EMPLOYEES = parseEmployees()
+
 function staffLabelFromId(id){
   const e = EMPLOYEES.find(x=>x.id===id)
-  return e?.labels?.[0] || (id ? `Prof. ${String(id).slice(-4)}` : null)
+  return e?.displayName || e?.labels?.[0] || (id ? `Prof. ${String(id).slice(-4)}` : null)
 }
 function isStaffAllowedInLocation(staffId, locKey){
   const e = EMPLOYEES.find(x=>x.id===staffId)
@@ -311,7 +398,6 @@ function pickStaffForLocation(locKey, preferId=null){
 }
 
 // ====== Servicios
-function titleCase(str){ return String(str||"").toLowerCase().replace(/\b([a-z])/g, (m)=>m.toUpperCase()) }
 function cleanDisplayLabel(label){
   const s = String(label||"").replace(/^\s*(luz|la\s*luz)\s+/i,"").trim()
   return applySpanishDiacritics(s)
@@ -623,7 +709,7 @@ async function callAIWithRetries(messages, systemPrompt=""){
 function staffRosterForPrompt(){
   return EMPLOYEES.map(e=>{
     const locs = e.allow.map(id=> id===LOC_TORRE?"torremolinos" : id===LOC_LUZ?"la_luz" : id).join(",")
-    return `• ID:${e.id} | Nombres:[${e.labels.join(", ")}] | Sedes:[${locs||"ALL"}] | Reservable:${e.bookable}`
+    return `• ID:${e.id} | Nombre:${e.displayName} | Aliases:[${e.labels.join(", ")}] | Sedes:[${locs||"ALL"}] | Reservable:${e.bookable}`
   }).join("\n")
 }
 
@@ -643,7 +729,7 @@ SEDES:
 HORARIOS:
 - L-V 09:00-20:00; S/D cerrado; Festivos: ${HOLIDAYS_EXTRA.join(", ")}
 
-PROFESIONALES (aliases y sedes permitidas):
+PROFESIONALES (con nombres bonitos, aliases y sedes permitidas):
 ${staffLines}
 
 SERVICIOS TORREMOLINOS:
@@ -658,7 +744,7 @@ REGLAS:
 1) Identidad: NO pidas nombre/email si el número existe (match único). Si 0 o 2+, pide justo ANTES de confirmar.
 2) Si el cliente dice una categoría (“depilarme”, “microblading”, “facial”, etc.), acción "choose_service" filtrando por esa categoría y por sede (si falta sede, pídela).
 3) Sede obligatoria para listar servicios. Si falta → acción "need_info" pidiendo sede.
-4) “con {nombre}” → mapea a profesional (case/tildes/alias). Si no existe, dilo y ofrece alternativas. Si existe pero no trabaja en esa sede, dilo y ofrece las que sí.
+4) “con {nombre}”: mapea a profesional (case/tildes/alias). Si hay varias candidatas, prioriza: (a) reservable (b) que atienda en la sede elegida. Si ninguna vale, dilo y ofrece alternativas válidas.
 5) Selección por número para servicios y horas. Para servicios, rellena selectedServiceLabel + selectedServiceEnvKey.
 6) Para reservar: sede + servicio + fecha/hora. Usa teamMemberId del slot. Nunca inventes IDs.
 7) Acciones válidas: propose_times | create_booking | list_appointments | cancel_appointment | choose_service | need_info | none.
@@ -707,7 +793,6 @@ function buildLocalFallback(userMessage, sessionData){
   const yesMatch = /\b(si|sí|ok|vale|confirmo|de acuerdo)\b/i.test(msg)
   const cancelMatch = /\b(cancelar|anular|borra|elimina)\b/i.test(lower)
   const listMatch = /\b(mis citas|lista|ver citas)\b/i.test(lower)
-  const bookMatch = /\b(reservar|cita|quiero.*(cita|reservar))\b/i.test(lower)
   const category = detectCategoryFromText(msg)
 
   const hasCore = (s)=> s?.sede && s?.selectedServiceEnvKey && s?.pendingDateTime
@@ -745,7 +830,6 @@ function buildLocalFallback(userMessage, sessionData){
   if (cancelMatch && !/^awaiting_/.test(sessionData?.stage||"")) return { message:"Vale, te enseño tus citas para cancelar:", action:"cancel_appointment", session_updates:{}, action_params:{} }
   if (listMatch) return { message:"Estas son tus próximas citas:", action:"list_appointments", session_updates:{}, action_params:{} }
 
-  // Si pide por categoría
   if (!sessionData?.selectedServiceEnvKey && (category || /\buñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul|depil|microblad|facial|pestañ/i.test(msg))){
     return { message:"Elige tu servicio:", action:"choose_service", session_updates:{ stage:"awaiting_service_choice", pendingCategory: category || sessionData?.pendingCategory || null }, action_params:{ candidates:[], category: category || null } }
   }
@@ -774,6 +858,45 @@ function buildServiceChoiceListBySede(sedeKey, userMsg, aiCandidates, category){
   const rest = uniq.filter(s=>!aiMap.has(s.label)).sort((a,b)=> (localScores.get(b.label)||0)-(localScores.get(a.label)||0))
   const final = [...inAI, ...rest].slice(0,30)
   return final.map((s,i)=>({ index:i+1, label:s.label }))
+}
+
+// ====== Preferencia “con {nombre}” (1 o 2 palabras) con ranking
+function matchStaffByName(text, sedeKey=null){
+  const t = norm(text)
+  const conIdx = t.indexOf(" con ")
+  let frag = null
+  if (conIdx >= 0) {
+    frag = t.slice(conIdx + 5).trim()
+  } else if (t.startsWith("con ")) {
+    frag = t.slice(4).trim()
+  }
+  if (!frag) return null
+  // candidatos: 2 palabras, o 1 palabra
+  const parts = frag.split(/\s+/).filter(Boolean).slice(0,3)
+  const cands = []
+  if (parts.length >= 2) cands.push(parts[0]+" "+parts[1])
+  if (parts.length >= 1) cands.push(parts[0])
+
+  let best = null
+  const sedeId = sedeKey ? locationToId(sedeKey) : null
+
+  for (const e of EMPLOYEES){
+    const aliasSet = new Set(e.labels.map(a=>norm(a)))
+    // también añade displayName como alias
+    aliasSet.add(norm(e.displayName||""))
+    for (const a of aliasSet){
+      for (const c of cands){
+        const cc = norm(c)
+        if (!cc || cc.length < 3) continue
+        const hit = (a.includes(cc) || cc.includes(a))
+        if (hit){
+          const score = (e.bookable?10:0) + (sedeId && (e.allow.includes("ALL") || e.allow.includes(sedeId)) ? 5:0) + Math.min(a.length, cc.length)
+          if (!best || score > best.score) best = { e, score }
+        }
+      }
+    }
+  }
+  return best?.e || null
 }
 
 // ====== Bot principal helpers
@@ -805,20 +928,6 @@ function parseNameEmailFromText(txt){
   const email = emailMatch ? emailMatch[0] : null
   const name = String(txt||"").replace(email||"", "").replace(/(email|correo)[:\s]*/ig,"").trim()
   return { name: name || null, email }
-}
-
-// “con {nombre}”
-function parsePreferredStaffFromText(text){
-  const t = norm(text)
-  const m = t.match(/\bcon\s+([a-zñáéíóú]+)\b/i)
-  if (!m) return null
-  const token = m[1]
-  for (const e of EMPLOYEES){
-    for (const lbl of e.labels){
-      if (norm(lbl).includes(token)) return e
-    }
-  }
-  return null
 }
 
 // ====== Acciones
@@ -1079,7 +1188,7 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Omnibot v30.0.0</h1>
+  <h1>🩷 Gapink Omnibot v31.0.0</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
@@ -1087,9 +1196,9 @@ app.get("/", (_req,res)=>{
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
     <strong>Mejoras:</strong><br>
-    • IA full-funnel (categorías + “con {nombre}” por sede)<br>
-    • Selección por número (servicios/horas) sólida<br>
-    • Slots solo de staff permitido en la sede<br>
+    • Override de centros por staff + alias<br>
+    • Parser “con {nombre}” multi-palabra y ranking por sede<br>
+    • Nombres bonitos en mensajes y confirmaciones<br>
   </div>
   </div>`)
 })
@@ -1217,170 +1326,4 @@ async function startBot(){
             sessionData.stage = null
             saveSession(phone, sessionData)
             await sendWithPresence(sock, jid, "¡Gracias! Finalizo tu reserva…")
-            await executeCreateBooking({}, sessionData, phone, sock, jid)
-            return
-          }
-
-          // ==== PRE: sede si estamos esperando para servicios
-          if (sessionData.stage==="awaiting_sede_for_services"){
-            const sede = parseSede(textRaw)
-            if (sede){
-              sessionData.sede = sede
-              sessionData.stage = null
-              saveSession(phone, sessionData)
-              await executeChooseService({ candidates: [], category: sessionData.pendingCategory || detectCategoryFromText(textRaw) || null }, sessionData, phone, sock, jid, textRaw)
-              return
-            }
-          }
-
-          // ==== PRE: selección de SERVICIO por número
-          if (sessionData.stage==="awaiting_service_choice" && numMatch && Array.isArray(sessionData.serviceChoices) && sessionData.serviceChoices.length){
-            const idx = Number(numMatch[1])
-            const choice = sessionData.serviceChoices.find(c=>c.index===idx)
-            if (choice){
-              const ek = resolveEnvKeyFromLabelAndSede(choice.label, sessionData.sede)
-              sessionData.selectedServiceLabel = choice.label
-              sessionData.selectedServiceEnvKey = ek
-              sessionData.stage = null
-              saveSession(phone, sessionData)
-              await executeProposeTime({}, sessionData, phone, sock, jid)
-              return
-            } else {
-              await sendWithPresence(sock, jid, "No encontré esa opción. Responde con un número de la lista.")
-              return
-            }
-          }
-
-          // ==== PRE: selección de horario
-          if (numMatch && Array.isArray(sessionData.lastHours) && sessionData.lastHours.length && (!sessionData.stage || sessionData.stage==="awaiting_time")){
-            const idx = Number(numMatch[1]) - 1
-            const pick = sessionData.lastHours[idx]
-            if (dayjs.isDayjs(pick)){
-              const iso = pick.format("YYYY-MM-DDTHH:mm")
-              const staffFromIso = sessionData?.lastStaffByIso?.[iso] || null
-              if (staffFromIso && !isStaffAllowedInLocation(staffFromIso, sessionData.sede)) {
-                await sendWithPresence(sock, jid, "Esa hora ya no está disponible con esa profesional en esa sede. Te paso otras opciones 👇")
-                await executeProposeTime({}, sessionData, phone, sock, jid)
-                return
-              }
-              sessionData.pendingDateTime = pick.tz(EURO_TZ).toISOString()
-              if (staffFromIso){ sessionData.preferredStaffId = staffFromIso; sessionData.preferredStaffLabel = null }
-              saveSession(phone, sessionData)
-              const aiObj = { message:"Perfecto, confirmo tu cita ✨", action:"create_booking", session_updates:{}, action_params:{} }
-              await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
-              return
-            }
-          }
-
-          // ==== PRE: selección para cancelar
-          if (numMatch && sessionData.stage==="awaiting_cancel" && Array.isArray(sessionData.cancelList) && sessionData.cancelList.length){
-            const n = Number(numMatch[1])
-            const chosen = sessionData.cancelList.find(apt=>apt.index===n)
-            if (chosen){
-              const success = await cancelBooking(chosen.id)
-              if (success) await sendWithPresence(sock, jid, `✅ Cita cancelada: ${chosen.pretty} en ${chosen.sede}`)
-              else await sendWithPresence(sock, jid, "No pude cancelar la cita. Por favor contacta directamente al salón.")
-              delete sessionData.cancelList
-              sessionData.stage = null
-              saveSession(phone, sessionData)
-              return
-            }
-          }
-
-          // ==== PRE: “con {nombre}” → proponer horas con esa pro (si sede+servicio ya definidos)
-          if (sessionData.sede && sessionData.selectedServiceEnvKey){
-            const maybe = parsePreferredStaffFromText(textRaw)
-            if (maybe){
-              if (isStaffAllowedInLocation(maybe.id, sessionData.sede)){
-                sessionData.preferredStaffId = maybe.id
-                sessionData.preferredStaffLabel = staffLabelFromId(maybe.id)
-                saveSession(phone, sessionData)
-                await executeProposeTime({}, sessionData, phone, sock, jid)
-                return
-              } else {
-                const allowed = EMPLOYEES.filter(e=>isStaffAllowedInLocation(e.id, sessionData.sede)).map(e=>e.labels[0]).slice(0,4)
-                await sendWithPresence(sock, jid, `${maybe.labels[0]} no atiende en esa sede. Disponibles: ${allowed.join(", ")}. ¿Con quién prefieres?`)
-                return
-              }
-            }
-          }
-
-          if (isCancelIntent(textRaw) && sessionData.stage!=="awaiting_cancel"){
-            await executeCancelAppointment({}, sessionData, phone, sock, jid)
-            return
-          }
-
-          // ==== IA normal
-          const categoryHint = detectCategoryFromText(textRaw)
-          if (categoryHint && !sessionData.pendingCategory) sessionData.pendingCategory = categoryHint
-
-          const aiObj = await getAIResponse(textRaw, sessionData, phone)
-
-          if (aiObj?.session_updates?.sede && (!sessionData.selectedServiceEnvKey) && sessionData.selectedServiceLabel){
-            const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, aiObj.session_updates.sede)
-            if (ek) aiObj.session_updates.selectedServiceEnvKey = ek
-          }
-          await routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid)
-
-        } catch (error) {
-          if (BOT_DEBUG) console.error(error)
-          await sendWithPresence(sock, jid, "Disculpa, hubo un error técnico. ¿Puedes repetir tu mensaje?")
-        }
-      })
-    })
-  }catch(e){ setTimeout(() => startBot().catch(console.error), 5000) }
-}
-
-async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
-  if (aiObj?.session_updates) {
-    Object.keys(aiObj.session_updates).forEach(key => {
-      if (aiObj.session_updates[key] !== null && aiObj.session_updates[key] !== undefined) {
-        sessionData[key] = aiObj.session_updates[key]
-      }
-    })
-  }
-  // Mantener envKey en cuanto haya sede + label
-  if (sessionData.sede && sessionData.selectedServiceLabel && !sessionData.selectedServiceEnvKey){
-    const ek = resolveEnvKeyFromLabelAndSede(sessionData.selectedServiceLabel, sessionData.sede)
-    if (ek) sessionData.selectedServiceEnvKey = ek
-  }
-
-  const fallbackUsedBool = !!aiObj?.__fallback_used
-  insertAIConversation.run({
-    phone, message_id: m.key.id, user_message: textRaw,
-    ai_response: safeJSONStringify(aiObj), timestamp: new Date().toISOString(),
-    session_data: safeJSONStringify(sessionData),
-    ai_error: (typeof aiObj?.__ai_error === "string" || aiObj?.__ai_error == null) ? (aiObj?.__ai_error ?? null) : safeJSONStringify(aiObj?.__ai_error),
-    fallback_used: Number(fallbackUsedBool)
-  })
-  saveSession(phone, sessionData)
-
-  switch (aiObj?.action) {
-    case "choose_service":
-      await executeChooseService(aiObj.action_params, sessionData, phone, sock, jid, textRaw); break
-    case "propose_times":
-      await executeProposeTime(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "create_booking":
-      await executeCreateBooking(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "list_appointments":
-      await executeListAppointments(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "cancel_appointment":
-      await executeCancelAppointment(aiObj.action_params, sessionData, phone, sock, jid); break
-    case "need_info":
-    case "none":
-    default:
-      if (!sessionData.selectedServiceEnvKey && (sessionData.pendingCategory || /\buñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul|depil|microblad|facial|pestañ/i.test(textRaw))){
-        await executeChooseService({ candidates: aiObj?.action_params?.candidates || [], category: sessionData.pendingCategory || detectCategoryFromText(textRaw) || null }, sessionData, phone, sock, jid, textRaw)
-      } else {
-        await sendWithPresence(sock, jid, aiObj?.message || "¿Puedes repetirlo, por favor?")
-      }
-  }
-}
-
-// ====== Arranque
-console.log(`🩷 Gapink Omnibot v30.0.0`)
-const appServer = app.listen(PORT, ()=>{ startBot().catch(console.error) })
-process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
-process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
-process.on("SIGTERM", ()=>{ appServer.close(()=>process.exit(0)) })
-process.on("SIGINT", ()=>{ appServer.close(()=>process.exit(0)) })
+            await executeCreateBooking({}, sessionData, phone
