@@ -1,10 +1,8 @@
-// index.js — Gapink Nails · v30.0.0 “MultiCat + SmartStaff”
-// Cambios clave respecto a v27.2.0:
-// • 6 categorías: uñas, depilación, micropigmentación, pestañas, facial y corporal.
-// • “con {nombre}” funciona aunque NO haya sede ni servicio todavía. Si la pro solo trabaja en una sede → se fija automáticamente; si trabaja en varias → se pide sede.
-// • Menús de servicios según categoría + sede + candidatos IA.
-// • Mantiene reglas de staff permitido por sede, evita ofrecer huecos no reservables en esa sede.
-// • Reserva real en Square con el teamMemberId correcto del slot.
+// index.js — Gapink Nails · v30.0.1 “MultiCat + SmartStaff (fix)”
+// Cambios clave vs v30.0.0:
+// • FIX: Eliminada la duplicación de `staffRosterForPrompt()` que rompía el arranque (SyntaxError).
+// • Resto: categorías (uñas, depilación, micropigmentación, pestañas, facial, corporal),
+//   “con {nombre}” sin sede (autoselección o pregunta), staff por sede, disponibilidad y reserva real en Square.
 
 import express from "express"
 import pino from "pino"
@@ -57,12 +55,9 @@ const sleep = ms => new Promise(r=>setTimeout(r, ms))
 
 // ====== Utils básicos
 const onlyDigits = s => String(s||"").replace(/\D+/g,"")
-// Quita diacríticos solo para comparaciones; no para mostrar
 const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
-// Normaliza para matching laxo
 const norm = s => rm(s).toLowerCase().replace(/[+.,;:()/_-]/g," ").replace(/[^\p{Letter}\p{Number}\s]/gu," ").replace(/\s+/g," ").trim()
 
-// 👉 Restaurar tildes/ñ y arreglar faltas comunes SOLO para mostrar
 function applySpanishDiacritics(label){
   let x = String(label||"")
   x = x.replace(/\bunas\b/gi, m => m[0] === 'U' ? 'Uñas' : 'uñas')
@@ -341,40 +336,14 @@ function allServices(){ return [...servicesForSedeKeyRaw("torremolinos"), ...ser
 
 // ====== Clasificación multi-categoría
 const CATEGORIES = {
-  nails:{
-    key:"nails",
-    anchorsPos:["uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente","esculpida","esculpidas","press","tips","francesa","baby boomer","encapsulado","nivelacion","nivelación","pedicur","pies","pie","esmalt"],
-    anchorsNeg:["pesta","ceja","labio","laser","láser"]
-  },
-  depilation:{
-    key:"depilation",
-    anchorsPos:["depil","fotodepil","laser","láser","axilas","ingles","inglés","labio","piernas","brazos","cera","hilo","pubis","perianal","nasal","fosas"],
-    anchorsNeg:["uña","acril","gel","micro","pesta","facial","masaje"]
-  },
-  micropigmentation:{
-    key:"micropig",
-    anchorsPos:["microblading","micropigment","hairstroke","polvo","eyeliner","labios","aquarela","hydra lips","retoque","retoque anual","retoque mes"],
-    anchorsNeg:["uña","depil","laser","pesta"]
-  },
-  lashes:{
-    key:"lashes",
-    anchorsPos:["pesta","pestañ","extension","extensión","lifting","tinte","relleno","2d","3d","pelo a pelo"],
-    anchorsNeg:["uña","depil","labio","micro"]
-  },
-  facial:{
-    key:"facial",
-    anchorsPos:["facial","dermapen","limpieza","hydra","peel","carbon","carbón","acne","acné","manchas","jade","oro","colageno","colágeno","vitamina"],
-    anchorsNeg:["uña","depil","pesta"]
-  },
-  body:{
-    key:"body",
-    anchorsPos:["masaje","maderoterapia","endosphere","corporal","push up"],
-    anchorsNeg:["uña","facial","pesta","depil"]
-  }
+  nails:{ key:"nails", anchorsPos:["uña","unas","uñas","manicura","gel","acrilic","acrilico","acrílico","semi","semipermanente","esculpida","esculpidas","press","tips","francesa","baby boomer","encapsulado","nivelacion","nivelación","pedicur","pies","pie","esmalt"], anchorsNeg:["pesta","ceja","labio","laser","láser"] },
+  depilation:{ key:"depilation", anchorsPos:["depil","fotodepil","laser","láser","axilas","ingles","inglés","labio","piernas","brazos","cera","hilo","pubis","perianal","nasal","fosas"], anchorsNeg:["uña","acril","gel","micro","pesta","facial","masaje"] },
+  micropigmentation:{ key:"micropig", anchorsPos:["microblading","micropigment","hairstroke","polvo","eyeliner","labios","aquarela","hydra lips","retoque","retoque anual","retoque mes"], anchorsNeg:["uña","depil","laser","pesta"] },
+  lashes:{ key:"lashes", anchorsPos:["pesta","pestañ","extension","extensión","lifting","tinte","relleno","2d","3d","pelo a pelo"], anchorsNeg:["uña","depil","labio","micro"] },
+  facial:{ key:"facial", anchorsPos:["facial","dermapen","limpieza","hydra","peel","carbon","carbón","acne","acné","manchas","jade","oro","colageno","colágeno","vitamina"], anchorsNeg:["uña","depil","pesta"] },
+  body:{ key:"body", anchorsPos:["masaje","maderoterapia","endosphere","corporal","push up"], anchorsNeg:["uña","facial","pesta","depil"] }
 }
-function shouldIncludePedicure(userMsg){
-  return /\b(pedicur|pies|pie)\b/i.test(String(userMsg||""))
-}
+function shouldIncludePedicure(userMsg){ return /\b(pedicur|pies|pie)\b/i.test(String(userMsg||"")) }
 function detectCategory(userMsg){
   const t = norm(userMsg||"")
   let best=null, bestScore=0
@@ -421,17 +390,11 @@ function scoreServiceRelevance(userMsg, label){
   if (/\brelleno\b/.test(u) && (l.includes("uña") || l.includes("manicura") || l.includes("gel") || l.includes("acril"))) score += 2
   if (/\bretir(ar|o)\b/.test(u) && (l.includes("retir")||l.includes("retiro"))) score += 1.5
   if (/\bpress\b/.test(u) && l.includes("press")) score += 1.2
-  // depilación
   if (/\bdepil|fotodepil|laser|láser\b/.test(u) && /\b(axilas|ingles|inglés|labio|piernas|brazos|pubis|perianal|nasales?)\b/.test(l)) score += 2.5
-  // micropig
   if (/\bmicroblading|micropigment|hairstroke|eyeliner|aquarela\b/.test(u) && /\b(micro|hair|eyeliner|labios|aquarela)\b/.test(l)) score += 2.5
-  // pestañas
   if (/\bpestañ|pesta|lifting|tinte\b/.test(u) && /\b(pesta|lifting|tinte|2d|3d)\b/.test(l)) score += 2.5
-  // facial
   if (/\bfacial|dermapen|limpieza|hydra|peel|acn|manchas|colag|vitamina|carbon\b/.test(u) && /\b(facial|dermapen|limpieza|hydra|peel|acn|manchas|colag|vitamina|carbon)\b/.test(l)) score += 2
-  // body
   if (/\bmasaje|maderoterapia|endosphere|corporal|push\b/.test(u) && /\b(masaje|maderoterapia|endosphere|corporal|push)\b/.test(l)) score += 2
-
   const tokens = ["natural","francesa","frances","decoracion","diseño","extra","exprés","express","completa","nivelacion","nivelación","labio","axilas","ingles","inglés","2d","3d","lifting","tinte","dermapen","limpieza","hydra","vitamina","oro","colágeno","colageno"]
   for (const t of tokens){ if (u.includes(norm(t)) && l.includes(norm(t))) score += 0.4 }
   const utoks = new Set(u.split(" ").filter(Boolean))
@@ -769,14 +732,6 @@ function buildLocalFallback(userMessage, sessionData){
   return { message:"¿Quieres reservar, cancelar o ver tus citas? Si es para reservar, dime sede y servicio.", action:"none", session_updates:{}, action_params:{} }
 }
 
-// ====== Roster para el prompt (IA ve TODO)
-function staffRosterForPrompt(){
-  return EMPLOYEES.map(e=>{
-    const locs = e.allow.includes("ALL") ? "torremolinos, la_luz" : e.allow.map(id=> idToLocKey(id)).filter(Boolean).join(",")
-    return `• ID:${e.id} | Nombres:[${e.labels.join(", ")}] | Sedes:[${locs||"—"}] | Reservable:${e.bookable}`
-  }).join("\n")
-}
-
 function buildSystemPromptCached(){ return buildSystemPrompt() }
 
 async function getAIResponse(userMessage, sessionData, phone) {
@@ -821,8 +776,6 @@ function parseSede(text){
   if (/\b(torre|torremolinos)\b/.test(t)) return "torremolinos"
   return null
 }
-
-// 👉 parse básico para nombre/email en texto libre
 function parseNameEmailFromText(txt){
   const emailMatch = String(txt||"").match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)
   const email = emailMatch ? emailMatch[0] : null
@@ -960,27 +913,17 @@ async function executeCreateBooking(_params, sessionData, phone, sock, jid) {
   if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
   if (!staffId) { await sendWithPresence(sock, jid, "No hay profesionales disponibles en esa sede"); return; }
 
-  // === Identidad justo después de confirmar ===
-  // 1) Si ya la resolvimos (por respuesta del cliente), usarla.
+  // Identidad
   let customerId = sessionData.identityResolvedCustomerId || null
-
-  // 2) Si no, buscamos por teléfono. Si 0 o 2+, preguntamos ahora y esperamos la respuesta del cliente.
   if (!customerId){
     const { status, customer } = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid) || {}
-    if (status === "need_new" || status === "need_pick") {
-      // Se preguntó al cliente y quedamos a la espera. La próxima respuesta completará la reserva.
-      return
-    }
+    if (status === "need_new" || status === "need_pick") return
     customerId = customer?.id || null
   }
-
-  // 3) Si aún no hay customerId pero tenemos nombre/email previos, intentamos crear.
   if (!customerId && (sessionData.name || sessionData.email)){
     const created = await findOrCreateCustomerWithRetry({ name: sessionData.name, email: sessionData.email, phone })
     if (created) customerId = created.id
   }
-
-  // 4) Si sigue sin haber customerId, pedimos identidad (último recurso) y aguardamos.
   if (!customerId){
     sessionData.stage = "awaiting_identity"
     saveSession(phone, sessionData)
@@ -1118,17 +1061,16 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v30.0.0</h1>
+  <h1>🩷 Gapink Nails Bot v30.0.1</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v30.0.0:</strong><br>
-    • Categorías multi-servicio (uñas, depilación, micro, pestañas, facial, corporal).<br>
-    • “con {nombre}” inteligente: fija o pide sede según centros de la pro.<br>
-    • Slots/IDs siempre compatibles con la sede permitida.<br>
+    <strong>🚀 Mejoras v30.0.1:</strong><br>
+    • Fix de función duplicada que impedía iniciar Node.<br>
+    • Todo el cerebro multi-categoría y SmartStaff sigue intacto.<br>
   </div>
   </div>`)
 })
@@ -1168,6 +1110,7 @@ function parsePreferredStaffFromText(text){
   return null
 }
 
+// ====== Presencia al escribir
 async function sendWithPresence(sock, jid, text){
   try{ await sock.sendPresenceUpdate("composing", jid) }catch{}
   await new Promise(r=>setTimeout(r, 800+Math.random()*1200))
@@ -1291,7 +1234,7 @@ async function startBot(){
             return
           }
 
-          // === PRE-INTERCEPT: sede si estamos esperando para servicios ===
+          // === PRE-INTERCEPT: sede para servicios ===
           if (sessionData.stage==="awaiting_sede_for_services"){
             const sede = parseSede(textRaw)
             if (sede){
@@ -1303,7 +1246,7 @@ async function startBot(){
             }
           }
 
-          // === PRE-INTERCEPT NUEVO: esperando sede por staff (“con {nombre}”)
+          // === PRE-INTERCEPT: esperando sede por staff (“con {nombre}”)
           if (sessionData.stage==="awaiting_sede_for_staff" && sessionData.pendingStaffId){
             const sede = parseSede(textRaw)
             if (sede){
@@ -1318,7 +1261,6 @@ async function startBot(){
               sessionData.pendingStaffLabel = null
               sessionData.stage = null
               saveSession(phone, sessionData)
-              // Si ya hay servicio → proponer horas; si no, mostrar menú según categoría
               if (sessionData.selectedServiceEnvKey){
                 await executeProposeTime({}, sessionData, phone, sock, jid)
               } else {
@@ -1367,7 +1309,6 @@ async function startBot(){
           // === PRE-INTERCEPT MEJORADO: “con {nombre}”
           const maybeStaff = parsePreferredStaffFromText(textRaw)
           if (maybeStaff){
-            // si no hay sede aún → ver cuántas cubre
             const locKeys = allowedLocKeysForStaff(maybeStaff.id)
             if (!sessionData.sede){
               if (locKeys.length === 1){
@@ -1375,7 +1316,6 @@ async function startBot(){
                 sessionData.preferredStaffId = maybeStaff.id
                 sessionData.preferredStaffLabel = staffLabelFromId(maybeStaff.id)
                 saveSession(phone, sessionData)
-                // si ya hay servicio, proponer; sino, mostrar menú según categoría
                 if (sessionData.selectedServiceEnvKey){
                   await executeProposeTime({}, sessionData, phone, sock, jid)
                 } else {
@@ -1390,12 +1330,10 @@ async function startBot(){
                 await sendWithPresence(sock, jid, `¿En qué sede prefieres con ${sessionData.pendingStaffLabel}? Torremolinos o La Luz.`)
                 return
               } else {
-                // No hay sedes permitidas
                 await sendWithPresence(sock, jid, `Ahora mismo ${staffLabelFromId(maybeStaff.id)} no tiene agenda activa.`)
                 return
               }
             } else {
-              // sí hay sede: comprobar si esa pro trabaja ahí
               if (isStaffAllowedInLocation(maybeStaff.id, sessionData.sede)){
                 sessionData.preferredStaffId = maybeStaff.id
                 sessionData.preferredStaffLabel = staffLabelFromId(maybeStaff.id)
@@ -1407,7 +1345,6 @@ async function startBot(){
                 }
                 return
               } else {
-                // ofrecer alternativas
                 const alt = EMPLOYEES.filter(e=>isStaffAllowedInLocation(e.id, sessionData.sede)).slice(0,3).map(e=>staffLabelFromId(e.id)).filter(Boolean)
                 await sendWithPresence(sock, jid, `${staffLabelFromId(maybeStaff.id)} no atiende en ${locationNice(sessionData.sede)}. Disponibles: ${alt.join(", ")}.`)
                 return
@@ -1460,7 +1397,6 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   })
   saveSession(phone, sessionData)
 
-  // Disparo automático de choose_service si detecto categoría y falta servicio
   const catDetected = detectCategory(textRaw)
 
   switch (aiObj.action) {
@@ -1488,7 +1424,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v30.0.0`)
+console.log(`🩷 Gapink Nails Bot v30.0.1`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
