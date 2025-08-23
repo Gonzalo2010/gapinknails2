@@ -1,10 +1,9 @@
-// index.js — Gapink Nails · v30.2.0 “IA Full Menu + Clean Categories”
-// Highlights v30.2.0:
-// • IA en todas las fases: detección de categoría y filtrado de servicios por categoría (Deepseek).
-// • Menús de servicios 100% limpios (nada de faciales/depil en “uñas”, etc.).
-// • Duración real por servicio desde env (SQ_DUR_* / SQ_DUR_luz_*).
-// • Comprensión de staff por sede mejorada y “con {nombre}” inteligente.
-// • Fixes de sintaxis y no hay funciones duplicadas.
+// index.js — Gapink Nails · v30.2.1 “IA Full Menu + Clean Categories + Cat Persist”
+// Cambios v30.2.1:
+// • Persistimos la categoría (ej. depilation) cuando el usuario dice “con {nombre}”.
+// • Al elegir sede tras pedir staff, el menú usa esa categoría persistida (sin caer a uñas).
+// • buildServiceChoiceListBySedeAI(sedeKey, userMsg, overrideCat) para forzar categoría.
+// • Resto: mantiene mejoras previas (duraciones reales, staff por sede, etc.).
 
 import express from "express"
 import pino from "pino"
@@ -388,13 +387,12 @@ async function aiFilterServicesByCategory(sedeKey, catKey){
       return svs.filter(s=> set.has(s.label) )
     }
   }catch{}
-  return [] // si IA falla, devolvemos vacío (usaremos heurística)
+  return []
 }
 
 // ====== Construcción de menús por sede/categoría (IA + heurística)
 function scoreServiceRelevance(userMsg, label){
   const u = norm(userMsg), l = norm(label); let score = 0
-  // uñas específicos
   if (/\b(uñas|unas)\b/.test(u) && /\b(uñas|unas|manicura)\b/.test(l)) score += 3
   if (/\bmanicura\b/.test(u) && /\bmanicura\b/.test(l)) score += 3
   if (/\b(acrilic|acrilico|acrílico)\b/.test(u) && l.includes("acril")) score += 2.5
@@ -403,17 +401,11 @@ function scoreServiceRelevance(userMsg, label){
   if (/\brelleno\b/.test(u) && (l.includes("uña") || l.includes("manicura") || l.includes("gel") || l.includes("acril"))) score += 2
   if (/\bretir(ar|o)\b/.test(u) && (l.includes("retir")||l.includes("retiro")||l.includes("quitar"))) score += 1.5
   if (/\bpress\b/.test(u) && l.includes("press")) score += 1.2
-  // depilación
   if (/\bdepil|fotodepil|laser|láser\b/.test(u) && /\b(axilas|ingles|inglés|labio|piernas|brazos|pubis|perianal|nasales?)\b/.test(l)) score += 2.5
-  // micropig
   if (/\bmicroblading|micropigment|hairstroke|eyeliner|aquarela|labios\b/.test(u) && /\b(micro|hair|eyeliner|labios|aquarela|polvo)\b/.test(l)) score += 2.5
-  // pestañas
   if (/\bpestañ|pesta|lifting|tinte|2d|3d\b/.test(u) && /\b(pesta|lifting|tinte|2d|3d)\b/.test(l)) score += 2.5
-  // facial
   if (/\bfacial|dermapen|limpieza|hydra|peel|acn|manchas|colag|vitamina|carbon|carbón\b/.test(u) && /\b(facial|dermapen|limpieza|hydra|peel|acn|manchas|colag|vitamina|carbon|carbón)\b/.test(l)) score += 2
-  // corporal
   if (/\bmasaje|maderoterapia|endosphere|corporal|push\b/.test(u) && /\b(masaje|maderoterapia|endosphere|corporal|push)\b/.test(l)) score += 2
-
   const tokens = ["natural","francesa","frances","decoracion","diseño","extra","exprés","express","completa","nivelacion","nivelación","labio","axilas","ingles","inglés","2d","3d","lifting","tinte","dermapen","limpieza","hydra","vitamina","oro","colágeno","colageno","jade","endosphere","maderoterapia","masaje"]
   for (const t of tokens){ if (u.includes(norm(t)) && l.includes(norm(t))) score += 0.4 }
   const utoks = new Set(u.split(" ").filter(Boolean))
@@ -423,24 +415,18 @@ function scoreServiceRelevance(userMsg, label){
   return score
 }
 
-async function buildServiceChoiceListBySedeAI(sedeKey, userMsg){
-  const catAI = await aiDetectCategory(userMsg||"")
+async function buildServiceChoiceListBySedeAI(sedeKey, userMsg, overrideCat=null){
+  const catAI = overrideCat || await aiDetectCategory(userMsg||"")
   const catKey = catAI || detectCategoryHeuristic(userMsg) || "nails"
   const allowPedi = shouldIncludePedicure(userMsg)
 
-  // IA filtra la lista total por categoría
   const aiList = await aiFilterServicesByCategory(sedeKey, catKey)
-  // Heurística filtra también
   const heur = servicesForSedeKeyRaw(sedeKey).filter(s=>isLabelInCategoryHeuristic(s.norm, catKey, allowPedi))
 
-  // Intersección segura (evita colados de cualquier lado)
   const aiSet = new Set(aiList.map(s=>s.label))
   const finalBase = heur.filter(s=> aiSet.has(s.label))
-
-  // Si por lo que sea queda vacío, usa heurística sola
   const pool = finalBase.length ? finalBase : heur
 
-  // Reranking híbrido (IA + score local)
   const localScores = new Map()
   for (const s of pool){ localScores.set(s.label, scoreServiceRelevance(userMsg, s.label)) }
   const aiBoost = new Set(aiList.map(s=>s.label))
@@ -455,7 +441,6 @@ async function buildServiceChoiceListBySedeAI(sedeKey, userMsg){
 // ====== Duración real de servicio
 function serviceDurationFromEnvKey(envKey){
   if (!envKey) return 60
-  // SVC -> DUR, manteniendo posible "luz_" en la clave
   const durKey = envKey.replace(/^SQ_SVC/, "SQ_DUR")
   const v = process.env[durKey]
   const n = v!=null ? Number(String(v).split("|")[0]) : NaN
@@ -784,14 +769,15 @@ function parsePreferredStaffFromText(text){
 
 // ====== Menús por categoría (IA + heurística)
 async function executeChooseService(params, sessionData, phone, sock, jid, userMsg){
+  const forcedCat = params?.cat || sessionData?.pendingCategory || null
   if (!sessionData.sede){
-    sessionData.pendingCategory = params?.cat || (await aiDetectCategory(userMsg||"")) || "nails"
+    sessionData.pendingCategory = forcedCat || (await aiDetectCategory(userMsg||"")) || "nails"
     sessionData.stage = "awaiting_sede_for_services"
     saveSession(phone, sessionData)
     await sendWithPresence(sock, jid, "¿En qué sede te viene mejor, Torremolinos o La Luz? (así te muestro las opciones correctas)")
     return
   }
-  const items = await buildServiceChoiceListBySedeAI(sessionData.sede, userMsg||"")
+  const items = await buildServiceChoiceListBySedeAI(sessionData.sede, userMsg||"", forcedCat)
   if (!items.length){
     await sendWithPresence(sock, jid, "Ahora mismo no tengo servicios de esa categoría configurados para esa sede.")
     return
@@ -1034,16 +1020,14 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v30.2.0</h1>
+  <h1>🩷 Gapink Nails Bot v30.2.1</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v30.2.0:</strong><br>
-    • IA filtra menús por categoría (sin “colados”).<br>
-    • Duración real por servicio en propuestas fallback.<br>
+    <strong>🚀 Mejora clave:</strong> Menús por categoría persistente tras “con {nombre}”.
   </div>
   </div>`)
 })
@@ -1175,7 +1159,7 @@ async function startBot(){
               sessionData.sede = sede
               sessionData.stage = null
               saveSession(phone, sessionData)
-              await executeChooseService({ }, sessionData, phone, sock, jid, textRaw)
+              await executeChooseService({ cat: sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
               return
             }
           }
@@ -1200,7 +1184,7 @@ async function startBot(){
               if (sessionData.selectedServiceEnvKey){
                 await executeProposeTime({}, sessionData, phone, sock, jid)
               } else {
-                await executeChooseService({}, sessionData, phone, sock, jid, textRaw)
+                await executeChooseService({ cat: sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
               }
               return
             }
@@ -1246,6 +1230,8 @@ async function startBot(){
           // “con {nombre}”
           const maybeStaff = parsePreferredStaffFromText(textRaw)
           if (maybeStaff){
+            // Detectamos y persistimos categoría aquí (FIX v30.2.1)
+            sessionData.pendingCategory = await aiDetectCategory(textRaw)
             const locKeys = allowedLocKeysForStaff(maybeStaff.id)
             if (!sessionData.sede){
               if (locKeys.length === 1){
@@ -1256,7 +1242,7 @@ async function startBot(){
                 if (sessionData.selectedServiceEnvKey){
                   await executeProposeTime({}, sessionData, phone, sock, jid)
                 } else {
-                  await executeChooseService({}, sessionData, phone, sock, jid, textRaw)
+                  await executeChooseService({ cat: sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
                 }
                 return
               } else if (locKeys.length > 1){
@@ -1278,7 +1264,7 @@ async function startBot(){
                 if (sessionData.selectedServiceEnvKey){
                   await executeProposeTime({}, sessionData, phone, sock, jid)
                 } else {
-                  await executeChooseService({}, sessionData, phone, sock, jid, textRaw)
+                  await executeChooseService({ cat: sessionData.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
                 }
                 return
               } else {
@@ -1335,7 +1321,6 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   })
   saveSession(phone, sessionData)
 
-  // Router de acciones
   switch (aiObj.action) {
     case "choose_service":
       await executeChooseService(aiObj.action_params, sessionData, phone, sock, jid, textRaw); break
@@ -1351,7 +1336,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
     case "none":
     default:
       if (!sessionData.selectedServiceEnvKey && /uñ|unas|manicura|gel|acrilic|semi|press|tips|francesa|encapsul|depil|fotodepil|laser|láser|micropig|microblad|pesta|facial|dermapen|limpieza|masaje|madero|endosphere/i.test(textRaw)){
-        await executeChooseService({ candidates: aiObj?.action_params?.candidates || [] }, sessionData, phone, sock, jid, textRaw)
+        await executeChooseService({ cat: aiObj?.action_params?.cat || sessionData?.pendingCategory || null }, sessionData, phone, sock, jid, textRaw)
       } else {
         await sendWithPresence(sock, jid, aiObj.message || "¿Puedes repetirlo, por favor?")
       }
@@ -1359,7 +1344,7 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
 }
 
 // ====== Servidor
-console.log(`🩷 Gapink Nails Bot v30.2.0`)
+console.log(`🩷 Gapink Nails Bot v30.2.1`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
