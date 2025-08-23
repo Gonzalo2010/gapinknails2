@@ -1,9 +1,10 @@
-// index.js — Gapink Nails · v30.0.2 “Cristina Fix + SmartStaff”
-// Cambios v30.0.2:
-// • FIX: parseEmployees() ahora marca BOOKABLE por defecto si hay EMP_CENTER_* o locs válidos.
-// • Mejor mapeo de sedes permitidas desde EMP_CENTER_* -> IDs de Square.
-// • Mensaje de alternativa cuando la pro no atiende en esa sede conserva lista de sedes donde sí atiende.
-// • Resto: multi-categoría (uñas, depilación, micropigmentación, pestañas, facial, corporal), preferencia “con {nombre}”, disponibilidad y reserva real en Square.
+// index.js — Gapink Nails · v30.0.3 “Cristina Fix + SmartStaff”
+// Cambios v30.0.3:
+// • FIX sintaxis: línea de `faltan.push("servicio")` cerrada correctamente.
+// • Staff BOOKABLE por defecto si hay EMP_CENTER_* o locs válidos (Cristina en Torremolinos ok).
+// • Multi-categoría (uñas, depilación, micropigmentación, pestañas, facial, corporal).
+// • “con {nombre}” entiende sedes y propone huecos reales por Square. 
+// • Mensajes útiles si la pro no atiende en esa sede + alternativas.
 
 import express from "express"
 import pino from "pino"
@@ -736,7 +737,10 @@ function buildLocalFallback(userMessage, sessionData){
     if (hasCore(sessionData)){
       return { message:"¡Voy a crear la reserva! ✨", action:"create_booking", session_updates:{}, action_params:{} }
     } else {
-      const faltan=[]; if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)"); if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio"; if (!sessionData?.pendingDateTime) faltan.push("fecha y hora")
+      const faltan=[];
+      if (!sessionData?.sede) faltan.push("sede (Torremolinos o La Luz)");
+      if (!sessionData?.selectedServiceEnvKey) faltan.push("servicio");
+      if (!sessionData?.pendingDateTime) faltan.push("fecha y hora");
       return { message:`Para proponerte horas dime: ${faltan.join(" y ")}.`, action:"need_info", session_updates:{}, action_params:{} }
     }
   }
@@ -1084,16 +1088,15 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v30.0.2</h1>
+  <h1>🩷 Gapink Nails Bot v30.0.3</h1>
   <div class="status ${conectado ? 'success' : 'error'}">Estado WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
   <h3>📊 Estadísticas</h3>
   <div><span class="stat">📅 Total: ${totalAppts}</span><span class="stat">✅ Exitosas: ${successAppts}</span><span class="stat">❌ Fallidas: ${failedAppts}</span></div>
   <div style="margin-top:24px;padding:16px;background:#e3f2fd;border-radius:8px;font-size:14px">
-    <strong>🚀 Mejoras v30.0.2:</strong><br>
-    • Staff BOOKABLE por defecto si hay centros/locs (Cristina ya opera en Torremolinos).<br>
-    • Mensajes más útiles cuando la pro no atiende en una sede.<br>
+    <strong>🚀 Mejoras v30.0.3:</strong><br>
+    • Fix de sintaxis en fallback + robustez staff/sedes.<br>
   </div>
   </div>`)
 })
@@ -1443,10 +1446,9 @@ async function routeAIResult(aiObj, sessionData, textRaw, m, phone, sock, jid){
   }
 }
 
-// ====== Mini API + servidor
-const appServer=app
-console.log(`🩷 Gapink Nails Bot v30.0.2`)
-appServer.listen(PORT, ()=>{ startBot().catch(console.error) })
+// ====== Servidor
+console.log(`🩷 Gapink Nails Bot v30.0.3`)
+app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
 process.on("SIGTERM", ()=>{ process.exit(0) })
