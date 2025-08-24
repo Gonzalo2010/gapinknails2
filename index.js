@@ -1,8 +1,11 @@
-// index.js — Gapink Nails · v29.1.0 — Full
+// index.js — Gapink Nails · v29.2.1 — Full
 // IA end-to-end: categoría → sede → servicio → profesional → día/parte del día → hora → Square.
-// Mejoras: “con {nombre}” re-filtra horas en caliente; dedupe de servicios; nota solo si preferencia explícita.
-// Staff por centro con fallback; valida sede para la profesional.
-// Mantiene teamMemberId del slot; filtros de sede; SQL y paréntesis OK.
+// Fixes clave v29.2.x:
+// - "con {profesional}" ahora *también* entiende día/franja del mismo mensaje (p.ej. "viernes por la tarde").
+// - Si la profesional no atiende en la sede elegida, no mostramos "no hay huecos"; avisamos sede incorrecta y proponemos alternativas.
+// - La nota "no veo huecos con {X}" solo se muestra si realmente se buscó con {X} en esa sede y *no hubo* horarios.
+// - Persistencia de día/franja en contexto para preguntas subsiguientes ("¿y por la tarde?").
+// - Dedupe de servicios, SQL OK, manejo de errores y logging.
 
 import express from "express"
 import pino from "pino"
@@ -128,11 +131,7 @@ function safeJSONStringify(value){
 }
 
 // ====== Day-part helpers
-const DAYPARTS = {
-  morning: { start: 9, end: 13 },
-  afternoon: { start: 15, end: 19 },
-  evening: { start: 18, end: 20 }
-}
+const DAYPARTS = { morning:{start:9,end:13}, afternoon:{start:15,end:19}, evening:{start:18,end:20} }
 function parseDaypart(text){
   const t = norm(text)
   if (/\b(ma[nñ]ana)\b/.test(t)) return "morning"
@@ -266,7 +265,7 @@ function deriveLabelsFromEnvKey(envKey){
 const FALLBACK_STAFF_CENTERS = {
   "rocio":"la_luz",
   "rocio chica":"both",
-  "carmen belen":"la_luz",
+  "carmen belen":"both",      // <- permitir ambos si el env no trae locs
   "patri":"la_luz",
   "ganna":"la_luz",
   "maria":"la_luz",
@@ -332,6 +331,16 @@ function isStaffAllowedInLocation(staffId, locKey){
   if (!e || !e.bookable) return false
   const locId = locationToId(locKey)
   return e.allow.includes("ALL") || e.allow.includes(locId)
+}
+function allowedLocKeysForStaff(staffId){
+  const e = EMPLOYEES.find(x=>x.id===staffId)
+  if (!e || !e.bookable) return []
+  const out=[]
+  for (const id of e.allow){
+    if (id===LOC_TORRE) out.push("torremolinos")
+    if (id===LOC_LUZ) out.push("la_luz")
+  }
+  return out
 }
 function pickStaffForLocation(locKey, preferId=null){
   const locId = locationToId(locKey)
@@ -744,12 +753,25 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
 
   if (!sessionData.sede || !sessionData.selectedServiceEnvKey) { await sendWithPresence(sock, jid, "Necesito la sede y el servicio primero."); return; }
 
+  // Guarda el día en contexto para mensajes como "por la tarde" a continuación
   sessionData.dateContextISO = baseFrom.clone().startOf("day").toISOString();
 
   let slots = []
   let usedPreferred = false
+  let attemptedPreferred = false
 
-  if (sessionData.preferredStaffId && isStaffAllowedInLocation(sessionData.preferredStaffId, sessionData.sede)) {
+  // Si se pidió alguien concreto y NO atiende en la sede, avisamos y salimos:
+  if (sessionData.preferredStaffId && !isStaffAllowedInLocation(sessionData.preferredStaffId, sessionData.sede)) {
+    const name = sessionData.preferredStaffLabel || "esa profesional"
+    const allowedKeys = allowedLocKeysForStaff(sessionData.preferredStaffId)
+    const allowedNice = allowedKeys.map(locationNice).join(" o ")
+    await sendWithPresence(sock, jid, `${name} no atiende en ${locationNice(sessionData.sede)}. Puede atender en ${allowedNice}. ¿Prefieres cambiar de sede o elegir otra profesional en ${locationNice(sessionData.sede)}?`)
+    saveSession(phone, sessionData)
+    return
+  }
+
+  if (sessionData.preferredStaffId) {
+    attemptedPreferred = true
     const staffSlots = await searchAvailabilityForStaff({
       locationKey: sessionData.sede,
       envServiceKey: sessionData.selectedServiceEnvKey,
@@ -761,6 +783,7 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     })
     if (staffSlots.length){ slots = staffSlots; usedPreferred = true }
   }
+
   if (!slots.length) {
     const generic = await searchAvailabilityGeneric({
       locationKey: sessionData.sede,
@@ -798,10 +821,14 @@ async function executeProposeTime(params, sessionData, phone, sock, jid) {
     const tag = sid ? ` — ${staffLabelFromId(sid)}` : ""
     return `${h.index}) ${h.pretty}${tag}`
   }).join("\n")
-  const showNote = (sessionData.preferredStaffId && sessionData.preferredStaffLabel && sessionData.preferredExplicit)
-  const header = usedPreferred
-    ? `Horarios disponibles con ${sessionData.preferredStaffLabel || "tu profesional"}:`
-    : `Horarios disponibles (nuestro equipo):${ showNote ? `\nNota: no veo huecos con ${sessionData.preferredStaffLabel} en los próximos días; te muestro alternativas.`:""}`
+
+  let header = `Horarios disponibles (nuestro equipo):`
+  if (usedPreferred) {
+    header = `Horarios disponibles con ${sessionData.preferredStaffLabel || "tu profesional"}:`
+  } else if (attemptedPreferred && sessionData.preferredExplicit) {
+    header = `Horarios disponibles (nuestro equipo):\nNota: no veo huecos con ${sessionData.preferredStaffLabel} en ese rango; te muestro alternativas.`
+  }
+
   await sendWithPresence(sock, jid, `${header}\n${lines}\n\nResponde con el número (1, 2 o 3)`)
 }
 
@@ -1044,7 +1071,7 @@ app.get("/", (_req,res)=>{
   .warning{background:#fff3cd;color:#856404}
   .stat{display:inline-block;margin:0 16px;padding:8px 12px;background:#e9ecef;border-radius:6px}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v29.1.0</h1>
+  <h1>🩷 Gapink Nails Bot v29.2.1</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"}</div>
@@ -1220,37 +1247,23 @@ async function startBot(){
             return
           }
 
-          // === “con {nombre}” (re-propone horas si ya hay servicio+sede)
+          // === “con {nombre}” (ahora entiende *en el mismo mensaje* día y franja)
           const maybeStaff = parsePreferredStaffFromText(textRaw)
           if (maybeStaff){
-            if (sessionData.sede){
-              if (isStaffAllowedInLocation(maybeStaff.id, sessionData.sede)){
-                sessionData.preferredStaffId = maybeStaff.id
-                sessionData.preferredStaffLabel = staffLabelFromId(maybeStaff.id)
-                sessionData.preferredExplicit = true
-                saveSession(phone, sessionData)
-                if (sessionData.selectedServiceEnvKey){
-                  const base = sessionData.dateContextISO ? dayjs(sessionData.dateContextISO).tz(EURO_TZ) : null
-                  await executeProposeTime({
-                    fromISO: base ? base.toISOString() : undefined,
-                    exactDayOnly: !!base,
-                    daypart: parseDaypart(textRaw) || null
-                  }, sessionData, phone, sock, jid)
-                  return
-                }
-              } else {
-                const locId = locationToId(sessionData.sede)
-                const alts = EMPLOYEES
-                  .filter(e=> e.bookable && (e.allow.includes("ALL") || e.allow.includes(locId)))
-                  .map(e=>e.labels[0]).slice(0,6)
-                await sendWithPresence(sock, jid, `${maybeStaff.labels[0]} no atiende en ${locationNice(sessionData.sede)}. Disponibles: ${alts.join(", ")}. ¿Con quién prefieres?`)
-                return
-              }
-            } else {
-              sessionData.preferredStaffId = maybeStaff.id
-              sessionData.preferredStaffLabel = staffLabelFromId(maybeStaff.id)
-              sessionData.preferredExplicit = true
-              saveSession(phone, sessionData)
+            const reqDay = parseRequestedDayFromText(textRaw, dayjs().tz(EURO_TZ)) // <-- viernes, 25/08, etc.
+            const reqPart = parseDaypart(textRaw) // <-- por la tarde, mañana...
+            sessionData.preferredStaffId = maybeStaff.id
+            sessionData.preferredStaffLabel = staffLabelFromId(maybeStaff.id)
+            sessionData.preferredExplicit = true
+            saveSession(phone, sessionData)
+
+            if (sessionData.sede && sessionData.selectedServiceEnvKey){
+              await executeProposeTime({
+                fromISO: reqDay ? reqDay.toISOString() : undefined,
+                exactDayOnly: !!reqDay,
+                daypart: reqPart || null
+              }, sessionData, phone, sock, jid)
+              return
             }
           }
 
@@ -1388,7 +1401,7 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v29.1.0`)
+console.log(`🩷 Gapink Nails Bot v29.2.1`)
 const appInstance = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
