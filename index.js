@@ -1,10 +1,5 @@
-// index.js — Gapink Nails · v31.1.0
+// index.js — Gapink Nails · v31.1.1
 // IA en TODO menos selección por números (servicio/hora/identidad/cancelar): deterministas.
-// Fixes v31.1:
-// - Mapeo de sedes por staff sin forzar Torremolinos cuando hay tokens desconocidos (NO_LOCS).
-// - Overrides ampliados: 'patricia' incluida, etc.
-// - “con el equipo / me da igual / cualquiera” limpia preferencia y propone huecos del equipo.
-// - Alternativas de staff sin duplicados.
 
 import express from "express"
 import pino from "pino"
@@ -115,7 +110,7 @@ function stableKey(parts){ const raw=Object.values(parts).join("|"); return crea
 function applySpanishDiacritics(label){
   let x = String(label||"")
   x = x.replace(/\bunas\b/gi, m => m[0] === 'U' ? 'Uñas' : 'uñas')
-  x = x.replace(/\bpestan(as?|)\b/gi, (m, suf) => (m[0]==='P'?'Pestañ':'pestañ') + (suf||''))
+  x = x.replace(/\bpestan(as?)?\b/gi, (m) => (m[0]==='P'?'Pestañ':'pestañ') + 'as')
   x = x.replace(/\bnivelacion\b/gi, m => m[0]==='N' ? 'Nivelación' : 'nivelación')
   x = x.replace(/\bfrances\b/gi, m => m[0]==='F' ? 'Francés' : 'francés')
   x = x.replace(/\bmas\b/gi, (m) => (m[0]==='M' ? 'Más' : 'más'))
@@ -289,7 +284,7 @@ function parseEmployees(){
       if (tok===LOC_LUZ || tok===LOC_TORRE){ allow.push(tok); continue }
       if (/^la_?luz$/i.test(tok)) { allow.push(LOC_LUZ); continue }
       if (/^torremolinos$/i.test(tok)) { allow.push(LOC_TORRE); continue }
-      // Cualquier otro token se ignora (NO_LOCS, NO_BOOKABLE, etc.)
+      // Ignora tokens no válidos (NO_LOCS, NO_BOOKABLE, etc.)
     }
     const labels = deriveLabelsFromEnvKey(k)
     out.push({ envKey:k, id, bookable, allow: allow.length?allow:[], labels })
@@ -938,7 +933,7 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v31.1.0 — IA parcial</h1>
+  <h1>🩷 Gapink Nails Bot v31.1.1 — IA parcial</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
@@ -1293,9 +1288,7 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.1.0 — IA parcial`)
-const app=express()
-const PORT=process.env.PORT||8080
+console.log(`🩷 Gapink Nails Bot v31.1.1 — IA parcial`)
 app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
