@@ -1,8 +1,7 @@
-// index.js — Gapink Nails · v31.4.0
-// Cambios clave v31.4.0:
-// - Enviar SIEMPRE un mensaje de bienvenida la primera vez que el cliente escribe en una ventana de 24h,
-//   y luego responder al mensaje original (mismo turno).
-// - Mantiene "salón", sábados NO laborales, top 5 huecos, horario semanal, IA, etc.
+// index.js — Gapink Nails · v31.3.1
+// Cambios clave v31.3.1:
+// - Muestra SOLO las primeras N=5 opciones (configurable) al proponer horas y en horario semanal.
+// - Mantiene "salón" (no "sede"), sábado NO laboral, IA y filtros locales por profesional.
 
 import express from "express"
 import pino from "pino"
@@ -58,20 +57,6 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"
 const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 15000)
 const sleep = ms => new Promise(r=>setTimeout(r, ms))
-
-// ====== Mensaje de bienvenida (24h)
-const WELCOME_MESSAGE = `Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.
-
-Solo atenderemos por WhatsApp y llamadas en horario de lunes a viernes de 10 a 14:00 y de 16:00 a 20:00 
-
-Si quieres reservar una cita puedes hacerlo a través de este link:
-
-https://gapinknails.square.site/?source=qr-code
-
-Y si quieres modificarla puedes hacerlo a través del link del sms que llega con su cita! 
-
-Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.
-Gracias 😘`
 
 async function aiChat(system, user, extraMsgs=[]){
   if (AI_PROVIDER==="none") return null
@@ -370,7 +355,7 @@ const NAME_ALIASES = [
   ["ginna","gina"],["chabely","chabeli","chabelí"],["elisabeth","elisabet","elis"],
   ["desi","desiree","desirée"],["daniela","dani"],["jamaica","jahmaica"],["edurne","edur"],
   ["sudemis","sude"],["maria","maría"],["anaira","an aira"],
-  ["thalia","thalía","talia","talía"]
+  ["thalia","thalía","talia","talía"] // alias extra de ejemplo
 ]
 function fuzzyStaffFromText(text){
   const tnorm = norm(text)
@@ -1071,11 +1056,11 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v31.4.0 — Welcome+Top5</h1>
+  <h1>🩷 Gapink Nails Bot v31.3.1 — Top 5</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
-  <p>Envío de bienvenida 1 vez/24h + respuesta al mensaje original. Mostrando solo las primeras ${SHOW_TOP_N} opciones.</p>
+  <p>Mostrando solo las primeras ${SHOW_TOP_N} opciones en propuestas y horario semanal. Sábados no laborales.</p>
   </div>`)
 })
 app.get("/qr.png", async (_req,res)=>{
@@ -1134,8 +1119,7 @@ async function startBot(){
             lastProposeUsedPreferred:false, stage:null,
             identityChoices:null, identityResolvedCustomerId:null,
             cancelList:null,
-            snooze_until_ms:null, name:null, email:null,
-            lastWelcome_ms:null
+            snooze_until_ms:null, name:null, email:null
           }
           if (isFromMe) { saveSession(phone, session); return }
 
@@ -1145,15 +1129,6 @@ async function startBot(){
             saveSession(phone, session); return
           }
           if (session.snooze_until_ms && nowEU.valueOf() < session.snooze_until_ms) { saveSession(phone, session); return }
-
-          // ====== NUEVO: Mensaje de bienvenida 1 vez / 24h ======
-          const shouldWelcome = !session.lastWelcome_ms || (nowEU.valueOf() - Number(session.lastWelcome_ms)) >= 24*60*60*1000
-          if (shouldWelcome){
-            await sock.sendMessage(jid, { text: WELCOME_MESSAGE })
-            session.lastWelcome_ms = nowEU.valueOf()
-            saveSession(phone, session)
-            // No retornamos: tras la bienvenida, seguimos procesando el mismo mensaje del cliente.
-          }
 
           const t = norm(textRaw)
           const numMatch = t.match(/^\s*([1-9]\d*)\b/)
@@ -1294,6 +1269,7 @@ async function startBot(){
             session.preferredStaffLabel = staffLabelFromId(fuzzy.id)
             saveSession(phone, session)
           } else {
+            // Si el usuario dijo “con {nombre}” y no existe, ofrecer alternativas del salón
             const unknownNameMatch = /(?:^|\s)con\s+([a-zñáéíóúüï\s]{2,})\??$/i.exec(textRaw)
             if (unknownNameMatch){
               if (!session.sede){
@@ -1493,7 +1469,7 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.4.0 — Welcome (24h) + Top ${SHOW_TOP_N} (L–V)`)
+console.log(`🩷 Gapink Nails Bot v31.3.1 — Top ${SHOW_TOP_N} (L–V)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
