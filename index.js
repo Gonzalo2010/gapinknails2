@@ -1,7 +1,7 @@
 // index.js — Gapink Nails · v31.4.0 (empleados sin ubicación)
 // - Staff global (sin mapeo por salón en ENV).
 // - Disponibilidad filtrada por locationId en Square (según salón elegido).
-// - Si un staff no tiene huecos en ese salón/rango, se cae a equipo automáticamente.
+// - Si un staff no tiene huecos en ese salón/rango, se cae a equipo automáticament
 
 import express from "express"
 import pino from "pino"
