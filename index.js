@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v31.5.0 (saludos IA + gestión por SMS + pausa 6h con ".")
+// index.js — Gapink Nails · v31.6.0 (IA en todo + pausa 6h + gestión por SMS)
 // - Staff global (sin mapeo por salón en ENV).
 // - Disponibilidad filtrada por locationId en Square (según salón elegido).
 // - Si un staff no tiene huecos en ese salón/rango, se cae a equipo automáticamente.
@@ -300,12 +300,10 @@ function staffLabelFromId(id){
   const e = EMPLOYEES.find(x=>x.id===id)
   return e?.labels?.[0] || (id ? `Prof. ${String(id).slice(-4)}` : null)
 }
-// Ahora solo comprobamos si es bookable, ignorando el salón
 function isStaffAllowedInLocation(staffId, _locKey){
   const e = EMPLOYEES.find(x=>x.id===staffId)
   return !!(e && e.bookable)
 }
-// Elegimos cualquier bookable (o el preferido)
 function pickStaffForLocation(_locKey, preferId=null){
   if (preferId){
     const e = EMPLOYEES.find(x=>x.id===preferId && x.bookable)
@@ -487,7 +485,7 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
     return { success: false, error: "teamMemberId requerido" }
   }
   if (DRY_RUN) return { success: true, booking: { id:`TEST_SIM_${Date.now()}`, __sim:true } }
-  const sv = await getServiceIdAndVersion(envServiceKey)
+  const sv = await getServiceIdAndVersion(envKey=envServiceKey)
   if (!sv?.id || !sv?.version) return { success: false, error: `No se pudo obtener servicio ${envServiceKey}` }
   const startISO = startEU.tz("UTC").toISOString()
   const idempotencyKey = stableKey({ loc:locationToId(locationKey), sv:sv.id, startISO, customerId, teamMemberId })
@@ -541,7 +539,7 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
   return { success: false, error: `No se pudo crear reserva: ${lastError?.message || 'Error desconocido'}`, lastError }
 }
 
-// ====== DISPONIBILIDAD (staff global, Square filtra por locationId)
+// ====== DISPONIBILIDAD
 function partOfDayWindow(dateEU, part){
   let start=dateEU.clone().hour(OPEN.start).minute(0).second(0).millisecond(0)
   let end  =dateEU.clone().hour(OPEN.end).minute(0).second(0).millisecond(0)
@@ -610,7 +608,7 @@ async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, l
 }
 
 // ====== Conversación determinista/IA
-function parseSede(text){ // “salón”
+function parseSede(text){
   const t=norm(text)
   if (/\b(luz|la luz)\b/.test(t)) return "la_luz"
   if (/\b(torre|torremolinos)\b/.test(t)) return "torremolinos"
@@ -635,38 +633,52 @@ function buildGreeting(){
   return `¡Hola! Soy el asistente de Gapink Nails.\n\nPara reservar dime *salón* (Torremolinos o La Luz) y *categoría*: Uñas / Depilación / Micropigmentación / Faciales / Pestañas.\nEj.: “depilación en Torremolinos con Patri el viernes por la tarde”.\nTambién puedo mostrarte el *horario de los próximos 7 días* (“horario esta semana” o “próxima semana con Cristina”).`
 }
 
-// ====== NUEVO: Clasificador IA de intención (saludo / editar-cancelar / info-cita / otro)
+// ====== NUEVO: Clasificador IA (todo pasa por aquí)
 function heuristicsIntent(textRaw){
   const t = norm(textRaw||"")
-  const greet = /\b(hola|buenas|buenos dias|buenas tardes|buenas noches|hey|holi|hello|hi|qué tal|que tal)\b/i.test(t)
-  const editCancel = /\b(cancel|cancelar|anular|modificar|editar|cambiar|reprogramar|mover|posponer)\b.*\b(cita|reserva)\b/i.test(t) ||
+
+  const hasBookVerb = /\b(quiero|quisiera|me gustar[ií]a|reservar|reserva(r|me)?|agendar|pedir|coger|sacar|concertar|poner|programar|crear|apuntar|hacerme|coger cita|pedir cita)\b/i.test(t)
+  const mentionsNew = hasBookVerb || /\b(una|nueva)\s+(cita|reserva)\b/i.test(t)
+
+  const mentionsView = /\b(ver|consultar|saber|confirmar|comprobar|revisar|mirar|chequear|enseñ(a|ar)|dime)\b/i.test(t)
+  const hasMy = /\b(mi|mis|la|las)\b/i.test(t)
+  const hasCita = /\b(cita|reserva)\b/i.test(t)
+  const hasRef = /\b(ref|n[uú]mero|c[óo]digo|confirmaci[oó]n|enlace|link|sms)\b/i.test(t)
+  const hasWhenWhere = /\b(a\s*qu[eé]\s*hora|cu[aá]ndo|d[oó]nde|que\s*d[ií]a)\b/i.test(t)
+  const infoApt = (mentionsView && hasCita) || ((hasMy || hasRef || hasWhenWhere) && hasCita)
+
+  const editCancel = /\b(cancel(ar)?|anular|modificar|editar|cambiar|reprogramar|mover|posponer)\b.*\b(cita|reserva)\b/i.test(t) ||
                      /\b(cambiar\s+hora|cambiar\s+fecha)\b/i.test(t)
-  const infoApt = /\b(mi|mis|la|una)?\s*cita\b/i.test(t) ||
-                  /\breserva\b/i.test(t) ||
-                  /\bpr[oó]xima\s+cita\b/i.test(t) ||
-                  /\b(ver|consultar|saber)\b.*\b(cita|reserva)\b/i.test(t) ||
-                  /\b(que|qué)\s+hora\b.*\b(cita|reserva)?\b/i.test(t) ||
-                  /\bcuando|cuándo|donde|dónde\b.*\b(cita|reserva)\b/i.test(t)
+
+  const greet = /\b(hola|buenas|buenos dias|buenas tardes|buenas noches|hey|holi|hello|hi|que tal|qué tal)\b/i.test(t)
+
+  // Prioridad:
   if (editCancel) return { intent:"edit_or_cancel" }
-  if (infoApt) return { intent:"appointment_info" }
+  if (infoApt && !mentionsNew) return { intent:"appointment_info" } // "ver mi cita", "a qué hora es mi cita"
+  if (mentionsNew) return { intent:"new_booking" }
   if (greet) return { intent:"greeting" }
   return { intent:"other" }
 }
+
 async function aiDetectIntent(textRaw){
   if (AI_PROVIDER==="none") return heuristicsIntent(textRaw)
   const sys = `Eres un clasificador para WhatsApp de un salón.
-Devuelve SOLO JSON con la forma: {"intent":"greeting|edit_or_cancel|appointment_info|other"}.
-- "greeting": saludos tipo hola/hey/qué tal.
-- "edit_or_cancel": peticiones para editar, cambiar, reprogramar o cancelar una cita/reserva.
-- "appointment_info": quiere saber qué cita tiene, a qué hora, fecha, detalles, confirmación, ver su reserva.
-- "other": cualquier otro mensaje.`
+Devuelve SOLO JSON: {"intent":"greeting|edit_or_cancel|appointment_info|new_booking|other"}.
+Reglas IMPORTANTES:
+- "edit_or_cancel": el usuario quiere cambiar, mover, reprogramar o cancelar una cita existente.
+- "appointment_info": quiere VER/CONSULTAR detalles de una cita existente (ej.: "ver mi cita", "a qué hora es mi cita", "ver reserva", "confirmación", "SMS", "link").
+- "new_booking": el usuario quiere CREAR una cita nueva (ej.: "quiero una cita", "reservar uñas viernes", "agendar con Patri").
+- Si aparece "quiero" + "cita/reserva" es SIEMPRE "new_booking", salvo si dice "ver mi cita".
+- "greeting": saludos ("hola", "buenas"...).
+- "other": lo demás.
+Devuelve SOLO JSON.`
   const out = await aiChat(sys, `Texto: "${textRaw}"`)
   const obj = stripToJSON(out)
   if (obj && typeof obj.intent==="string") return obj
   return heuristicsIntent(textRaw)
 }
 
-// ====== HORARIO SEMANAL (7 días o próxima semana) — top N
+// ====== HORARIO SEMANAL (7 días o próxima semana)
 function nextMondayEU(base){ return base.clone().add(1,"week").isoWeekday(1).hour(OPEN.start).minute(0).second(0).millisecond(0) }
 async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   if (!sessionData.sede){
@@ -835,8 +847,6 @@ ${address}
 👩‍💼 ${staffName}
 📅 ${fmtES(startEU)}
 
-Ref: ${result.booking.id}
-
 ¡Te esperamos!`
   await sock.sendMessage(jid, { text: confirmMessage })
   clearSession(phone);
@@ -851,7 +861,6 @@ async function executeListAppointments(_session, _phone, sock, jid){
   await sock.sendMessage(jid, { text: SMS_INFO })
 }
 async function executeCancelAppointment(sessionData, _phone, sock, jid){
-  // Si hubiese algún estado previo de cancelación, lo cierro.
   sessionData.cancelList=null; sessionData.stage=null
   await sock.sendMessage(jid, { text: SMS_EDIT_CANCEL })
 }
@@ -869,7 +878,7 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v31.5.0 — Top ${SHOW_TOP_N}</h1>
+  <h1>🩷 Gapink Nails Bot v31.6.0 — Top ${SHOW_TOP_N}</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
@@ -937,19 +946,16 @@ async function startBot(){
 
           const nowEU = dayjs().tz(EURO_TZ)
 
-          // ====== Pausa 6h con "." (sirve si lo envía el cliente o nosotros)
+          // ====== Pausa 6h con "."
           if (textRaw.trim()==="."){
             session.snooze_until_ms = nowEU.add(6,"hour").valueOf()
-            saveSession(phone, session)
-            return
-          }
-
-          // Si está en pausa, no contestamos
-          if (session.snooze_until_ms && nowEU.valueOf() < session.snooze_until_ms) {
             saveSession(phone, session); return
           }
 
-          // A partir de aquí, ignoramos mensajes que sean "de mí", salvo que quieras rastrear logs
+          // Pausado → silencio
+          if (session.snooze_until_ms && nowEU.valueOf() < session.snooze_until_ms) { saveSession(phone, session); return }
+
+          // Ignora eco nuestro
           if (isFromMe) { saveSession(phone, session); return }
 
           const t = norm(textRaw)
@@ -957,15 +963,12 @@ async function startBot(){
           const sedeMention = parseSede(textRaw)
           const catMention = parseCategory(textRaw)
 
-          // ====== Primero: filtro IA de intención
+          // ====== Filtro IA (todo texto pasa por aquí)
           const intentObj = await aiDetectIntent(textRaw)
           const intent = intentObj?.intent || "other"
 
           if (intent === "greeting"){
-            // Saludo cálido y guía breve
-            const greet = "¡Holi! 🩷 Soy el asistente de Gapink Nails. ¿Te ayudo a reservar? Dime *salón* (Torremolinos o La Luz) y *categoría* (Uñas/Depilación/Micropigmentación/Faciales/Pestañas)."
-            await sock.sendMessage(jid,{ text:greet })
-            // Si solo era un saludo, paramos aquí
+            await sock.sendMessage(jid,{ text:"¡Holi! 🩷 Soy el asistente de Gapink Nails. ¿Te ayudo a reservar? Dime *salón* (Torremolinos o La Luz) y *categoría* (Uñas/Depilación/Micropigmentación/Faciales/Pestañas)." })
             if (!sedeMention && !catMention && !numMatch) return
           }
           if (intent === "edit_or_cancel"){
@@ -976,26 +979,9 @@ async function startBot(){
             await sock.sendMessage(jid,{ text: SMS_INFO })
             return
           }
+          // "new_booking" no bloquea: continúa el flujo normal para pedir datos y reservar
 
-          // “con el equipo / me da igual / cualquiera”
-          if (/\b(con el equipo|me da igual|cualquiera|con quien sea|lo que haya)\b/i.test(t)){
-            session.preferredStaffId = null
-            session.preferredStaffLabel = null
-            saveSession(phone, session)
-            // Pedimos datos faltantes o proponemos
-            if (session.sede && session.selectedServiceEnvKey){
-              await proposeTimes(session, phone, sock, jid, { text:textRaw })
-            } else {
-              const faltan=[]
-              if (!session.sede) faltan.push("salón")
-              if (!session.category) faltan.push("categoría")
-              if (!session.selectedServiceEnvKey) faltan.push("servicio")
-              await sock.sendMessage(jid,{text:`Perfecto, te propongo huecos del equipo en cuanto me digas ${faltan.join(", ")}.`})
-            }
-            return
-          }
-
-          // ====== BLOQUE DETERMINISTA POR NÚMERO ======
+          // ====== NÚMEROS (selecciones)
           if (session.stage==="awaiting_identity_pick" && numMatch){
             const n = Number(numMatch[1])
             const choice = (session.identityChoices||[]).find(c=>c.index===n)
@@ -1022,7 +1008,6 @@ async function startBot(){
             return
           }
           if (session.stage==="awaiting_cancel"){
-            // Forzamos la vía SMS
             session.cancelList=null; session.stage=null; saveSession(phone, session)
             await sock.sendMessage(jid,{ text: SMS_EDIT_CANCEL })
             return
@@ -1055,12 +1040,11 @@ async function startBot(){
             await executeCreateBooking(session, phone, sock, jid)
             return
           }
-          // ====== FIN BLOQUE POR NÚMERO ======
 
           if (sedeMention) { session.sede = sedeMention; saveSession(phone, session) }
           if (catMention)  { session.category = catMention; saveSession(phone, session) }
 
-          // Fuzzy staff (sin bloquear por salón)
+          // Fuzzy staff
           const fuzzy = fuzzyStaffFromText(textRaw)
           if (fuzzy){
             if (fuzzy.anyTeam){
@@ -1118,13 +1102,13 @@ async function startBot(){
             return
           }
 
-          // Si ya hay salón+servicio y el texto menciona día/franja → proponer directamente
+          // Si ya hay salón+servicio y menciona día/franja → proponer
           if (session.sede && session.selectedServiceEnvKey && /\botro dia\b|\botro día\b|\bhoy\b|\bmanana\b|\bpasado\b|\blunes\b|\bmartes\b|\bmiercoles\b|\bjueves\b|\bviernes\b|\btarde\b|\bpor la manana\b|\bnoche\b/i.test(t)){
             await proposeTimes(session, phone, sock, jid, { text:textRaw })
             return
           }
 
-          // IA de alto nivel (reserva/horario/etc.)
+          // IA de alto nivel (acciones)
           const aiObj = await (async ()=>{
             const nowEU = dayjs().tz(EURO_TZ)
             const torremolinos_services = servicesForSedeKeyRaw("torremolinos");
@@ -1157,7 +1141,6 @@ FORMATO:
             const action = aiObj.action
             const p = aiObj.params || {}
 
-            // BLOQUEO: todo lo que sea ver/cancelar → SMS
             if (action==="list_appointments"){ await sock.sendMessage(jid,{ text: SMS_INFO }); return }
             if (action==="cancel_appointment"){ await sock.sendMessage(jid,{ text: SMS_EDIT_CANCEL }); return }
 
@@ -1245,7 +1228,7 @@ FORMATO:
             }
           } // fin IA válida
 
-          // Si faltan datos, guía
+          // Datos mínimos
           if (!session.sede){
             session.stage="awaiting_sede"; saveSession(phone, session)
             await sock.sendMessage(jid,{text:"¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*."})
@@ -1283,7 +1266,7 @@ FORMATO:
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.5.0 — Top ${SHOW_TOP_N} (L–V)`)
+console.log(`🩷 Gapink Nails Bot v31.6.0 — Top ${SHOW_TOP_N} (L–V)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
