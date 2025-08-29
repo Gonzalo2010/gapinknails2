@@ -72,7 +72,7 @@ async function aiChat(system, user, extraMsgs=[]){
       const resp = await fetch("https://api.deepseek.com/chat/completions",{
         method:"POST",
         headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${DEEPSEEK_API_KEY}` },
-        body: JSON.stringify({ model: DEEPSEEK_MODEL, messages, temperature:0.2, max_tokens:1000 }),
+        body: JSON.stringify({ model: DEEPSEEK_MODEL, messages, temperature:0.6, max_tokens:1000 }),
         signal: controller.signal
       })
       clearTimeout(timeout)
@@ -83,7 +83,7 @@ async function aiChat(system, user, extraMsgs=[]){
       const resp = await fetch("https://api.openai.com/v1/chat/completions",{
         method:"POST",
         headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${OPENAI_API_KEY}` },
-        body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature:0.2, max_tokens:1000 }),
+        body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature:0.6, max_tokens:1000 }),
         signal: controller.signal
       })
       clearTimeout(timeout)
@@ -106,6 +106,20 @@ function stripToJSON(text){
   try{ return JSON.parse(s) }catch{ return null }
 }
 
+// >>>>>>> NUEVO: pulido amable con IA para mensajes al usuario (sin romper listados numerados)
+function _isStructuredList(t){
+  return /(?:^|\n)\s*\d+\)/.test(t) || /Responde con el número/i.test(t) || /Horarios disponibles|Opciones de|Tus próximas citas/i.test(t)
+}
+async function aiPolishText(original){
+  if (AI_PROVIDER==="none") return original
+  if (!original || original.length<3) return original
+  if (_isStructuredList(original)) return original
+  const sys = "Eres un copywriter para WhatsApp en español de España. Reescribe el texto con tono cercano, amable y natural; no suenes a bot ni uses listas; no inventes datos; mantén emojis si los hay; devuelve SOLO el texto reescrito."
+  const out = await aiChat(sys, `Texto:\n"""${original}"""`)
+  return (out||"").trim() || original
+}
+// <<<<<<< FIN NUEVO
+
 // ====== Utils básicos
 const onlyDigits = s => String(s||"").replace(/\D+/g,"")
 const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
@@ -120,7 +134,7 @@ function isEditOrCancelIntent(text){
   const edit = /\b(modific|cambi|mover|editar|reprogram|aplaz|adelant)\w*/.test(t)
   return mentionsApt && (cancel || edit)
 }
-const EDIT_CANCEL_MSG = "Para *editar o cancelar* tu cita, hazlo desde el *SMS de confirmación* que te llegó (trae un enlace directo). Si no lo encuentras, escríbenos y te ayudamos 😊";
+const EDIT_CANCEL_MSG = "Para editar o cancelar tu cita, usa el enlace del SMS de confirmación. Si no lo encuentras, escríbenos y te echamos un cable.";
 // <<<<<<< FIN NUEVO
 
 function applySpanishDiacritics(label){
@@ -444,7 +458,7 @@ async function getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid){
   if (matches.length === 0){
     sessionData.stage = "awaiting_identity"
     saveSession(phone, sessionData)
-    await sock.sendMessage(jid, { text: "Para terminar, no encuentro tu ficha por este número. Cuéntame tu *nombre completo* y, si quieres, tu *email* para crearte 😊" })
+    await sock.sendMessage(jid, { text: "Para terminar, no encuentro tu ficha por este número. Cuéntame tu nombre completo y, si quieres, tu email para crearte." })
     return { status:"need_new" }
   }
   const choices = matches.map((c,i)=>({
@@ -646,10 +660,10 @@ function proposeLines(slots, mapIsoToStaff){
 function buildGreeting(){
   return `¡Hola! Soy el asistente de Gapink Nails 💅
   
-Para reservar, dime *salón* (Torremolinos o La Luz) y *categoría*: Uñas / Depilación / Micropigmentación / Faciales / Pestañas.
+Para reservar, dime salón (Torremolinos o La Luz) y categoría: Uñas / Depilación / Micropigmentación / Faciales / Pestañas.
 Ej.: “depilación en Torremolinos con Patri el viernes por la tarde”.
 
-Si quieres, te muestro el *horario de los próximos 7 días* (“horario esta semana” o “próxima semana con Cristina”).`
+Si quieres, te muestro el horario de los próximos 7 días (“horario esta semana” o “próxima semana con Cristina”).`
 }
 
 function buildSystemPrompt(session){
@@ -674,7 +688,7 @@ ${laluz_services.map(s => `- ${s.label} (Clave: ${s.key})`).join("\n")}
 REGLAS:
 - Si el cliente escribe números para elegir, NO intervengas. Tú solo interpretas lenguaje natural.
 - Mapea nombres de profesionales (alias) a IDs listados.
-- Antes de listar servicios, identifica *categoría* y *salón*.
+- Antes de listar servicios, identifica categoría y salón.
 - Si pide “horario”, “esta/está semana” o “próxima semana”, devuelve {action:"weekly_schedule", next_week:boolean, staff_name?:string}.
 - Si dice “otro día / viernes tarde…”, devuelve {action:"propose_times", date_hint, part_of_day}.
 - Para reservar hace falta: salón + servicio + fecha/hora. La identidad se resuelve por teléfono.
@@ -719,7 +733,7 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   let endEU   = when ? when.clone().hour(OPEN.end).minute(0)   : baseFrom.clone().add(days,"day")
 
   if (!sessionData.sede || !sessionData.selectedServiceEnvKey){
-    await sock.sendMessage(jid, { text: "Antes necesito saber *salón* y *servicio* para proponerte horas 🙏" })
+    await sock.sendMessage(jid, { text: "Antes necesito saber salón y servicio para proponerte horas." })
     return
   }
 
@@ -763,7 +777,7 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
       sessionData.lastProposeUsedPreferred = nextUsedPreferred
       sessionData.stage = "awaiting_time"
       saveSession(phone, sessionData)
-      await sock.sendMessage(jid, { text: `No había huecos en los próximos ${days} días. *La próxima semana* sí hay (primeras ${SHOW_TOP_N}):\n${lines}\n\nResponde con el número.` })
+      await sock.sendMessage(jid, { text: `No había huecos en los próximos ${days} días. La próxima semana sí hay (primeras ${SHOW_TOP_N}):\n${lines}\n\nResponde con el número.` })
       return
     }
   }
@@ -796,11 +810,11 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
 function nextMondayEU(base){ return base.clone().add(1,"week").isoWeekday(1).hour(OPEN.start).minute(0).second(0).millisecond(0) }
 async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   if (!sessionData.sede){
-    await sock.sendMessage(jid,{ text:"¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*." })
+    await sock.sendMessage(jid,{ text:"¿En qué salón te viene mejor? Torremolinos o La Luz." })
     return
   }
   if (!sessionData.selectedServiceEnvKey){
-    await sock.sendMessage(jid,{ text:"Dime el *servicio* (o la *categoría* para listarte opciones) y te muestro el horario semanal." })
+    await sock.sendMessage(jid,{ text:"Dime el servicio (o la categoría para listarte opciones) y te muestro el horario semanal." })
     return
   }
   const nowEU = dayjs().tz(EURO_TZ)
@@ -831,7 +845,7 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   if (staffIdFilter){
     slots = rawSlots.filter(s => s.staffId === staffIdFilter)
     if (!slots.length){
-      await sock.sendMessage(jid,{ text:`No veo huecos con ${staffLabelFromId(staffIdFilter)} en ese rango. Te muestro el *horario del equipo*:` })
+      await sock.sendMessage(jid,{ text:`No veo huecos con ${staffLabelFromId(staffIdFilter)} en ese rango. Te muestro el horario del equipo:` })
       slots = rawSlots
       staffIdFilter = null
     }
@@ -870,38 +884,55 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   sessionData.stage = "awaiting_time"
   saveSession(phone, sessionData)
 
-  const header = `🗓️ Horario ${opts.nextWeek? "de la *próxima semana*":"de los *próximos 7 días*"} — primeras ${SHOW_TOP_N} — ${locationNice(sessionData.sede)}\n` +
+  const header = `🗓️ Horario ${opts.nextWeek? "de la próxima semana":"de los próximos 7 días"} — primeras ${SHOW_TOP_N} — ${locationNice(sessionData.sede)}\n` +
                  `${serviceLabelFromEnvKey(sessionData.selectedServiceEnvKey) || sessionData.selectedServiceLabel || "Servicio"}${staffIdFilter? ` · con ${staffLabelFromId(staffIdFilter)}`:""}\n`
-  await sock.sendMessage(jid,{ text: `${header}${lines.join("\n")}\n\nResponde con el *número* para reservar ese hueco.` })
+  await sock.sendMessage(jid,{ text: `${header}${lines.join("\n")}\n\nResponde con el número para reservar ese hueco.` })
 }
 
-// ====== Crear reserva
+// ====== Crear reserva (SIN MENTIR CON LA PROFESIONAL)
 async function executeCreateBooking(sessionData, phone, sock, jid){
-  if (!sessionData.sede) { await sock.sendMessage(jid,{text:"Nos falta el *salón* (Torremolinos o La Luz) 😊"}); return }
-  if (!sessionData.selectedServiceEnvKey) { await sock.sendMessage(jid,{text:"Y también el *servicio*, porfa 🙏"}); return }
-  if (!sessionData.pendingDateTime) { await sock.sendMessage(jid,{text:"Dime la *fecha y hora* que te viene bien 😉"}); return }
+  if (!sessionData.sede) { await sock.sendMessage(jid,{text:"Nos falta el salón (Torremolinos o La Luz)."}); return }
+  if (!sessionData.selectedServiceEnvKey) { await sock.sendMessage(jid,{text:"Y también el servicio, porfa."}); return }
+  if (!sessionData.pendingDateTime) { await sock.sendMessage(jid,{text:"Dime la fecha y hora que te viene bien."}); return }
 
   const startEU = parseToEU(sessionData.pendingDateTime)
-  if (!insideBusinessHours(startEU, 60)) { await sock.sendMessage(jid,{text:"Esa hora está fuera del horario (L–V 09:00–20:00)"}); return }
+  if (!insideBusinessHours(startEU, 60)) { await sock.sendMessage(jid,{text:"Esa hora está fuera del horario (L–V 09:00–20:00)."}); return }
 
   const iso = startEU.format("YYYY-MM-DDTHH:mm")
-  let staffId = sessionData.lastProposeUsedPreferred ? (sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null)
-                                                    : (sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null)
+
+  // >>>>>>> NUEVO: fijamos el staff del hueco elegido y NO mentimos si ha cambiado
+  let staffId =
+    sessionData.lockedStaffId ||
+    (sessionData.lastProposeUsedPreferred ? (sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null)
+                                          : (sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null))
+
+  // Comprobamos en Square quién tiene realmente ese minuto
+  const probe = await searchAvailWindow({
+    locationKey: sessionData.sede,
+    envServiceKey: sessionData.selectedServiceEnvKey,
+    startEU: startEU.clone().subtract(5,"minute"),
+    endEU: startEU.clone().add(5,"minute"),
+    limit: 5
+  })
+  const match = probe.find(x => x.date.isSame(startEU, "minute"))
+
+  if (match?.staffId) {
+    if (!staffId) staffId = match.staffId
+    if (staffId !== match.staffId) {
+      const prevName = staffLabelFromId(staffId) || sessionData.preferredStaffLabel || "otra profesional"
+      const realName = staffLabelFromId(match.staffId) || "nuestro equipo"
+      // Avisamos con la verdad antes de confirmar
+      await sock.sendMessage(jid, { text: `Aviso rápido: ese hueco es con ${realName}, no con ${prevName}. Sigo con esa profesional.` })
+      staffId = match.staffId
+    }
+  }
 
   if (staffId && !isStaffAllowedInLocation(staffId, sessionData.sede)) staffId = null
   if (!staffId) {
-    const probe = await searchAvailWindow({
-      locationKey: sessionData.sede,
-      envServiceKey: sessionData.selectedServiceEnvKey,
-      startEU: startEU.clone().subtract(5,"minute"),
-      endEU: startEU.clone().add(5,"minute"),
-      limit: 3
-    })
-    const match = probe.find(x => x.date.isSame(startEU, "minute"))
-    if (match?.staffId && isStaffAllowedInLocation(match.staffId, sessionData.sede)) staffId = match.staffId
+    const fallback = pickStaffForLocation(sessionData.sede, null)
+    if (!fallback){ await sock.sendMessage(jid,{text:"Ahora mismo no tengo a nadie libre en ese hueco. ¿Te paso otras opciones?"}); return }
+    staffId = fallback
   }
-  if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
-  if (!staffId) { await sock.sendMessage(jid,{text:"Ahora mismo no tengo a nadie libre en ese hueco 😞 ¿Te paso otras opciones?"}); return }
 
   // Identidad
   let customerId = sessionData.identityResolvedCustomerId || null
@@ -917,7 +948,7 @@ async function executeCreateBooking(sessionData, phone, sock, jid){
   if (!customerId){
     sessionData.stage = "awaiting_identity"
     saveSession(phone, sessionData)
-    await sock.sendMessage(jid,{text:"Para terminar, dime tu *nombre* y (opcional) tu *email* para crear tu ficha 😊"})
+    await sock.sendMessage(jid,{text:"Para terminar, dime tu nombre y (opcional) tu email para crear tu ficha."})
     return
   }
 
@@ -935,7 +966,7 @@ async function executeCreateBooking(sessionData, phone, sock, jid){
       staff_id: staffId, status: "failed", created_at: new Date().toISOString(),
       square_booking_id: null, square_error: result.error, retry_count: SQUARE_MAX_RETRIES
     })
-    await sock.sendMessage(jid,{text:"No pude crear la reserva ahora 😵‍💫. ¿Quieres que te proponga otro horario?"})
+    await sock.sendMessage(jid,{text:"No pude crear la reserva ahora. ¿Quieres que te proponga otro horario?"})
     return
   }
 
@@ -1003,7 +1034,7 @@ async function enumerateCitasByPhone(phone){
 }
 async function executeListAppointments(_session, phone, sock, jid){
   const appointments = await enumerateCitasByPhone(phone);
-  if (!appointments.length) { await sock.sendMessage(jid, { text: "No tienes citas programadas. ¿Quieres agendar una? 😊" }); return; }
+  if (!appointments.length) { await sock.sendMessage(jid, { text: "No tienes citas programadas. ¿Quieres agendar una?" }); return; }
   const message = `Tus próximas citas:\n\n${appointments.map(apt => 
     `${apt.index}) ${apt.pretty}\n📍 ${apt.salon}\n👩‍💼 ${apt.profesional}\n`
   ).join("\n")}`;
@@ -1064,6 +1095,18 @@ async function startBot(){
     const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:Browsers.macOS("Desktop"), syncFullHistory:false })
     globalThis.sock=sock
 
+    // >>>>>>> NUEVO: Monkey-patch para que TODAS las respuestas pasen por IA (sin romper listados)
+    const _origSend = sock.sendMessage.bind(sock)
+    sock.sendMessage = async (jid, content, options) => {
+      try{
+        if (content && typeof content.text === "string") {
+          content = { ...content, text: await aiPolishText(content.text) }
+        }
+      }catch{}
+      return _origSend(jid, content, options)
+    }
+    // <<<<<<< FIN NUEVO
+
     sock.ev.on("connection.update", ({connection,qr})=>{
       if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
       if (connection==="open"){ lastQR=null; conectado=true; }
@@ -1093,7 +1136,10 @@ async function startBot(){
             lastProposeUsedPreferred:false, stage:null,
             identityChoices:null, identityResolvedCustomerId:null,
             cancelList:null,
-            snooze_until_ms:null, name:null, email:null
+            snooze_until_ms:null, name:null, email:null,
+            // >>>>>>> NUEVO
+            lockedStaffId:null, lockedStaffLabel:null
+            // <<<<<<< FIN NUEVO
           }
           if (isFromMe) { saveSession(phone, session); return }
 
@@ -1104,12 +1150,19 @@ async function startBot(){
           }
           if (session.snooze_until_ms && nowEU.valueOf() < session.snooze_until_ms) { saveSession(phone, session); return }
 
-          // >>>>>>> NUEVO: si el mensaje pide editar/cancelar, enviamos instrucción SMS y salimos
+          // >>>>>>> NUEVO: saludo amable al primer mensaje
+          if (!session.greeted){
+            session.greeted = true
+            saveSession(phone, session)
+            await sock.sendMessage(jid, { text: "¡Hola! Soy el asistente de Gapink Nails. Te ayudo a reservar lo que necesites. Dime salón y categoría y te paso huecos al momento." })
+          }
+          // <<<<<<< FIN NUEVO
+
+          // Si el mensaje pide editar/cancelar, redirigimos a SMS y salimos
           if (isEditOrCancelIntent(textRaw)){
             await sock.sendMessage(jid, { text: EDIT_CANCEL_MSG })
             return
           }
-          // <<<<<<< FIN NUEVO
 
           const t = norm(textRaw)
           const numMatch = t.match(/^\s*([1-9]\d*)\b/)
@@ -1148,7 +1201,7 @@ async function startBot(){
           }
           if (session.stage==="awaiting_identity"){
             const {name,email} = parseNameEmailFromText(textRaw)
-            if (!name && !email){ await sock.sendMessage(jid,{text:"Cuéntame tu *nombre completo* y, si quieres, tu *email* 😊"}); return }
+            if (!name && !email){ await sock.sendMessage(jid,{text:"Cuéntame tu nombre completo y, si quieres, tu email 😊"}); return }
             if (name) session.name = name
             if (email) session.email = email
             const created = await findOrCreateCustomerWithRetry({ name: session.name, email: session.email, phone })
@@ -1160,13 +1213,12 @@ async function startBot(){
             await executeCreateBooking(session, phone, sock, jid)
             return
           }
-          // >>>>>>> MODIFICADO: nunca cancelamos por chat; si llega aquí, redirigimos a SMS
+          // Cancelar/editar solo vía SMS
           if (session.stage==="awaiting_cancel"){
             session.cancelList=null; session.stage=null; saveSession(phone, session)
             await sock.sendMessage(jid,{ text: EDIT_CANCEL_MSG })
             return
           }
-          // <<<<<<< FIN MODIFICADO
 
           if (session.stage==="awaiting_service_choice" && numMatch && Array.isArray(session.serviceChoices) && session.serviceChoices.length){
             const n = Number(numMatch[1])
@@ -1179,7 +1231,7 @@ async function startBot(){
             if (session.preferredStaffId){
               await proposeTimes(session, phone, sock, jid, { text:"" })
             } else {
-              await sock.sendMessage(jid,{text:`Perfecto, ${choice.label} en ${locationNice(session.sede)}. ¿Lo quieres *con alguna profesional*? (por ejemplo “con Patri”). Si no, te paso huecos del equipo.`})
+              await sock.sendMessage(jid,{text:`Perfecto, ${choice.label} en ${locationNice(session.sede)}. ¿Lo quieres con alguna profesional? (por ejemplo “con Patri”). Si no, te paso huecos del equipo.`})
             }
             return
           }
@@ -1190,7 +1242,14 @@ async function startBot(){
             const iso = pick.format("YYYY-MM-DDTHH:mm")
             const staffFromIso = session?.lastStaffByIso?.[iso] || null
             session.pendingDateTime = pick.tz(EURO_TZ).toISOString()
-            if (staffFromIso){ session.preferredStaffId = staffFromIso; session.preferredStaffLabel = staffLabelFromId(staffFromIso) }
+            if (staffFromIso){
+              session.preferredStaffId = staffFromIso
+              session.preferredStaffLabel = staffLabelFromId(staffFromIso)
+              // >>>>>>> NUEVO: bloqueamos la profesional del hueco elegido
+              session.lockedStaffId = staffFromIso
+              session.lockedStaffLabel = staffLabelFromId(staffFromIso)
+              // <<<<<<< FIN NUEVO
+            }
             saveSession(phone, session)
             await sock.sendMessage(jid,{text:"¡Perfecto! Creo la reserva…"})
             await executeCreateBooking(session, phone, sock, jid)
@@ -1225,7 +1284,7 @@ async function startBot(){
               const alternativas = Array.from(new Set(
                 EMPLOYEES.filter(e=> e.bookable).map(e=>e.labels[0])
               )).slice(0,6)
-              await sock.sendMessage(jid, { text: `No tengo a *${unknownNameMatch[1].trim()}* en el equipo. Disponibles: ${alternativas.join(", ")}. ¿Con quién prefieres?` })
+              await sock.sendMessage(jid, { text: `No tengo a ${unknownNameMatch[1].trim()} en el equipo. Disponibles: ${alternativas.join(", ")}. ¿Con quién prefieres?` })
               return
             }
           }
@@ -1234,21 +1293,21 @@ async function startBot(){
           if (/\b(horario|agenda|est[áa]\s+semana|esta\s+semana|pr[oó]xima\s+semana|semana\s+que\s+viene|7\s+d[ií]as|siete\s+d[ií]as)\b/i.test(t)){
             if (!session.selectedServiceEnvKey){
               if (!session.category){
-                await sock.sendMessage(jid,{ text:"Antes del horario, dime *categoría* (Uñas / Depilación / Micropigmentación / Faciales / Pestañas)." })
+                await sock.sendMessage(jid,{ text:"Antes del horario, dime categoría (Uñas / Depilación / Micropigmentación / Faciales / Pestañas)." })
                 return
               }
               if (!session.sede){
-                await sock.sendMessage(jid,{ text:"¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*." })
+                await sock.sendMessage(jid,{ text:"¿En qué salón te viene mejor? Torremolinos o La Luz." })
                 return
               }
               const itemsRaw = listServicesByCategory(session.sede, session.category, textRaw)
-              if (!itemsRaw.length){ await sock.sendMessage(jid,{text:`No tengo servicios de *${session.category}* en ${locationNice(session.sede)}.`}); return }
+              if (!itemsRaw.length){ await sock.sendMessage(jid,{text:`No tengo servicios de ${session.category} en ${locationNice(session.sede)}.`}); return }
               const list = itemsRaw.slice(0,22).map((s,i)=>({ index:i+1, key:s.key, label:s.label }))
               session.serviceChoices = list
               session.stage = "awaiting_service_choice"
               saveSession(phone, session)
               const lines = list.map(it=> `${it.index}) ${it.label}`).join("\n")
-              await sock.sendMessage(jid,{text:`Elige el *servicio* para mostrarte el horario semanal en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`})
+              await sock.sendMessage(jid,{text:`Elige el servicio para mostrarte el horario semanal en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`})
               return
             }
             await weeklySchedule(session, phone, sock, jid, {
@@ -1276,7 +1335,7 @@ async function startBot(){
               const lk = parseSede(String(p.sede))
               if (lk){ session.sede = lk; saveSession(phone, session) }
               if (!session.category){
-                await sock.sendMessage(jid,{text:"¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*."})
+                await sock.sendMessage(jid,{text:"¿Qué categoría necesitas? Uñas, Depilación, Micropigmentación, Faciales o Pestañas."})
                 return
               }
             }
@@ -1285,7 +1344,7 @@ async function startBot(){
               const cm = parseCategory(String(p.category))
               if (cm){ session.category = cm; saveSession(phone, session) }
               if (!session.sede){
-                await sock.sendMessage(jid,{text:"¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*."})
+                await sock.sendMessage(jid,{text:"¿En qué salón te viene mejor? Torremolinos o La Luz."})
                 return
               }
             }
@@ -1298,7 +1357,7 @@ async function startBot(){
                 saveSession(phone, session)
                 if (!session.sede){
                   session.stage="awaiting_sede"; saveSession(phone, session)
-                  await sock.sendMessage(jid,{text:`¿En qué *salón* prefieres con ${session.preferredStaffLabel}? Torremolinos o La Luz.`})
+                  await sock.sendMessage(jid,{text:`¿En qué salón prefieres con ${session.preferredStaffLabel}? Torremolinos o La Luz.`})
                   return
                 }
               } else {
@@ -1322,7 +1381,7 @@ async function startBot(){
 
             if (action==="weekly_schedule"){
               if (!session.selectedServiceEnvKey){
-                await sock.sendMessage(jid,{ text:"Dime el *servicio* y te muestro el horario semanal." })
+                await sock.sendMessage(jid,{ text:"Dime el servicio y te muestro el horario semanal." })
                 return
               }
               await weeklySchedule(session, phone, sock, jid, {
@@ -1335,32 +1394,31 @@ async function startBot(){
 
             if (action==="propose_times"){
               if (!session.sede){
-                await sock.sendMessage(jid,{text:"¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*."}); return
+                await sock.sendMessage(jid,{text:"¿En qué salón te viene mejor? Torremolinos o La Luz."}); return
               }
               if (!session.category){
-                await sock.sendMessage(jid,{text:"¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*."}); return
+                await sock.sendMessage(jid,{text:"¿Qué categoría necesitas? Uñas, Depilación, Micropigmentación, Faciales o Pestañas."}); return
               }
               if (!session.selectedServiceEnvKey){
                 const itemsRaw = listServicesByCategory(session.sede, session.category, textRaw)
-                if (!itemsRaw.length){ await sock.sendMessage(jid,{text:`No tengo servicios de *${session.category}* en ${locationNice(session.sede)}.`}); return }
+                if (!itemsRaw.length){ await sock.sendMessage(jid,{text:`No tengo servicios de ${session.category} en ${locationNice(session.sede)}.`}); return }
                 const list = itemsRaw.slice(0,22).map((s,i)=>({ index:i+1, key:s.key, label:s.label }))
                 session.serviceChoices = list
                 session.stage = "awaiting_service_choice"
                 saveSession(phone, session)
                 const lines = list.map(it=> `${it.index}) ${it.label}`).join("\n")
-                await sock.sendMessage(jid,{text:`Opciones de *${session.category}* en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`})
+                await sock.sendMessage(jid,{text:`Opciones de ${session.category} en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`})
                 return
               }
               await proposeTimes(session, phone, sock, jid, { date_hint:p.date_hint, part_of_day:p.part_of_day, text:textRaw })
               return
             }
 
-            // >>>>>>> MODIFICADO: si la IA detecta cancelar/editar, redirigimos a SMS
+            // Cancelar/editar → SMS
             if (action==="cancel_appointment" || action==="edit_appointment"){
               await sock.sendMessage(jid,{ text: EDIT_CANCEL_MSG })
               return
             }
-            // <<<<<<< FIN MODIFICADO
 
             if (action==="list_appointments"){
               await executeListAppointments(session, phone, sock, jid); return
@@ -1370,23 +1428,23 @@ async function startBot(){
           // Si faltan datos, guía
           if (!session.sede){
             session.stage="awaiting_sede"; saveSession(phone, session)
-            await sock.sendMessage(jid,{text:"¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*."})
+            await sock.sendMessage(jid,{text:"¿En qué salón te viene mejor? Torremolinos o La Luz."})
             return
           }
           if (!session.category){
             session.stage="awaiting_category"; saveSession(phone, session)
-            await sock.sendMessage(jid,{text:"¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*."})
+            await sock.sendMessage(jid,{text:"¿Qué categoría necesitas? Uñas, Depilación, Micropigmentación, Faciales o Pestañas."})
             return
           }
           if (!session.selectedServiceEnvKey){
             const itemsRaw = listServicesByCategory(session.sede, session.category, textRaw)
-            if (!itemsRaw.length){ await sock.sendMessage(jid,{text:`No tengo servicios de *${session.category}* en ${locationNice(session.sede)}.`}); return }
+            if (!itemsRaw.length){ await sock.sendMessage(jid,{text:`No tengo servicios de ${session.category} en ${locationNice(session.sede)}.`}); return }
             const list = itemsRaw.slice(0,22).map((s,i)=>({ index:i+1, key:s.key, label:s.label }))
             session.serviceChoices = list
             session.stage = "awaiting_service_choice"
             saveSession(phone, session)
             const lines = list.map(it=> `${it.index}) ${it.label}`).join("\n")
-            await sock.sendMessage(jid,{text:`Opciones de *${session.category}* en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`})
+            await sock.sendMessage(jid,{text:`Opciones de ${session.category} en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`})
             return
           }
           if (/\botro dia\b|\botro día\b|\bhoy\b|\bmanana\b|\bpasado\b|\blunes\b|\bmartes\b|\bmiercoles\b|\bjueves\b|\bviernes\b|\btarde\b|\bpor la manana\b|\bnoche\b/i.test(t)){
@@ -1396,7 +1454,7 @@ async function startBot(){
           await sock.sendMessage(jid,{text:buildGreeting()})
         }catch(err){
           if (BOT_DEBUG) console.error(err)
-          await sock.sendMessage(jid,{text:"Ups, error técnico. ¿Puedes repetirlo, porfa?"})
+          await sock.sendMessage(jid,{text:"Ups, hubo un fallo técnico. ¿Puedes repetirlo, porfa?"})
         }
       })
       QUEUE.set(phone, job.finally(()=>{ if (QUEUE.get(phone)===job) QUEUE.delete(phone) }))
