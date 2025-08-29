@@ -1,7 +1,4 @@
-// index.js — Gapink Nails · v31.4.0 (empleados sin ubicación)
-// - Staff global (sin mapeo por salón en ENV).
-// - Disponibilidad filtrada por locationId en Square (según salón elegido).
-// - Si un staff no tiene huecos en ese salón/rango, se cae a equipo automáticamente.
+// index.js — Gapink Nails · v31.4.2 (cancelación solo vía SMS + sync DB con Square)
 
 import express from "express"
 import pino from "pino"
@@ -233,6 +230,13 @@ const insertAppt = db.prepare(`INSERT INTO appointments
 (id,customer_name,customer_phone,customer_square_id,location_key,service_env_key,service_label,duration_min,start_iso,end_iso,staff_id,status,created_at,square_booking_id,square_error,retry_count)
 VALUES (@id,@customer_name,@customer_phone,@customer_square_id,@location_key,@service_env_key,@service_label,@duration_min,@start_iso,@end_iso,@staff_id,@status,@created_at,@square_booking_id,@square_error,@retry_count)`)
 
+const updateApptBasic = db.prepare(`UPDATE appointments
+SET customer_square_id=@customer_square_id, location_key=@location_key, service_env_key=@service_env_key, service_label=@service_label,
+    duration_min=@duration_min, start_iso=@start_iso, end_iso=@end_iso, staff_id=@staff_id, status=@status, square_error=@square_error
+WHERE id=@id`)
+
+const selectApptBySquareId = db.prepare(`SELECT id FROM appointments WHERE square_booking_id=@sid LIMIT 1`)
+
 const insertSquareLog = db.prepare(`INSERT INTO square_logs
 (phone, action, request_data, response_data, error_data, timestamp, success)
 VALUES (@phone, @action, @request_data, @response_data, @error_data, @timestamp, @success)`)
@@ -370,6 +374,17 @@ function serviceLabelFromEnvKey(envKey){
   const all = allServices()
   return all.find(s=>s.key===envKey)?.label || null
 }
+
+// === Índice servicioId -> {envKey, label, sedeKey} (para sincronizar desde Square)
+function buildServiceIdToMeta(){
+  const idx = {}
+  for (const s of allServices()){
+    idx[s.id] = { envKey:s.key, label:s.label, sedeKey:s.sedeKey }
+  }
+  return idx
+}
+const SVC_META = buildServiceIdToMeta()
+function metaFromServiceVariationId(id){ return SVC_META[id] || null }
 
 // ====== Categorías y filtros
 const CATS = {
@@ -599,7 +614,6 @@ async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, l
                  : Array.isArray(a.segments) ? a.segments
                  : []
     if (segs[0]?.teamMemberId) tm = segs[0].teamMemberId
-    // ya no filtramos por “staff permitido en salón”; Square ya filtró por locationId
     if (part){
       const { start, end } = partOfDayWindow(d, part)
       if (!(d.isSame(start,"day") && d.isAfter(start.subtract(1,"minute")) && d.isBefore(end.add(1,"minute")))) continue
@@ -709,7 +723,6 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
     return
   }
 
-  // Traemos TODO y filtramos localmente si hay profesional preferida
   const rawSlots = await searchAvailWindow({
     locationKey: sessionData.sede,
     envServiceKey: sessionData.selectedServiceEnvKey,
@@ -947,11 +960,69 @@ ${address}
 👩‍💼 ${staffName}
 📅 ${fmtES(startEU)}
 
-Ref: ${result.booking.id}
-
 ¡Te esperamos!`
+  // ^^^ Referencia (ID) ELIMINADA intencionadamente
   await sock.sendMessage(jid, { text: confirmMessage })
   clearSession(phone);
+}
+
+// ====== Sync DB con Square (futuras reservas del teléfono)
+function computeEndFromSegments(startAt, segments){
+  const dur = (segments?.[0]?.durationMinutes) ? Number(segments[0].durationMinutes) : 60
+  return dayjs(startAt).add(dur, "minute").toISOString()
+}
+function statusFromSquare(booking){
+  const s = (booking?.status || "").toString().toUpperCase()
+  if (/CANCEL/.test(s)) return "cancelled"
+  if (/DECLIN|REJECT/.test(s)) return "failed"
+  return "confirmed"
+}
+function upsertAppointmentFromSquare({ booking, cid, phone }){
+  const startISO = booking.startAt
+  const endISO = computeEndFromSegments(startISO, booking.appointmentSegments || booking.segments)
+  const seg = (booking.appointmentSegments || booking.segments || [])[0] || {}
+  const meta = metaFromServiceVariationId(seg.serviceVariationId)
+  const envKey = meta?.envKey || null
+  const label = meta?.label || "Servicio"
+  const locKey = idToLocKey(booking.locationId) || null
+  const staffId = seg.teamMemberId || null
+  const status = statusFromSquare(booking)
+
+  const row = selectApptBySquareId.get({ sid: booking.id })
+  if (row?.id){
+    updateApptBasic.run({
+      id: row.id,
+      customer_square_id: cid || null,
+      location_key: locKey,
+      service_env_key: envKey,
+      service_label: label,
+      duration_min: seg?.durationMinutes || 60,
+      start_iso: dayjs(startISO).toISOString(),
+      end_iso: endISO,
+      staff_id: staffId,
+      status,
+      square_error: null
+    })
+  } else {
+    insertAppt.run({
+      id: `apt_sq_${booking.id}`,
+      customer_name: null,
+      customer_phone: phone || null,
+      customer_square_id: cid || null,
+      location_key: locKey,
+      service_env_key: envKey,
+      service_label: label,
+      duration_min: seg?.durationMinutes || 60,
+      start_iso: dayjs(startISO).toISOString(),
+      end_iso: endISO,
+      staff_id: staffId,
+      status,
+      created_at: new Date().toISOString(),
+      square_booking_id: booking.id,
+      square_error: null,
+      retry_count: 0
+    })
+  }
 }
 
 // ====== Listar/cancelar por teléfono
@@ -963,16 +1034,19 @@ async function enumerateCitasByPhone(phone){
     const s=await square.customersApi.searchCustomers({ query:{ filter:{ phoneNumber:{ exact:e164 } } } })
     cid=(s?.result?.customers||[])[0]?.id||null
   }catch{}
+  let list=[]
   if (cid){
     try{
       const resp=await square.bookingsApi.listBookings(undefined, undefined, cid)
-      const list=resp?.result?.bookings||[]
+      list=resp?.result?.bookings||[]
       const nowISO=new Date().toISOString()
       const seen = new Set()
       for (const b of list){
         if (!b?.startAt || b.startAt<nowISO) continue
         if (seen.has(b.id)) continue
         seen.add(b.id)
+        // — Sync a DB local
+        try{ upsertAppointmentFromSquare({ booking:b, cid, phone }) }catch{}
         const start=dayjs(b.startAt).tz(EURO_TZ)
         const seg=(b.appointmentSegments||[{}])[0]
         items.push({
@@ -984,29 +1058,49 @@ async function enumerateCitasByPhone(phone){
           profesional: staffLabelFromId(seg?.teamMemberId) || "Profesional",
         })
       }
+      // — Marcar como canceladas en DB las futuras que ya no existan en Square
+      try{
+        const setIds = new Set(list.filter(b=>b?.startAt && b.startAt>=new Date().toISOString()).map(b=>b.id))
+        const rows = db.prepare(`SELECT id, square_booking_id, start_iso, status FROM appointments WHERE customer_phone=@p AND square_booking_id IS NOT NULL`).all({p:phone})
+        const now = Date.now()
+        for (const r of rows){
+          const startMs = Date.parse(r.start_iso||"")
+          if (isFinite(startMs) && startMs>now && !setIds.has(r.square_booking_id) && r.status!=="cancelled"){
+            updateApptBasic.run({
+              id: r.id,
+              customer_square_id: cid || null,
+              location_key: null,
+              service_env_key: null,
+              service_label: null,
+              duration_min: null,
+              start_iso: r.start_iso,
+              end_iso: r.end_iso || r.start_iso,
+              staff_id: null,
+              status: "cancelled",
+              square_error: "sync_missing"
+            })
+          }
+        }
+      }catch{}
       items.sort((a,b)=> (a.fecha_iso.localeCompare(b.fecha_iso)) || (a.pretty.localeCompare(b.pretty)))
     }catch(e){}
   }
   return items
 }
+
 async function executeListAppointments(_session, phone, sock, jid){
   const appointments = await enumerateCitasByPhone(phone);
-  if (!appointments.length) { await sock.sendMessage(jid, { text: "No veo citas activas con tu número ahora mismo. ¿Quieres que te reserve una? 🩷" }); return; }
-  const message = `Aquí tienes tus próximas citas 🗓️:\n\n${appointments.map(apt => 
+  if (!appointments.length) { await sock.sendMessage(jid, { text: "No tienes citas programadas. ¿Quieres agendar una?" }); return; }
+  const message = `Tus próximas citas:\n\n${appointments.map(apt => 
     `${apt.index}) ${apt.pretty}\n📍 ${apt.salon}\n👩‍💼 ${apt.profesional}\n`
-  ).join("\n")}\nSi quieres cancelar alguna, dime *cancelar* y te paso las opciones.`;
+  ).join("\n")}\n\nℹ️ Para *cancelar o modificar* una cita usa el enlace que recibiste por SMS al confirmar tu reserva.`
   await sock.sendMessage(jid, { text: message });
 }
-async function executeCancelAppointment(sessionData, phone, sock, jid){
-  const appointments = await enumerateCitasByPhone(phone);
-  if (!appointments.length) { await sock.sendMessage(jid, { text: "No encuentro citas futuras asociadas a tu número. ¿Quieres que te ayude a reservar?" }); return; }
-  sessionData.cancelList = appointments
-  sessionData.stage = "awaiting_cancel"
-  saveSession(phone, sessionData)
-  const message = `Estas son tus próximas citas. ¿Cuál quieres cancelar?\n\n${appointments.map(apt => 
-    `${apt.index}) ${apt.pretty} - ${apt.salon}`
-  ).join("\n")}\n\nResponde con el número.`
-  await sock.sendMessage(jid, { text: message });
+
+// 🔴 Cancelación/edición: solo por SMS (no tocamos Square desde WhatsApp)
+async function executeCancelAppointment(_session, _phone, sock, jid){
+  await sock.sendMessage(jid, { text: "ℹ️ Para *cancelar o modificar* tu cita debes hacerlo desde el enlace que recibiste por SMS al confirmar la reserva." })
+  return
 }
 
 // ====== Mini-web + Baileys
@@ -1022,7 +1116,7 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v31.4.0 — Top ${SHOW_TOP_N}</h1>
+  <h1>🩷 Gapink Nails Bot v31.4.2 — Top ${SHOW_TOP_N}</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
@@ -1149,10 +1243,8 @@ async function startBot(){
             const n = Number(numMatch[1])
             const chosen = session.cancelList.find(apt=>apt.index===n)
             if (!chosen){ await sock.sendMessage(jid,{text:"No encontré esa opción. Responde con el número válido."}); return }
-            try{
-              const ok = await square.bookingsApi.cancelBooking(chosen.id, { idempotencyKey:`cancel_${chosen.id}_${Date.now()}` })
-              await sock.sendMessage(jid,{text: ok?.result?.booking ? `✅ Cita cancelada: ${chosen.pretty} en ${chosen.salon}` : "No pude cancelar la cita. Contacta al salón, porfa."})
-            }catch{ await sock.sendMessage(jid,{text:"No pude cancelar la cita. Contacta al salón, porfa."}) }
+            // Redirigir a SMS (no cancelar aquí)
+            await sock.sendMessage(jid,{text:"ℹ️ Para *cancelar o modificar* tu cita usa el enlace del SMS de confirmación."})
             session.cancelList=null; session.stage=null; saveSession(phone, session); return
           }
           if (session.stage==="awaiting_service_choice" && numMatch && Array.isArray(session.serviceChoices) && session.serviceChoices.length){
@@ -1259,14 +1351,13 @@ async function startBot(){
             const action = aiObj.action
             const p = aiObj.params || {}
 
-            // >>> NUEVO: saludo detectado por IA
+            // Saludo detectado por IA
             if (action==="greeting"){
               session.greeted = true
               saveSession(phone, session)
               await sock.sendMessage(jid,{ text:"¡Holaaa! Soy el asistente de Gapink Nails 🩷\n¿Te reservo algo hoy o quieres ver *tus próximas citas*?" })
               return
             }
-            // <<< FIN NUEVO
 
             if ((action==="set_salon" || action==="set_sede") && p.sede){
               const lk = parseSede(String(p.sede))
@@ -1397,7 +1488,7 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.4.0 — Top ${SHOW_TOP_N} (L–V)`)
+console.log(`🩷 Gapink Nails Bot v31.4.2 — Top ${SHOW_TOP_N} (L–V)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
