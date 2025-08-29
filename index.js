@@ -1,8 +1,8 @@
-// index.js — Gapink Nails · v31.4.1 (empleados sin ubicación)
+// index.js — Gapink Nails · v31.5.0 (empleados sin ubicación)
 // - Staff global (sin mapeo por salón).
 // - Square filtra por locationId (según salón).
-// - Si la profesional preferida no tiene huecos, mostramos equipo automáticamente.
-// - FIX: la reserva usa la profesional mostrada en el hueco elegido (bloqueo estricto).
+// - Si la profesional preferida no tiene huecos, mostramos equipo automáticamente (con nota).
+// - Bloqueo ESTRICTO de profesional según la línea elegida (persistente aunque haya selección de ficha).
 
 import express from "express"
 import pino from "pino"
@@ -609,12 +609,12 @@ function proposeLines(slots, mapIsoToStaff){
   return { lines, hoursEnum }
 }
 function buildGreeting(){
-  return `¡Hola! Soy el asistente de Gapink Nails 😊
+  return `¡Hola! Soy el asistente de Gapink Nails 💅
 
 Para reservar, dime *salón* (Torremolinos o La Luz) y *categoría*: Uñas / Depilación / Micropigmentación / Faciales / Pestañas.
 Ej.: “depilación en Torremolinos con Patri el viernes por la tarde”.
 
-También puedo mostrarte el *horario de los próximos 7 días* (“horario esta semana” o “próxima semana con Cristina”).`
+También puedo mostrarte *horarios* (“esta semana”, “próxima semana con Cristina”).`
 }
 function buildSystemPrompt(session){
   const nowEU = dayjs().tz(EURO_TZ)
@@ -659,7 +659,14 @@ async function aiInterpret(textRaw, session){
   return stripToJSON(out)
 }
 
-// ====== Proponer horas (con almacenamiento de opciones exactas)
+// ====== Helpers de menú
+function computeMenuHash(options){
+  // options: [{iso, staffId}]
+  const payload = options.map(o=>`${o.iso}|${o.staffId||"_"}`).join("~")
+  return createHash("sha256").update(payload).digest("hex").slice(0,16)
+}
+
+// ====== Proponer horas (con almacenamiento y hash del menú)
 async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   const nowEU = dayjs().tz(EURO_TZ);
   const baseFrom = nextOpeningFrom(nowEU.add(NOW_MIN_OFFSET_MIN, "minute"))
@@ -680,7 +687,7 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   let endEU   = when ? when.clone().hour(OPEN.end).minute(0)   : baseFrom.clone().add(days,"day")
 
   if (!sessionData.sede || !sessionData.selectedServiceEnvKey){
-    await sock.sendMessage(jid, { text: "Necesito primero *salón* y *servicio* para proponerte horas 💅" })
+    await sock.sendMessage(jid, { text: "Necesito primero *salón* y *servicio* para proponerte horas 💖" })
     return
   }
 
@@ -717,12 +724,17 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
       const shown = nextSlots.slice(0, SHOW_TOP_N)
       const mapN={}; for (const s of shown) mapN[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
       const { lines } = proposeLines(shown, mapN)
+
+      const options = shown.map(s=>({ iso:s.date.format("YYYY-MM-DDTHH:mm"), staffId:s.staffId||null }))
       sessionData.lastHours = shown.map(s => s.date)
       sessionData.lastStaffByIso = mapN
-      sessionData.lastOptions = shown.map(s=>({ iso:s.date.format("YYYY-MM-DDTHH:mm"), staffId:s.staffId||null }))
+      sessionData.lastOptions = options
+      sessionData.lastMenuHash = computeMenuHash(options)
+      sessionData.lastMenuAt = Date.now()
       sessionData.lastProposeUsedPreferred = nextUsedPreferred
       sessionData.stage = "awaiting_time"
       saveSession(phone, sessionData)
+
       const note = (sessionData.preferredStaffLabel && !nextUsedPreferred)
         ? `\nNota: no veo huecos con *${sessionData.preferredStaffLabel}* en ese rango; te muestro alternativas del *equipo* la próxima semana.`
         : ""
@@ -743,9 +755,12 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   const map = {}; for (const s of shown) map[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
   const { lines } = proposeLines(shown, map)
 
+  const options = shown.map(s=>({ iso:s.date.format("YYYY-MM-DDTHH:mm"), staffId:s.staffId||null }))
   sessionData.lastHours = shown.map(s => s.date)
   sessionData.lastStaffByIso = map
-  sessionData.lastOptions = shown.map(s=>({ iso:s.date.format("YYYY-MM-DDTHH:mm"), staffId:s.staffId||null }))
+  sessionData.lastOptions = options
+  sessionData.lastMenuHash = computeMenuHash(options)
+  sessionData.lastMenuAt = Date.now()
   sessionData.lastProposeUsedPreferred = usedPreferred
   sessionData.stage = "awaiting_time"
   saveSession(phone, sessionData)
@@ -816,9 +831,13 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
 
   const map={}; const arr=[]
   for (const e of enumerated){ map[e.iso]=e.staffId; arr.push(e.date) }
+  const options = enumerated.map(e=>({ iso:e.iso, staffId:e.staffId||null }))
+
   sessionData.lastHours = arr
   sessionData.lastStaffByIso = map
-  sessionData.lastOptions = enumerated.map(e=>({ iso:e.iso, staffId:e.staffId||null }))
+  sessionData.lastOptions = options
+  sessionData.lastMenuHash = computeMenuHash(options)
+  sessionData.lastMenuAt = Date.now()
   sessionData.lastProposeUsedPreferred = !!staffIdFilter
   sessionData.stage = "awaiting_time"
   saveSession(phone, sessionData)
@@ -828,7 +847,7 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   await sock.sendMessage(jid,{ text: `${header}${lines.join("\n")}\n\nResponde con el *número* para reservar ese hueco.` })
 }
 
-// ====== Crear reserva (bloqueo estricto de profesional)
+// ====== Crear reserva (usa SIEMPRE la profesional del slot elegido)
 async function executeCreateBooking(sessionData, phone, sock, jid){
   if (!sessionData.sede) { await sock.sendMessage(jid,{text:"Falta el *salón* (Torremolinos o La Luz)"}); return }
   if (!sessionData.selectedServiceEnvKey) { await sock.sendMessage(jid,{text:"Falta el *servicio*"}); return }
@@ -837,16 +856,15 @@ async function executeCreateBooking(sessionData, phone, sock, jid){
   const startEU = parseToEU(sessionData.pendingDateTime)
   if (!insideBusinessHours(startEU, 60)) { await sock.sendMessage(jid,{text:"Esa hora está fuera del horario (L–V 09:00–20:00)"}); return }
 
-  // 1) Si hay bloqueo por selección, lo usamos sin discutir.
-  let staffId = sessionData.lockedStaffIdForPending || null
+  // Usar los datos BLOQUEADOS del slot elegido, si existen
+  const iso = startEU.format("YYYY-MM-DDTHH:mm")
+  let staffId = sessionData.lockedStaffIdForPending || sessionData.pendingSlotStaffId || null
 
-  // 2) Si no hay bloqueo (por cualquier motivo), usamos el mapeo exacto por ISO o la preferida.
+  // Si por alguna razón no tenemos bloqueo, usar el mapeo del menú mostrado
   if (!staffId){
-    const iso = startEU.format("YYYY-MM-DDTHH:mm")
     staffId = sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null
   }
 
-  // 3) Últimos fallback: validar permitida; si no, cualquiera bookable.
   if (staffId && !isStaffAllowedInLocation(staffId, sessionData.sede)) staffId = null
   if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
   if (!staffId) { await sock.sendMessage(jid,{text:"No hay profesionales disponibles ahora mismo"}); return }
@@ -869,7 +887,6 @@ async function executeCreateBooking(sessionData, phone, sock, jid){
     return
   }
 
-  // IMPORTANTE: no hacemos “probe” que pueda cambiarnos la profesional.
   const result = await createBookingWithRetry({
     startEU, locationKey: sessionData.sede, envServiceKey: sessionData.selectedServiceEnvKey,
     durationMin: 60, customerId, teamMemberId: staffId, phone
@@ -884,7 +901,7 @@ async function executeCreateBooking(sessionData, phone, sock, jid){
       staff_id: staffId, status: "failed", created_at: new Date().toISOString(),
       square_booking_id: null, square_error: result.error, retry_count: SQUARE_MAX_RETRIES
     })
-    sessionData.lockedStaffIdForPending = null
+    // NO limpiamos los campos del slot; por si quiere reintentar
     saveSession(phone, sessionData)
     await sock.sendMessage(jid,{text:"No pude crear la reserva ahora. ¿Quieres que te proponga otro horario?"})
     return
@@ -900,9 +917,6 @@ async function executeCreateBooking(sessionData, phone, sock, jid){
     square_booking_id: result.booking.id, square_error: null, retry_count: 0
   })
 
-  sessionData.lockedStaffIdForPending = null
-  saveSession(phone, sessionData)
-
   const staffName = staffLabelFromId(staffId) || sessionData.preferredStaffLabel || "nuestro equipo";
   const address = sessionData.sede === "la_luz" ? ADDRESS_LUZ : ADDRESS_TORRE;
   const svcLabel = serviceLabelFromEnvKey(sessionData.selectedServiceEnvKey) || sessionData.selectedServiceLabel || "Servicio"
@@ -917,10 +931,12 @@ ${address}
 
 ¡Te esperamos!`
   await sock.sendMessage(jid, { text: confirmMessage })
+
+  // Limpiar completamente la sesión tras confirmar
   clearSession(phone);
 }
 
-// ====== Listar citas (sin cancelar por aquí)
+// ====== Listar citas (simple)
 async function enumerateCitasByPhone(phone){
   const items=[]
   let cid=null
@@ -977,7 +993,7 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v31.4.1 — Top ${SHOW_TOP_N}</h1>
+  <h1>🩷 Gapink Nails Bot v31.5.0 — Top ${SHOW_TOP_N}</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
@@ -1037,12 +1053,13 @@ async function startBot(){
             selectedServiceEnvKey:null, selectedServiceLabel:null,
             preferredStaffId:null, preferredStaffLabel:null,
             pendingDateTime:null, lastHours:null, lastStaffByIso:{},
-            lastOptions:[], // <— NUEVO
+            lastOptions:[], lastMenuHash:null, lastMenuAt:null,
             lastProposeUsedPreferred:false, stage:null,
             identityChoices:null, identityResolvedCustomerId:null,
             cancelList:null,
             snooze_until_ms:null, name:null, email:null,
-            lockedStaffIdForPending:null
+            // Campos del slot elegido:
+            pendingSlotIso:null, pendingSlotStaffId:null, lockedStaffIdForPending:null
           }
           if (isFromMe) { saveSession(phone, session); return }
 
@@ -1131,7 +1148,23 @@ async function startBot(){
           }
 
           if ((!session.stage || session.stage==="awaiting_time") && numMatch && Array.isArray(session.lastHours) && session.lastHours.length){
-            const idx = Number(numMatch[1]) - 1
+            const n = Number(numMatch[1])
+            const idx = n - 1
+
+            // Validación robusta
+            if (idx<0 || idx>=session.lastOptions.length){
+              await sock.sendMessage(jid,{text:"No encontré esa opción. Responde con un número válido de la lista."})
+              return
+            }
+
+            // Verificar que el menú no cambió
+            const currentHash = computeMenuHash(session.lastOptions||[])
+            if (session.lastMenuHash && currentHash !== session.lastMenuHash){
+              await sock.sendMessage(jid,{text:"El listado cambió. Te paso opciones actualizadas ahora mismo:"})
+              await proposeTimes(session, phone, sock, jid, { text:"" })
+              return
+            }
+
             const pickDate = session.lastHours[idx]
             const pickOpt = (session.lastOptions||[])[idx] || null
             if (!dayjs.isDayjs(pickDate)){ await sock.sendMessage(jid,{text:"No encontré esa opción. Responde con el número válido."}); return }
@@ -1140,8 +1173,10 @@ async function startBot(){
             const staffFromIso = pickOpt?.staffId ?? session?.lastStaffByIso?.[iso] ?? null
 
             session.pendingDateTime = pickDate.tz(EURO_TZ).toISOString()
-            // BLOQUEO ESTRICTO
+            // BLOQUEO ESTRICTO + persistencia
             session.lockedStaffIdForPending = staffFromIso || null
+            session.pendingSlotIso = iso
+            session.pendingSlotStaffId = staffFromIso || null
 
             if (staffFromIso){
               session.preferredStaffId = staffFromIso
@@ -1325,7 +1360,7 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.4.1 — Top ${SHOW_TOP_N} (L–V)`)
+console.log(`🩷 Gapink Nails Bot v31.5.0 — Top ${SHOW_TOP_N} (L–V)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
