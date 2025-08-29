@@ -1,4 +1,4 @@
-// index.js — Gapink Nails · v31.4.2 (cancelación solo vía SMS + sync DB con Square)
+// index.js — Gapink Nails · v31.4.3 (fix: tras “con <staff>” propone huecos de inmediato)
 
 import express from "express"
 import pino from "pino"
@@ -961,7 +961,7 @@ ${address}
 📅 ${fmtES(startEU)}
 
 ¡Te esperamos!`
-  // ^^^ Referencia (ID) ELIMINADA intencionadamente
+  // (sin “Ref:”)
   await sock.sendMessage(jid, { text: confirmMessage })
   clearSession(phone);
 }
@@ -1116,7 +1116,7 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v31.4.2 — Top ${SHOW_TOP_N}</h1>
+  <h1>🩷 Gapink Nails Bot v31.4.3 — Top ${SHOW_TOP_N}</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
@@ -1298,6 +1298,11 @@ async function startBot(){
             session.preferredStaffId = fuzzy.id
             session.preferredStaffLabel = staffLabelFromId(fuzzy.id)
             saveSession(phone, session)
+            // ✅ CAMBIO: si ya hay salón+servicio, proponemos horas inmediatamente
+            if (session.sede && session.selectedServiceEnvKey){
+              await proposeTimes(session, phone, sock, jid, { text:textRaw })
+              return
+            }
           } else {
             const unknownNameMatch = /(?:^|\s)con\s+([a-zñáéíóúüï\s]{2,})\??$/i.exec(textRaw)
             if (unknownNameMatch){
@@ -1383,6 +1388,11 @@ async function startBot(){
                 session.preferredStaffId = byAI.id
                 session.preferredStaffLabel = staffLabelFromId(byAI.id)
                 saveSession(phone, session)
+                // ✅ CAMBIO: si ya tenemos salón+servicio, proponemos horas ya
+                if (session.sede && session.selectedServiceEnvKey){
+                  await proposeTimes(session, phone, sock, jid, { text:textRaw })
+                  return
+                }
                 if (!session.sede){
                   session.stage="awaiting_sede"; saveSession(phone, session)
                   await sock.sendMessage(jid,{text:`¿En qué *salón* prefieres con ${session.preferredStaffLabel}? Torremolinos o La Luz.`})
@@ -1488,7 +1498,7 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.4.2 — Top ${SHOW_TOP_N} (L–V)`)
+console.log(`🩷 Gapink Nails Bot v31.4.3 — Top ${SHOW_TOP_N} (L–V)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
