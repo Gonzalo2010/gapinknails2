@@ -1001,10 +1001,8 @@ async function executeCreateBooking(sessionData, phone, sock, jid){
 ${address}
 
 🧾 ${svcLabel}
-👩‍💼 ${staffName}
 📅 ${fmtES(startEU)}
 
-Ref: ${result.booking.id}
 
 ¡Te esperamos!`
   await sendWithLog(sock, jid, confirmMessage, {phone, intent:"booking_confirmed", action:"confirm"})
