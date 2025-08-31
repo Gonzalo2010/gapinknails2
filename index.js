@@ -6,6 +6,12 @@
 // - Cancelar/editar/consultar detalles de cita -> siempre redirige a email/SMS (sin tocar DB).
 // - Logging detallado de todo (IN/OUT/SYS) + mensajes recibidos.
 // - Saludo solo 1ª vez en 24h + “.” para silenciar 6h (de versiones previas de Gonzalo).
+// - ACTUALIZACIONES SOLICITADAS:
+//   1) Aliases de nombres: “Ana/Anna” -> “Ganna”
+//   2) Buscar citas existentes en Square y mostrarlas si preguntan “¿cuándo es mi cita?”
+//   3) Aumentar límite de búsqueda de disponibilidad a 500 y ampliar búsqueda 30 días
+//      cuando piden una profesional concreta y no hay huecos
+//   4) Mejorar mensaje cuando no hay huecos con la preferida en 30 días
 
 import express from "express"
 import pino from "pino"
@@ -365,7 +371,8 @@ const NAME_ALIASES = [
   ["patri","patricia"],["patricia","patri"],
   ["cristi","cristina","cristy"],
   ["rocio chica","rociochica","rocio  chica","rocio c","rocio chica"],["rocio","rosio"],
-  ["carmen belen","carmen","belen"],["tania","tani"],["johana","joana","yohana"],["ganna","gana"],
+  ["carmen belen","carmen","belen"],["tania","tani"],["johana","joana","yohana"],
+  ["ganna","gana","ana","anna"],  // ← CAMBIADO: agregamos ana y anna
   ["ginna","gina"],["chabely","chabeli","chabelí"],["elisabeth","elisabet","elis"],
   ["desi","desiree","desirée"],["daniela","dani"],["jamaica","jahmaica"],["edurne","edur"],
   ["sudemis","sude"],["maria","maría"],["anaira","an aira"],["thalia","thalía","talia","talía"]
@@ -586,6 +593,72 @@ async function createBookingWithRetry({ startEU, locationKey, envServiceKey, dur
   return { success: false, error: `No se pudo crear reserva: ${lastError?.message || 'Error desconocido'}`, lastError }
 }
 
+// ====== NUEVO: Buscar citas existentes del cliente en Square
+async function searchExistingBookings(phone, fromDate = null) {
+  try {
+    const e164 = normalizePhoneES(phone)
+    if (!e164) return []
+    // Buscar cliente por teléfono
+    const customers = await searchCustomersByPhone(phone)
+    if (!customers.length) return []
+
+    const customerId = customers[0].id
+    const startAt = fromDate ? fromDate.tz("UTC").toISOString()
+                             : nowEU().tz("UTC").toISOString()
+
+    const body = {
+      query: {
+        filter: {
+          customerId: customerId,
+          startAtRange: { startAt }
+        }
+      }
+    }
+
+    let retries = 0
+    while (retries < SQUARE_MAX_RETRIES) {
+      try {
+        const resp = await square.bookingsApi.searchBookings(body)
+        const bookings = resp?.result?.bookings || []
+
+        // Log de la búsqueda
+        insertSquareLog.run({
+          phone: phone || 'unknown',
+          action: 'search_existing_bookings',
+          request_data: safeJSONStringify(body),
+          response_data: safeJSONStringify(resp?.result || {}),
+          error_data: null,
+          timestamp: new Date().toISOString(),
+          success: 1
+        })
+
+        return bookings.filter(b =>
+          b.status !== 'CANCELLED' &&
+          b.status !== 'DECLINED'
+        )
+      } catch (e) {
+        retries++
+        if (retries >= SQUARE_MAX_RETRIES) {
+          insertSquareLog.run({
+            phone: phone || 'unknown',
+            action: 'search_existing_bookings',
+            request_data: safeJSONStringify(body),
+            response_data: null,
+            error_data: safeJSONStringify({ message: e?.message }),
+            timestamp: new Date().toISOString(),
+            success: 0
+          })
+          return []
+        }
+        await sleep(1000 * retries)
+      }
+    }
+    return []
+  } catch (e) {
+    return []
+  }
+}
+
 // ====== DISPONIBILIDAD (staff global, Square filtra por locationId)
 function partOfDayWindow(dateEU, part){
   let start=dateEU.clone().hour(OPEN.start).minute(0).second(0).millisecond(0)
@@ -619,7 +692,7 @@ function parseTemporalPreference(text){
   return { when, part, nextWeek }
 }
 
-async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, limit=200, part=null }){
+async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, limit=500, part=null }){
   const sv = await getServiceIdAndVersion(envServiceKey)
   if (!sv?.id) return []
   const body = {
@@ -652,6 +725,39 @@ async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, l
     if (out.length>=limit) break
   }
   return out
+}
+
+// ====== NUEVO: Búsqueda extendida hasta 30 días (en ventanas de 7 días)
+async function searchAvailWindowExtended({ locationKey, envServiceKey, startEU, staffId, maxDays=30 }){
+  const results = []
+  const endDate = startEU.clone().add(maxDays, 'day')
+  let currentStart = startEU.clone()
+
+  while (currentStart.isBefore(endDate) && results.length < 1000) {
+    let currentEnd = currentStart.clone().add(7, 'day')
+    if (currentEnd.isAfter(endDate)) {
+      currentEnd = endDate.clone()
+    }
+
+    const weekSlots = await searchAvailWindow({
+      locationKey,
+      envServiceKey,
+      startEU: currentStart,
+      endEU: currentEnd,
+      limit: 500
+    })
+
+    const filteredSlots = staffId
+      ? weekSlots.filter(s => s.staffId === staffId)
+      : weekSlots
+
+    results.push(...filteredSlots)
+    currentStart = currentEnd.clone()
+
+    await sleep(100)
+  }
+
+  return results
 }
 
 // ====== Conversación determinista/IA
@@ -766,11 +872,11 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
     return
   }
 
-  // Traemos TODO y filtramos localmente si hay profesional preferida
+  // Traemos TODO y filtramos localmente si hay profesional preferida (limit 500)
   const rawSlots = await searchAvailWindow({
     locationKey: sessionData.sede,
     envServiceKey: sessionData.selectedServiceEnvKey,
-    startEU, endEU, limit: 200, part
+    startEU, endEU, limit: 500, part
   })
 
   let slots = rawSlots
@@ -778,7 +884,24 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   if (sessionData.preferredStaffId){
     slots = rawSlots.filter(s => s.staffId === sessionData.preferredStaffId)
     usedPreferred = true
-    if (!slots.length){ slots = rawSlots; usedPreferred = false }
+
+    // NUEVO: si no hay con la preferida, buscar hasta 30 días
+    if (!slots.length) {
+      const extendedSlots = await searchAvailWindowExtended({
+        locationKey: sessionData.sede,
+        envServiceKey: sessionData.selectedServiceEnvKey,
+        startEU: startEU,
+        staffId: sessionData.preferredStaffId,
+        maxDays: 30
+      })
+      if (extendedSlots.length > 0) {
+        slots = extendedSlots
+        usedPreferred = true
+      } else {
+        slots = rawSlots
+        usedPreferred = false
+      }
+    }
   }
 
   // Fallback automático: próxima semana
@@ -831,7 +954,7 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
 
   const header = usedPreferred
     ? `Horarios disponibles con ${sessionData.preferredStaffLabel || "tu profesional"} (primeras ${SHOW_TOP_N}):`
-    : `Horarios disponibles (equipo) — primeras ${SHOW_TOP_N}:${sessionData.preferredStaffLabel ? `\nNota: no veo huecos con ${sessionData.preferredStaffLabel} en este rango; te muestro alternativas.`:""}`
+    : `Horarios disponibles del equipo — primeras ${SHOW_TOP_N}:${sessionData.preferredStaffLabel ? `\n⚠️ No encontré huecos con ${sessionData.preferredStaffLabel} en los próximos 30 días. Te muestro alternativas del equipo:`:""}`
   await sendWithLog(sock, jid, `${header}\n${lines}\n\nResponde con el número.`, {phone, intent:"times_list", action:"guide", stage:sessionData.stage})
 }
 
@@ -1111,7 +1234,7 @@ async function startBot(){
           logEvent({direction:"in", action:"message", phone, raw_text:textRaw, stage:session.stage, extra:{isFromMe:false}})
 
           const now = nowEU()
-          // “.” silenciar 6h
+          // "." silenciar 6h
           if (textRaw.trim()==="."){
             session.snooze_until_ms = now.add(6,"hour").valueOf()
             saveSession(phone, session)
@@ -1127,9 +1250,28 @@ async function startBot(){
             await sendWithLog(sock, jid, buildGreeting(), {phone, intent:"greeting_24h", action:"send_greeting"})
           }
 
-          // Consultas de información de cita -> redirigir
+          // Consultas de información de cita -> buscar en Square primero
           if (looksLikeAppointmentInfoQuery(textRaw)){
-            await sendWithLog(sock, jid, BOOKING_SELF_SERVICE_MSG, {phone, intent:"booking_info_redirect", action:"redirect"})
+            const existingBookings = await searchExistingBookings(phone, nowEU())
+            if (existingBookings.length > 0) {
+              const booking = existingBookings[0] // próxima
+              const startTime = dayjs(booking.startAt).tz(EURO_TZ)
+              const locationName = booking.locationId === LOC_LUZ ? "Málaga – La Luz" : "Torremolinos"
+              const serviceName = booking.appointmentSegments?.[0]?.serviceVariation?.name || "Servicio"
+              const staffName = staffLabelFromId(booking.appointmentSegments?.[0]?.teamMemberId) || "Equipo"
+
+              const infoMsg = `📅 Tu próxima cita:
+
+📍 ${locationName}
+🧾 ${serviceName}
+👩‍💼 ${staffName}
+🕐 ${fmtES(startTime)}
+
+${BOOKING_SELF_SERVICE_MSG}`
+              await sendWithLog(sock, jid, infoMsg, {phone, intent:"booking_info_found", action:"info"})
+            } else {
+              await sendWithLog(sock, jid, `No encuentro citas próximas a tu nombre. ${BOOKING_SELF_SERVICE_MSG}`, {phone, intent:"booking_info_not_found", action:"info"})
+            }
             return
           }
 
