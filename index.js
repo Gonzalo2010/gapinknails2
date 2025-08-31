@@ -12,6 +12,7 @@
 //   3) Aumentar límite de búsqueda de disponibilidad a 500 y ampliar búsqueda 30 días
 //      cuando piden una profesional concreta y no hay huecos
 //   4) Mejorar mensaje cuando no hay huecos con la preferida en 30 días
+//   5) NUEVO: ordenar siempre los huecos por fecha antes de mostrarlos (evita falsos “no hay”)
 
 import express from "express"
 import pino from "pino"
@@ -384,7 +385,7 @@ function fuzzyStaffFromText(text){
   const m = t.match(/\scon\s+([a-zñáéíóú ]{2,})\b/i)
   let token = m ? norm(m[1]).trim() : null
   if (!token){
-    const nm = t.match(/\b(patri|patricia|cristi|cristina|rocio chica|rocio|carmen belen|carmen|belen|ganna|maria|anaira|ginna|daniela|desi|jamaica|johana|edurne|sudemis|tania|chabely|elisabeth|thalia|thalía|talia|talía)\b/i)
+    const nm = t.match(/\b(patri|patricia|cristi|cristina|rocio chica|rocio|carmen belen|carmen|belen|ganna|maria|anaira|ginna|daniela|desi|jamaica|johana|edurne|sudemis|tania|chabely|elisabeth|thalia|thalía|talia|talía|ana|anna)\b/i)
     if (nm) token = norm(nm[0])
   }
   if (!token) return null
@@ -724,6 +725,8 @@ async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, l
     out.push({ date:d, staffId: tm || null })
     if (out.length>=limit) break
   }
+  // Ordenar por fecha para consistencia
+  out.sort((a,b)=>a.date.valueOf()-b.date.valueOf())
   return out
 }
 
@@ -757,6 +760,8 @@ async function searchAvailWindowExtended({ locationKey, envServiceKey, startEU, 
     await sleep(100)
   }
 
+  // Ordenar por fecha para asegurar que devolvemos el primer hueco real
+  results.sort((a,b)=>a.date.valueOf()-b.date.valueOf())
   return results
 }
 
@@ -904,6 +909,9 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
     }
   }
 
+  // Ordenar SIEMPRE por fecha antes de cortar top N
+  slots.sort((a,b)=>a.date.valueOf()-b.date.valueOf())
+
   // Fallback automático: próxima semana
   if (!slots.length){
     const startNext = startEU.clone().add(7, "day")
@@ -920,6 +928,7 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
       nextUsedPreferred = true
       if (!nextSlots.length){ nextSlots = rawNext; nextUsedPreferred = false }
     }
+    nextSlots.sort((a,b)=>a.date.valueOf()-b.date.valueOf())
     if (nextSlots.length){
       const shown = nextSlots.slice(0, SHOW_TOP_N)
       const mapN={}; for (const s of shown) mapN[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
@@ -1386,6 +1395,11 @@ ${BOOKING_SELF_SERVICE_MSG}`
             // Si estamos eligiendo servicio y el usuario dice “con Patri”, no repetimos la lista:
             if (session.stage==="awaiting_service_choice"){
               await sendWithLog(sock, jid, `Genial, *con ${session.preferredStaffLabel}*. Ahora responde con el *número* del servicio de la lista de arriba 👆`, {phone, intent:"staff_set_during_service_choice", action:"guide", stage:session.stage})
+              return
+            }
+            // Si YA tenemos salón y servicio, proponemos directamente huecos (clave para el caso “con Ana”)
+            if (session.sede && session.selectedServiceEnvKey){
+              await proposeTimes(session, phone, sock, jid, { text:textRaw })
               return
             }
           } else {
