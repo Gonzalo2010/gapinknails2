@@ -1,5 +1,10 @@
-// index.js — Gapink Nails · v31.6.4 (empleados sin ubicación)
-// Cambios Gonzalo (hotfix):
+// index.js — Gapink Nails · v31.7.0 (empleados sin ubicación)
+// Cambios Gonzalo (feature):
+// - Antes de "intentar dar una cita" (proponer horas, horario semanal o crear reserva),
+//   buscamos en Square si el cliente YA tiene una cita próxima y, si existe, se la mostramos
+//   y BLOQUEAMOS el flujo de reserva. (Solo Square, nada de DB).
+//
+// Hotfixes previos mantenidos:
 // - Silencio 6h si el mensaje es SOLO puntitos (".", "·", "•", "⋅"), tanto si lo envía el CLIENTE
 //   como si lo envías TÚ (isFromMe=true). En el caso de que lo envíes tú, no responde nada.
 // - Fuzzy de nombres con clúster canónico (ana/anna/gana → Ganna sin colarse con johana).
@@ -719,6 +724,49 @@ async function searchExistingBookings(phone, fromDate = null) {
   }
 }
 
+function bookingSummaryMessage(b){
+  const startTime = dayjs(b.startAt).tz(EURO_TZ)
+  const locationName = b.locationId === LOC_LUZ ? "Málaga – La Luz" : "Torremolinos"
+  const serviceName = b.appointmentSegments?.[0]?.serviceVariation?.name || "Servicio"
+  const staffName = staffLabelFromId(b.appointmentSegments?.[0]?.teamMemberId) || "Equipo"
+  return `📅 Tienes una *cita próxima*:
+
+📍 ${locationName}
+🧾 ${serviceName}
+👩‍💼 ${staffName}
+🕐 ${fmtES(startTime)}
+
+Para *consultar, editar o cancelar* tu cita usa el enlace del *email/SMS de confirmación*. Desde ahí puedes gestionar cambios al instante ✅`
+}
+
+// ====== NUEVO: Bloqueo si ya tiene una cita próxima
+const UPCOMING_SHOW_THROTTLE_MS = Number(process.env.UPCOMING_SHOW_THROTTLE_MS || (3*60*60*1000)) // 3h
+async function ensureNoUpcomingBookingBeforeAction(sessionData, phone, sock, jid){
+  // Si ya enseñamos hace poco, igualmente comprobamos Square (por si canceló), pero solo re-mostramos si pasó el throttle
+  const existing = await searchExistingBookings(phone, nowEU())
+  if (!existing.length) return false
+  // Pillamos la más cercana futura
+  existing.sort((a,b)=> dayjs(a.startAt).valueOf() - dayjs(b.startAt).valueOf())
+  const next = existing[0]
+  const now = nowEU().valueOf()
+  const lastShown = sessionData.lastUpcomingShownAt_ms || 0
+  if (!lastShown || (now - lastShown) > UPCOMING_SHOW_THROTTLE_MS){
+    const msg = bookingSummaryMessage(next)
+    await sendWithLog(sock, jid, msg, {phone, intent:"has_upcoming_block", action:"info"})
+    sessionData.lastUpcomingShownAt_ms = now
+    saveSession(phone, sessionData)
+  }
+  return true // BLOQUEAR
+}
+
+function isBookingIntent(text){
+  const t = norm(text)
+  return (
+    /\b(cita|reserv(ar|a|e|o)|pedir\s*hora|coger\s*hora|agendar|agenda|poner\s*cita|hacer\s*una\s*cita|quiero\s*cita)\b/i.test(t) ||
+    /\b(horario|disponibilidad|dime\s*horas|qué\s*hora|cuando\s*podría)\b/i.test(t)
+  )
+}
+
 // ====== Disponibilidad (limit=500 + extendida)
 async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, limit=500, part=null }){
   const sv = await getServiceIdAndVersion(envServiceKey)
@@ -798,7 +846,18 @@ function proposeLines(slots, mapIsoToStaff){
   return { lines, hoursEnum }
 }
 function buildGreeting(){
-  return `¡Hola! Soy el asistente de Gapink Nails.\n\nPara reservar dime *salón* (Torremolinos o La Luz) y *categoría*: Uñas / Depilación / Micropigmentación / Faciales / Pestañas.\nEj.: “depilación en Torremolinos con Patri el viernes por la tarde”.\nTambién puedo mostrarte el *horario de los próximos 7 días* (“horario esta semana” o “próxima semana con Cristina”).`
+  return `Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.
+
+Solo atenderemos por WhatsApp y llamadas en horario de lunes a viernes de 10 a 14:00 y de 16:00 a 20:00 
+
+Si quieres reservar una cita puedes hacerlo a través de este link:
+
+https://gapinknails.square.site
+
+Y si quieres modificarla puedes hacerlo a través del link del sms que llega con su cita! 
+
+Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.
+Gracias 😘`
 }
 
 function buildSystemPrompt(session){
@@ -863,6 +922,9 @@ function noteServiceListSignature(session, sig, phone){
 
 // ====== Proponer horas (top N con fallback a próxima semana)
 async function proposeTimes(sessionData, phone, sock, jid, opts={}){
+  // NUEVO: bloquear si ya tiene cita próxima
+  if (await ensureNoUpcomingBookingBeforeAction(sessionData, phone, sock, jid)) return
+
   const now = nowEU();
   const baseFrom = nextOpeningFrom(now.add(NOW_MIN_OFFSET_MIN, "minute"))
   const days = SEARCH_WINDOW_DAYS
@@ -976,6 +1038,9 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
 // ====== HORARIO SEMANAL
 function nextMondayEU(base){ return base.clone().add(1,"week").isoWeekday(1).hour(OPEN.start).minute(0).second(0).millisecond(0) }
 async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
+  // NUEVO: bloquear si ya tiene cita próxima
+  if (await ensureNoUpcomingBookingBeforeAction(sessionData, phone, sock, jid)) return
+
   if (!sessionData.sede){
     await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide"})
     return
@@ -1058,6 +1123,9 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
 
 // ====== Crear reserva
 async function executeCreateBooking(sessionData, phone, sock, jid){
+  // NUEVO: bloquear si ya tiene cita próxima
+  if (await ensureNoUpcomingBookingBeforeAction(sessionData, phone, sock, jid)) return
+
   if (!sessionData.sede) { await sendWithLog(sock, jid, "Falta el *salón* (Torremolinos o La Luz)", {phone, intent:"missing_sede", action:"guide"}); return }
   if (!sessionData.selectedServiceEnvKey) { await sendWithLog(sock, jid, "Falta el *servicio*", {phone, intent:"missing_service", action:"guide"}); return }
   if (!sessionData.pendingDateTime) { await sendWithLog(sock, jid, "Falta la *fecha y hora*", {phone, intent:"missing_datetime", action:"guide"}); return }
@@ -1243,7 +1311,9 @@ async function startBot(){
             identityChoices:null, identityResolvedCustomerId:null,
             cancelList:null,
             snooze_until_ms:null, name:null, email:null,
-            lastServiceListSig:null, lastServiceListAt_ms:null
+            lastServiceListSig:null, lastServiceListAt_ms:null,
+            // NUEVO
+            lastUpcomingShownAt_ms:null
           }
 
           const now = nowEU()
@@ -1280,24 +1350,14 @@ async function startBot(){
             await sendWithLog(sock, jid, buildGreeting(), {phone, intent:"greeting_24h", action:"send_greeting"})
           }
 
-          // Consultas de información de cita -> buscar en Square primero
+          // Consultas de información de cita -> buscar en Square primero (ya estaba)
           if (looksLikeAppointmentInfoQuery(textRaw)){
             const existingBookings = await searchExistingBookings(phone, nowEU())
             if (existingBookings.length > 0) {
+              existingBookings.sort((a,b)=> dayjs(a.startAt).valueOf() - dayjs(b.startAt).valueOf())
               const booking = existingBookings[0]
-              const startTime = dayjs(booking.startAt).tz(EURO_TZ)
-              const locationName = booking.locationId === LOC_LUZ ? "Málaga – La Luz" : "Torremolinos"
-              const serviceName = booking.appointmentSegments?.[0]?.serviceVariation?.name || "Servicio"
-              const staffName = staffLabelFromId(booking.appointmentSegments?.[0]?.teamMemberId) || "Equipo"
-              const infoMsg = `📅 Tu próxima cita:
-
-📍 ${locationName}
-🧾 ${serviceName}
-👩‍💼 ${staffName}
-🕐 ${fmtES(startTime)}
-
-${BOOKING_SELF_SERVICE_MSG}`
-              await sendWithLog(sock, jid, infoMsg, {phone, intent:"booking_info_found", action:"info"})
+              const msg = bookingSummaryMessage(booking)
+              await sendWithLog(sock, jid, msg, {phone, intent:"booking_info_found", action:"info"})
             } else {
               await sendWithLog(sock, jid, `No encuentro citas próximas a tu nombre. ${BOOKING_SELF_SERVICE_MSG}`, {phone, intent:"booking_info_not_found", action:"info"})
             }
@@ -1314,23 +1374,18 @@ ${BOOKING_SELF_SERVICE_MSG}`
             if (list.length){
               list.sort((a,b)=> dayjs(a.startAt).valueOf() - dayjs(b.startAt).valueOf())
               const b=list[0]
-              const startTime = dayjs(b.startAt).tz(EURO_TZ)
-              const locationName = b.locationId === LOC_LUZ ? "Málaga – La Luz" : "Torremolinos"
-              const serviceName = b.appointmentSegments?.[0]?.serviceVariation?.name || "Servicio"
-              const staffName = staffLabelFromId(b.appointmentSegments?.[0]?.teamMemberId) || "Equipo"
-              const msg = `📅 Tu próxima cita${(maybeStaff && !maybeStaff.anyTeam)?` con ${staffName}`:""}:
-
-📍 ${locationName}
-🧾 ${serviceName}
-👩‍💼 ${staffName}
-🕐 ${fmtES(startTime)}
-
-${BOOKING_SELF_SERVICE_MSG}`
+              const msg = bookingSummaryMessage(b)
               await sendWithLog(sock, jid, msg, {phone, intent:"booking_info_have", action:"info"})
             } else {
               await sendWithLog(sock, jid, `No encuentro citas próximas a tu nombre. ${BOOKING_SELF_SERVICE_MSG}`, {phone, intent:"booking_info_none", action:"info"})
             }
             return
+          }
+
+          // NUEVO: si el mensaje suena a "quiero reservar", chequeamos Square y bloqueamos si tiene cita
+          if (isBookingIntent(textRaw)){
+            const blocked = await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)
+            if (blocked) return
           }
 
           const t = norm(textRaw)
@@ -1345,6 +1400,8 @@ ${BOOKING_SELF_SERVICE_MSG}`
             saveSession(phone, session)
             logEvent({direction:"sys", action:"prefer_team", phone})
             if (session.sede && session.selectedServiceEnvKey){
+              // Aquí también bloqueamos si ya tiene cita (por si acaso)
+              if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
               await proposeTimes(session, phone, sock, jid, { text:textRaw })
             } else {
               const faltan=[]
@@ -1395,6 +1452,8 @@ ${BOOKING_SELF_SERVICE_MSG}`
             session.selectedServiceLabel = choice.label
             session.stage = null
             saveSession(phone, session)
+            // Bloqueo antes de proponer horas
+            if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
             if (session.preferredStaffId){
               await proposeTimes(session, phone, sock, jid, { text:"" })
             } else {
@@ -1427,6 +1486,7 @@ ${BOOKING_SELF_SERVICE_MSG}`
               session.preferredStaffLabel = null
               saveSession(phone, session)
               if (session.sede && session.selectedServiceEnvKey){
+                if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
                 await proposeTimes(session, phone, sock, jid, { text:textRaw })
               }else{
                 const faltan=[]; if (!session.sede) faltan.push("salón"); if (!session.category) faltan.push("categoría"); if (!session.selectedServiceEnvKey) faltan.push("servicio")
@@ -1439,6 +1499,7 @@ ${BOOKING_SELF_SERVICE_MSG}`
             saveSession(phone, session)
             logEvent({direction:"sys", action:"set_preferred_staff", phone, extra:{id:fuzzy.id,label:session.preferredStaffLabel}})
             if (session.sede && session.selectedServiceEnvKey){
+              if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
               await proposeTimes(session, phone, sock, jid, { text:textRaw })
               return
             }
@@ -1458,6 +1519,9 @@ ${BOOKING_SELF_SERVICE_MSG}`
           }
 
           if (/\b(horario|agenda|est[áa]\s+semana|esta\s+semana|pr[oó]xima\s+semana|semana\s+que\s+viene|7\s+d[ií]as|siete\s+d[ií]as)\b/i.test(t)){
+            // Bloqueo antes de dar horario
+            if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
+
             if (!session.selectedServiceEnvKey){
               if (!session.category){
                 await sendWithLog(sock, jid, "Antes del horario, dime *categoría* (Uñas / Depilación / Micropigmentación / Faciales / Pestañas).", {phone, intent:"ask_category_for_schedule", action:"guide"})
@@ -1491,6 +1555,7 @@ ${BOOKING_SELF_SERVICE_MSG}`
           }
 
           if (session.sede && session.selectedServiceEnvKey && /\botro dia\b|\botro día\b|\bhoy\b|\bmanana\b|\bpasado\b|\blunes\b|\bmartes\b|\bmiercoles\b|\bjueves\b|\bviernes\b|\btarde\b|\bpor la manana\b|\bnoche\b/i.test(t)){
+            if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
             await proposeTimes(session, phone, sock, jid, { text:textRaw })
             return
           }
@@ -1544,6 +1609,8 @@ ${BOOKING_SELF_SERVICE_MSG}`
                 session.selectedServiceEnvKey = ek
                 session.selectedServiceLabel = p.label
                 session.stage=null; saveSession(phone, session)
+                // Bloqueo antes de proponer horas
+                if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
                 await sendWithLog(sock, jid, `Perfecto, ${p.label} en ${locationNice(session.sede)}.`, {phone, intent:"service_set", action:"info"})
                 await proposeTimes(session, phone, sock, jid, { text:textRaw })
                 return
@@ -1551,6 +1618,9 @@ ${BOOKING_SELF_SERVICE_MSG}`
             }
 
             if (action==="weekly_schedule"){
+              // Bloqueo antes de mostrar horario
+              if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
+
               if (!session.selectedServiceEnvKey){
                 await sendWithLog(sock, jid, "Dime el *servicio* y te muestro el horario semanal.", {phone, intent:"need_service_for_weekly", action:"guide"})
                 return
@@ -1564,6 +1634,9 @@ ${BOOKING_SELF_SERVICE_MSG}`
             }
 
             if (action==="propose_times"){
+              // Bloqueo antes de proponer
+              if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
+
               if (!session.sede){
                 await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"need_sede_for_times", action:"guide"}); return
               }
@@ -1625,6 +1698,7 @@ ${BOOKING_SELF_SERVICE_MSG}`
             return
           }
           if (/\botro dia\b|\botro día\b|\bhoy\b|\bmanana\b|\bpasado\b|\blunes\b|\bmartes\b|\bmiercoles\b|\bjueves\b|\bviernes\b|\btarde\b|\bpor la manana\b|\bnoche\b/i.test(t)){
+            if (await ensureNoUpcomingBookingBeforeAction(session, phone, sock, jid)) return
             await proposeTimes(session, phone, sock, jid, { text:textRaw })
             return
           }
@@ -1641,7 +1715,7 @@ ${BOOKING_SELF_SERVICE_MSG}`
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.6.4 — Top ${SHOW_TOP_N} (L–V)`)
+console.log(`🩷 Gapink Nails Bot v31.7.0 — Top ${SHOW_TOP_N} (L–V)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
