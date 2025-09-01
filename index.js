@@ -833,7 +833,18 @@ function proposeLines(slots, mapIsoToStaff){
 }
 function buildGreeting(){
   // Si tienes un mensaje de bienvenida propio por ENV, puedes sustituir aquí.
-  return `¡Hola! Soy el asistente de Gapink Nails.\n\nPara reservar dime *salón* (Torremolinos o La Luz) y *categoría*: Uñas / Depilación / Micropigmentación / Faciales / Pestañas.\nEj.: “depilación en Torremolinos con Patri el viernes por la tarde”.\nTambién puedo mostrarte el *horario de los próximos 7 días* (“horario esta semana” o “próxima semana con Cristina”).`
+  return `Gracias por comunicarte con Gapink Nails. Por favor, haznos saber cómo podemos ayudarte.
+
+Solo atenderemos por WhatsApp y llamadas en horario de lunes a viernes de 10 a 14:00 y de 16:00 a 20:00 
+
+Si quieres reservar una cita puedes hacerlo a través de este link:
+
+https://gapinknails.square.site/?source=qr-code
+
+Y si quieres modificarla puedes hacerlo a través del link del sms que llega con su cita! 
+
+Para cualquier otra consulta, déjenos saber y en el horario establecido le responderemos.
+Gracias 😘`
 }
 
 function buildSystemPrompt(session){
