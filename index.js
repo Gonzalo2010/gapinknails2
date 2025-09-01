@@ -1,9 +1,9 @@
-// index.js — Gapink Nails · v31.6.3 (empleados sin ubicación)
+// index.js — Gapink Nails · v31.6.4 (empleados sin ubicación)
 // Cambios Gonzalo (hotfix):
-// - Fuzzy de nombres ahora usa coincidencia por PALABRA EXACTA y clúster CANÓNICO:
-//   "ana/anna/gana" mapea a Ganna sin confundir con "johana" (antes coincidía por "ana").
-// - Silencio 6h si el mensaje es SOLO puntitos (".", "·", "•", "⋅") aunque haya espacios.
-// - Resto: búsqueda extendida 30 días, limit=500, consulta de citas en Square, etc. (de v31.6.2)
+// - Silencio 6h si el mensaje es SOLO puntitos (".", "·", "•", "⋅"), tanto si lo envía el CLIENTE
+//   como si lo envías TÚ (isFromMe=true). En el caso de que lo envíes tú, no responde nada.
+// - Fuzzy de nombres con clúster canónico (ana/anna/gana → Ganna sin colarse con johana).
+// - Búsqueda extendida 30 días, limit=500, consulta de citas en Square, etc.
 
 import express from "express"
 import pino from "pino"
@@ -397,12 +397,10 @@ function fuzzyStaffFromText(text){
     for (const e of EMPLOYEES){
       for (const lbl of e.labels){
         const nlbl = norm(lbl)
-        // match por palabra exacta del canónico (soporta "ganna luz", etc.)
         const re = new RegExp(`(^|\\s)${canonical}(\\s|$)`)
         if (re.test(nlbl)) return e
       }
     }
-    // si no encontramos por canónico, probamos igualdad exacta con cualquier alias del clúster
     for (const e of EMPLOYEES){
       const nlbls = e.labels.map(norm)
       if (cluster.some(alias => nlbls.includes(alias))) return e
@@ -410,7 +408,6 @@ function fuzzyStaffFromText(text){
     return null
   }
 
-  // Sin clúster: igualdad exacta de palabra (no subcadena)
   for (const e of EMPLOYEES){
     for (const lbl of e.labels){
       const nlbl = norm(lbl)
@@ -902,7 +899,6 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
     slots = rawSlots.filter(s => s.staffId === sessionData.preferredStaffId)
     usedPreferred = true
     
-    // Si no encuentra con la profesional preferida, buscar en 30 días
     if (!slots.length) {
       const extendedSlots = await searchAvailWindowExtended({
         locationKey: sessionData.sede,
@@ -911,12 +907,10 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
         staffId: sessionData.preferredStaffId,
         maxDays: 30
       })
-      
       if (extendedSlots.length > 0) {
         slots = extendedSlots
         usedPreferred = true
       } else {
-        // Solo si no hay nada en 30 días, mostrar alternativas del equipo
         slots = rawSlots
         usedPreferred = false
       }
@@ -925,7 +919,6 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
 
   slots.sort((a,b)=>a.date.valueOf()-b.date.valueOf())
 
-  // Fallback automático: próxima semana
   if (!slots.length){
     const startNext = startEU.clone().add(7, "day")
     const endNext   = endEU.clone().add(7, "day")
@@ -1162,13 +1155,11 @@ async function executeCancelAppointment(sessionData, phone, sock, jid){
   sessionData.cancelList=null; sessionData.stage=null; saveSession(phone, sessionData)
   await sendWithLog(sock, jid, BOOKING_SELF_SERVICE_MSG, {phone, intent:"cancel_redirect", action:"redirect"})
 }
-// Detecta preguntas tipo “¿cuándo es mi cita? / hora / detalles”
 function looksLikeAppointmentInfoQuery(text){
   const t = norm(text)
   return /\b(mi|la|de)\s*cita\b/.test(t) && /\b(cuando|cuando es|hora|a que hora|donde|detall|info|confirm|ver|consultar)\b/.test(t)
       || /\b(confirmaci[oó]n|recordatorio|comprobante)\b/.test(t)
 }
-// NUEVO: “tengo cita …”
 function looksLikeIHaveAppointment(text){
   const t = norm(text)
   return /\btengo\s+cita\b/.test(t) || /\bye?\s*tengo\s+cita\b/.test(t)
@@ -1254,14 +1245,24 @@ async function startBot(){
             snooze_until_ms:null, name:null, email:null,
             lastServiceListSig:null, lastServiceListAt_ms:null
           }
-          if (isFromMe) { saveSession(phone, session); return }
-
-          // IN log
-          logEvent({direction:"in", action:"message", phone, raw_text:textRaw, stage:session.stage, extra:{isFromMe:false}})
 
           const now = nowEU()
 
-          // Silencio 6h si el mensaje es SOLO puntitos (admite espacios)
+          // ========= NUEVO: comandos de silencio si lo envías TÚ (isFromMe)
+          if (isFromMe && /^[\s.·•⋅]+$/.test(textRaw)){
+            session.snooze_until_ms = now.add(6,"hour").valueOf()
+            saveSession(phone, session)
+            logEvent({direction:"sys", action:"admin_snooze_6h", phone, raw_text:textRaw})
+            // No respondemos nada
+            return
+          }
+
+          if (isFromMe) { saveSession(phone, session); return }
+
+          // IN log (solo mensajes del cliente)
+          logEvent({direction:"in", action:"message", phone, raw_text:textRaw, stage:session.stage, extra:{isFromMe:false}})
+
+          // Silencio 6h si el CLIENTE manda solo puntitos
           if (/^[\s.·•⋅]+$/.test(textRaw)){
             session.snooze_until_ms = now.add(6,"hour").valueOf()
             saveSession(phone, session)
@@ -1283,7 +1284,7 @@ async function startBot(){
           if (looksLikeAppointmentInfoQuery(textRaw)){
             const existingBookings = await searchExistingBookings(phone, nowEU())
             if (existingBookings.length > 0) {
-              const booking = existingBookings[0] // Mostrar la próxima
+              const booking = existingBookings[0]
               const startTime = dayjs(booking.startAt).tz(EURO_TZ)
               const locationName = booking.locationId === LOC_LUZ ? "Málaga – La Luz" : "Torremolinos"
               const serviceName = booking.appointmentSegments?.[0]?.serviceVariation?.name || "Servicio"
@@ -1303,7 +1304,6 @@ ${BOOKING_SELF_SERVICE_MSG}`
             return
           }
 
-          // “tengo cita … (con <nombre>)” -> mostrar próxima (filtrada si nombras profe)
           if (looksLikeIHaveAppointment(textRaw)){
             const maybeStaff = fuzzyStaffFromText(textRaw)
             const existing = await searchExistingBookings(phone, nowEU())
@@ -1339,7 +1339,6 @@ ${BOOKING_SELF_SERVICE_MSG}`
           const catMention = parseCategory(textRaw)
           const temporal = parseTemporalPreference(textRaw)
 
-          // “con el equipo / me da igual / cualquiera”
           if (/\b(con el equipo|me da igual|cualquiera|con quien sea|lo que haya)\b/i.test(t)){
             session.preferredStaffId = null
             session.preferredStaffLabel = null
@@ -1384,7 +1383,6 @@ ${BOOKING_SELF_SERVICE_MSG}`
             return
           }
           if (session.stage==="awaiting_cancel" && numMatch && Array.isArray(session.cancelList)){
-            // Ahora siempre redirige (sin tocar DB)
             session.cancelList=null; session.stage=null; saveSession(phone, session)
             await sendWithLog(sock, jid, BOOKING_SELF_SERVICE_MSG, {phone, intent:"cancel_redirect", action:"redirect"})
             return
@@ -1422,7 +1420,6 @@ ${BOOKING_SELF_SERVICE_MSG}`
           if (sedeMention) { session.sede = sedeMention; saveSession(phone, session); logEvent({direction:"sys", action:"store_sede", phone, extra:{sede:session.sede}}) }
           if (catMention)  { session.category = catMention; saveSession(phone, session); logEvent({direction:"sys", action:"store_category", phone, extra:{category:session.category}}) }
 
-          // Fuzzy staff (con canónico, sin falsos positivos)
           const fuzzy = fuzzyStaffFromText(textRaw)
           if (fuzzy){
             if (fuzzy.anyTeam){
@@ -1441,12 +1438,10 @@ ${BOOKING_SELF_SERVICE_MSG}`
             session.preferredStaffLabel = staffLabelFromId(fuzzy.id)
             saveSession(phone, session)
             logEvent({direction:"sys", action:"set_preferred_staff", phone, extra:{id:fuzzy.id,label:session.preferredStaffLabel}})
-            // Si ya hay salón+servicio, proponemos directamente
             if (session.sede && session.selectedServiceEnvKey){
               await proposeTimes(session, phone, sock, jid, { text:textRaw })
               return
             }
-            // Si estamos eligiendo servicio y el usuario dice “con X”, no repetimos la lista:
             if (session.stage==="awaiting_service_choice"){
               await sendWithLog(sock, jid, `Genial, *con ${session.preferredStaffLabel}*. Ahora responde con el *número* del servicio de la lista de arriba 👆`, {phone, intent:"staff_set_during_service_choice", action:"guide", stage:session.stage})
               return
@@ -1462,7 +1457,6 @@ ${BOOKING_SELF_SERVICE_MSG}`
             }
           }
 
-          // Disparadores “horario”
           if (/\b(horario|agenda|est[áa]\s+semana|esta\s+semana|pr[oó]xima\s+semana|semana\s+que\s+viene|7\s+d[ií]as|siete\s+d[ií]as)\b/i.test(t)){
             if (!session.selectedServiceEnvKey){
               if (!session.category){
@@ -1496,13 +1490,11 @@ ${BOOKING_SELF_SERVICE_MSG}`
             return
           }
 
-          // Si ya hay salón+servicio y menciona día/franja → proponer directamente
           if (session.sede && session.selectedServiceEnvKey && /\botro dia\b|\botro día\b|\bhoy\b|\bmanana\b|\bpasado\b|\blunes\b|\bmartes\b|\bmiercoles\b|\bjueves\b|\bviernes\b|\btarde\b|\bpor la manana\b|\bnoche\b/i.test(t)){
             await proposeTimes(session, phone, sock, jid, { text:textRaw })
             return
           }
 
-          // IA para el resto
           const aiObj = await aiInterpret(textRaw, session)
           logEvent({direction:"sys", action:"ai_interpretation", phone, extra:{aiObj}})
 
@@ -1606,7 +1598,6 @@ ${BOOKING_SELF_SERVICE_MSG}`
             }
           } // fin IA válida
 
-          // Si faltan datos, guía (anti-repeat aplicado al listado)
           if (!session.sede){
             session.stage="awaiting_sede"; saveSession(phone, session)
             await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide", stage:session.stage})
@@ -1641,7 +1632,6 @@ ${BOOKING_SELF_SERVICE_MSG}`
         }catch(err){
           if (BOT_DEBUG) console.error(err)
           logEvent({direction:"sys", action:"handler_error", phone, error:{message:err?.message, stack:err?.stack}, success:0})
-          // Mensaje neutro:
           await sendWithLog(globalThis.sock, messages?.[0]?.key?.remoteJid, "No te he entendido bien. ¿Puedes decirlo de otra forma? 😊", {phone, intent:"error_recover", action:"guide"})
         }
       })
@@ -1651,7 +1641,7 @@ ${BOOKING_SELF_SERVICE_MSG}`
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.6.3 — Top ${SHOW_TOP_N} (L–V)`)
+console.log(`🩷 Gapink Nails Bot v31.6.4 — Top ${SHOW_TOP_N} (L–V)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
