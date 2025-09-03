@@ -1,718 +1,767 @@
-// index.js — Gapink Nails · v37.4.0 (IA mejorada full-NLU + holds 6h + DeepSeek-only + mini web QR)
-// - IA en TODO: entiende salón/tema/servicio/fecha (“la primera”, “otra tarde”, “viernes por la mañana”),
-//   y también “con <nombre>” (solo entonces muestra/filtra por profesional).
-// - Cero keywords: la IA decide; hay heurística solo como “airbag” si el LLM falla.
-// - Duración real por servicio desde ENV (SQ_DUR_*), encaja slots por duración + horario laboral.
-// - Bloqueo local 6h en SQLite (holds), sin tocar Square (solo consulta disponibilidad).
-// - UX: pocas preguntas, no repite, no lista infinito, resumen al final cuando hay hold.
-// - DeepSeek-only con presupuestado adaptativo: LITE → BOOST si hay baja confianza.
-// - Mini web QR y Baileys con import ESM dinámico.
+// index.js — Gapink Nails · v38.0.0 (DeepSeek-only, holds 6h, IA sin números)
+// Autor: Gonzalo-friendly edition 🫶
+// Características clave:
+// - IA DeepSeek en TODO (interpretación natural y elección de hora/servicio sin números).
+// - Mini web con QR (http://localhost:8080) y estado.
+// - Bloqueo de huecos en SQLite 6h (no ofrece a otra persona por WhatsApp). NO toca Square para reservar.
+// - Lista completa de servicios de UÑAS (manos) con duración.
+// - Si el cliente pide “con <nombre>”, se filtra SOLO esa profesional. Si no hay huecos, no cae a “equipo”.
+// - Oculta nombres de profesionales salvo que el cliente lo pida explícitamente.
+// - Evita el “spam”: hace resumen solo cuando ya tiene todo, y usa prompts de IA cortitos (ahorro tokens).
 
 import express from "express"
 import pino from "pino"
 import qrcode from "qrcode"
 import qrcodeTerminal from "qrcode-terminal"
 import "dotenv/config"
+import fs from "fs"
 import Database from "better-sqlite3"
 import dayjs from "dayjs"
 import utc from "dayjs/plugin/utc.js"
 import tz from "dayjs/plugin/timezone.js"
 import isoWeek from "dayjs/plugin/isoWeek.js"
 import "dayjs/locale/es.js"
-import { webcrypto } from "crypto"
+import { createHash, webcrypto } from "crypto"
 import { Client, Environment } from "square"
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto
+
 dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isoWeek); dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
-const nowEU = () => dayjs().tz(EURO_TZ)
 
-// ===== Config negocio
-const OPEN = { start: 9, end: 20 }                 // L–V 09–20
-const WORK_DAYS = [1,2,3,4,5]                      // L–V
-const SEARCH_WINDOW_DAYS   = Number(process.env.BOT_SEARCH_WINDOW_DAYS   || 30)
-const EXTENDED_WINDOW_DAYS = Number(process.env.BOT_EXTENDED_WINDOW_DAYS || 90)
-const NOW_MIN_OFFSET_MIN   = Number(process.env.BOT_NOW_OFFSET_MIN       || 30)
-const SHOW_TOP_N           = Number(process.env.SHOW_TOP_N               || 5)
-const HOLD_HOURS           = Number(process.env.HOLD_HOURS               || 6)
-const PORT                 = Number(process.env.PORT                     || 8080)
-const BOT_DEBUG            = /^true$/i.test(process.env.BOT_DEBUG        || "")
+// ====== Config horario
+const WORK_DAYS = [1,2,3,4,5]        // L–V
+const SLOT_MIN = 30
+const OPEN = { start: 9, end: 20 }
+const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
+const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
+const EXTENDED_WINDOW_DAYS = Number(process.env.BOT_STEER_WINDOW_DAYS || 7)
+const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,01/11,06/12,08/12,25/12")
+  .split(",").map(s=>s.trim()).filter(Boolean)
+const SHOW_TOP_N = Number(process.env.SHOW_TOP_N || 5)
 
-// ===== Square (solo consultas de disponibilidad)
+// ====== Flags
+const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
+const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "")
+const SQUARE_MAX_RETRIES = Number(process.env.SQUARE_MAX_RETRIES || 3)
+
+// ====== Square (solo CONSULTA de disponibilidad)
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment: (process.env.SQUARE_ENV==="production") ? Environment.Production : Environment.Sandbox
 })
 const LOC_TORRE = (process.env.SQUARE_LOCATION_ID_TORREMOLINOS || "").trim()
 const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "").trim()
-function locationToId(key){ return key==="la_luz" ? LOC_LUZ : LOC_TORRE }
-function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torremolinos" }
+const ADDRESS_TORRE = process.env.ADDRESS_TORREMOLINOS || "Av. de Benyamina 18, Torremolinos"
+const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Luz"
 
-// ===== IA DeepSeek (presupuesto adaptativo)
+// ====== IA (DeepSeek only)
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ""
-const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL || "deepseek-chat"
-const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 10000)
-// Presupuestos escalonados
-const TOKENS = {
-  router_lite: Number(process.env.AI_TOKENS_ROUTER_LITE || 80),
-  router_boost: Number(process.env.AI_TOKENS_ROUTER_BOOST || 160),
-  shortlist: Number(process.env.AI_TOKENS_SHORTLIST || 160),
-  choose: Number(process.env.AI_TOKENS_CHOOSE || 110),
-  pick: Number(process.env.AI_TOKENS_PICK || 110)
-}
-async function aiCall(messages, {maxTokens=120, temperature=0.15}={}){
-  if(!DEEPSEEK_API_KEY) return null
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || process.env.AI_MODEL || "deepseek-chat"
+const DEEPSEEK_URL = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/v1/chat/completions"
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 12000)
+const sleep = ms => new Promise(r=>setTimeout(r, ms))
+
+async function aiChat(system, user, extraMsgs=[]){
+  if (!DEEPSEEK_API_KEY) return null
   const controller = new AbortController()
-  const t = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
+  const timeout = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
   try{
-    const resp = await fetch("https://api.deepseek.com/chat/completions",{
+    const messages = [
+      system ? { role:"system", content: system } : null,
+      ...extraMsgs,
+      { role:"user", content: user }
+    ].filter(Boolean)
+    const resp = await fetch(DEEPSEEK_URL,{
       method:"POST",
       headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({ model: DEEPSEEK_MODEL, temperature, max_tokens:maxTokens, messages }),
+      body: JSON.stringify({ model: DEEPSEEK_MODEL, messages, temperature:0.2, max_tokens:500 }),
       signal: controller.signal
     })
-    clearTimeout(t)
-    if(!resp.ok) return null
+    clearTimeout(timeout)
+    if (!resp.ok) return null
     const data = await resp.json()
     return data?.choices?.[0]?.message?.content || null
-  }catch{ clearTimeout(t); return null }
+  }catch{ clearTimeout(timeout); return null }
 }
-function stripJSON(s){
-  if(!s) return null
-  let x = s.trim().replace(/```json/gi,"```")
-  if (x.startsWith("```")) x=x.slice(3)
-  if (x.endsWith("```")) x=x.slice(0,-3)
-  const i=x.indexOf("{"), j=x.lastIndexOf("}")
-  if(i>=0 && j>i) x=x.slice(i,j+1)
-  try{ return JSON.parse(x) }catch{ return null }
+function stripToJSON(text){
+  if (!text) return null
+  let s = text.trim()
+  s = s.replace(/```json/gi,"```")
+  if (s.startsWith("```")) s = s.slice(3)
+  if (s.endsWith("```")) s = s.slice(0,-3)
+  s = s.trim()
+  const i = s.indexOf("{"), j = s.lastIndexOf("}")
+  if (i>=0 && j>i) s = s.slice(i, j+1)
+  try{ return JSON.parse(s) }catch{ return null }
 }
 
-// ===== Utils
-function rm(s){ return String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"") }
-function norm(s){ return rm(s).toLowerCase().replace(/[+.,;:()/_-]/g," ").replace(/[^\p{Letter}\p{Number}\s]/gu," ").replace(/\s+/g," ").trim() }
+// ====== Utils
+const nowEU = ()=>dayjs().tz(EURO_TZ)
+const stableKey = parts => createHash("sha256").update(Object.values(parts).join("|")).digest("hex").slice(0,48)
+const onlyDigits = s => String(s||"").replace(/\D+/g,"")
+const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
+const norm = s => rm(s).toLowerCase().replace(/[+.,;:()/_-]/g," ").replace(/[^\p{Letter}\p{Number}\s]/gu," ").replace(/\s+/g," ").trim()
+function titleCase(str){ return String(str||"").toLowerCase().replace(/\b([a-z])/g, (m)=>m.toUpperCase()) }
+function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torremolinos" }
+function locationToId(key){ return key==="la_luz" ? LOC_LUZ : LOC_TORRE }
+function idToLocKey(id){ return id===LOC_LUZ ? "la_luz" : id===LOC_TORRE ? "torremolinos" : null }
+function normalizePhoneES(raw){
+  const d=onlyDigits(raw); if(!d) return null
+  if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
+  if (d.startsWith("34") && d.length===11) return `+${d}`
+  if (d.length===9) return `+34${d}`
+  if (d.startsWith("00")) return `+${d.slice(2)}`
+  return `+${d}`
+}
 function fmtES(d){
   const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]
-  const t=dayjs(d).tz(EURO_TZ)
+  const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ)
   return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")} ${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}`
 }
-function insideBusinessHours(d,mins){
-  const t=dayjs(d)
-  if(!WORK_DAYS.includes(t.day())) return false
-  const end=t.add(mins,"minute"); if(!t.isSame(end,"day")) return false
-  const s=t.hour()*60+t.minute(), e=end.hour()*60+end.minute()
-  return s >= OPEN.start*60 && e <= OPEN.end*60
+function fmtDay(d){
+  const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]
+  const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ)
+  return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")}`
+}
+function fmtHour(d){ const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ); return `${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}` }
+
+// ====== Horario helpers
+function isHolidayEU(d){
+  const dd=String(d.date()).padStart(2,"0"), mm=String(d.month()+1).padStart(2,"0")
+  return HOLIDAYS_EXTRA.includes(`${dd}/${mm}`)
+}
+function insideBusinessHours(d,dur){
+  const t=d.clone()
+  if (!WORK_DAYS.includes(t.day())) return false
+  if (isHolidayEU(t)) return false
+  const end=t.clone().add(dur,"minute")
+  if (!t.isSame(end,"day")) return false
+  const startMin = t.hour()*60 + t.minute()
+  const endMin   = end.hour()*60 + end.minute()
+  const openMin  = OPEN.start*60
+  const closeMin = OPEN.end*60
+  return startMin >= openMin && endMin <= closeMin
 }
 function nextOpeningFrom(d){
   let t=d.clone()
-  const nowMin=t.hour()*60+t.minute(), openMin=OPEN.start*60, closeMin=OPEN.end*60
-  if(nowMin<openMin) t=t.hour(OPEN.start).minute(0).second(0)
-  if(nowMin>=closeMin) t=t.add(1,"day").hour(OPEN.start).minute(0).second(0)
-  while(!WORK_DAYS.includes(t.day())) t=t.add(1,"day").hour(OPEN.start).minute(0).second(0)
+  const nowMin = t.hour()*60 + t.minute()
+  const openMin= OPEN.start*60
+  const closeMin=OPEN.end*60
+  if (nowMin < openMin) t = t.hour(OPEN.start).minute(0).second(0).millisecond(0)
+  if (nowMin >= closeMin) t = t.add(1,"day").hour(OPEN.start).minute(0).second(0).millisecond(0)
+  while (!WORK_DAYS.includes(t.day()) || isHolidayEU(t)) {
+    t = t.add(1,"day").hour(OPEN.start).minute(0).second(0).millisecond(0)
+  }
   return t
 }
 
-// ===== Staff (solo si cliente pide “con <nombre>”)
+// ====== DB
+const db=new Database("gapink.db"); db.pragma("journal_mode = WAL")
+db.exec(`
+CREATE TABLE IF NOT EXISTS sessions (
+  phone TEXT PRIMARY KEY,
+  data_json TEXT,
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS holds (
+  hold_id TEXT PRIMARY KEY,
+  phone TEXT,
+  sede TEXT,
+  service_env_key TEXT,
+  start_utc TEXT,
+  end_utc TEXT,
+  staff_id TEXT,
+  created_at TEXT,
+  expire_at TEXT,
+  active INTEGER
+);
+`)
+
+function loadSession(phone){
+  const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
+  if (!row?.data_json) return null
+  const s = JSON.parse(row.data_json)
+  if (Array.isArray(s.lastSlots)) s.lastSlots = s.lastSlots.map(o=>({ ...o, date: dayjs(o.date).tz(EURO_TZ) }))
+  return s
+}
+function saveSession(phone,s){
+  const c={...s}
+  if (Array.isArray(c.lastSlots)) c.lastSlots = c.lastSlots.map(o=>({ ...o, date: dayjs(o.date).toISOString() }))
+  const j=JSON.stringify(c)
+  const up=db.prepare(`UPDATE sessions SET data_json=@j, updated_at=@u WHERE phone=@p`).run({j,u:new Date().toISOString(),p:phone})
+  if (up.changes===0) db.prepare(`INSERT INTO sessions (phone,data_json,updated_at) VALUES (@p,@j,@u)`).run({p:phone,j,u:new Date().toISOString()})
+}
+function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
+
+// ====== Holds (bloqueo de huecos 6h)
+function cleanupHolds(){
+  const nowISO = new Date().toISOString()
+  db.prepare(`UPDATE holds SET active=0 WHERE active=1 AND expire_at < @now`).run({now:nowISO})
+}
+function hasActiveOverlap({ sede, startISO, endISO }){
+  cleanupHolds()
+  const rows = db.prepare(`
+    SELECT 1 FROM holds
+    WHERE active=1 AND sede=@sede
+      AND start_utc < @endISO AND end_utc > @startISO
+    LIMIT 1
+  `).all({ sede, startISO, endISO })
+  return rows && rows.length>0
+}
+function placeHold({ phone, sede, envKey, startEU, durMin, staffId=null }){
+  const startISO = startEU.tz("UTC").toISOString()
+  const endISO = startEU.clone().add(durMin,"minute").tz("UTC").toISOString()
+  const expireISO = dayjs().add(6,"hour").toISOString()
+  const hold_id = `hold_${stableKey({phone,sede,envKey,startISO,endISO,staffId})}`
+  db.prepare(`
+    INSERT OR REPLACE INTO holds
+      (hold_id, phone, sede, service_env_key, start_utc, end_utc, staff_id, created_at, expire_at, active)
+    VALUES (@hold_id,@phone,@sede,@envKey,@startISO,@endISO,@staffId,@created,@expire,1)
+  `).run({
+    hold_id, phone, sede, envKey,
+    startISO, endISO, staffId,
+    created: new Date().toISOString(),
+    expire: expireISO
+  })
+  return { hold_id, expireISO, startISO, endISO }
+}
+function releaseHoldsForPhone(phone){
+  db.prepare(`UPDATE holds SET active=0 WHERE active=1 AND phone=@phone`).run({phone})
+}
+
+// ====== Staff & sedes por profesional
 function parseEmployees(){
+  // SQ_EMP_* envs — soporta alias en el nombre de la variable (p.ej. SQ_EMP_TANIA_TANIA)
   const out=[]
-  for(const [k,v] of Object.entries(process.env)){
-    if(!k.startsWith("SQ_EMP_")) continue
-    const [id, tag] = String(v||"").split("|").map(x=>x?.trim())
-    if(!id) continue
-    const label = k.replace(/^SQ_EMP_/,"").replace(/_/g," ")
-    const tokens = new Set(norm(label).split(" ").filter(Boolean))
-    out.push({ id, label, short: label.split(" ")[0], tokens, bookable: (tag||"BOOKABLE").toUpperCase()!=="OFF" })
+  for (const [k,v] of Object.entries(process.env)) {
+    if (!k.startsWith("SQ_EMP_")) continue
+    const parts = String(v||"").split("|").map(s=>s.trim())
+    const id = parts[0]; if (!id) continue
+    const bookTag = (parts[1]||"BOOKABLE").toUpperCase()
+    const bookable = ["BOOKABLE","TRUE","YES","1"].includes(bookTag)
+    const labels = k.replace(/^SQ_EMP_/,"").toLowerCase().split("_").filter(Boolean)
+    out.push({ envKey:k, id, bookable, labels })
   }
   return out
 }
-const EMPLOYEES = parseEmployees()
-function staffLabelFromId(id){ return EMPLOYEES.find(e=>e.id===id)?.short || "Equipo" }
-const STAFF_ALIASES = [
-  ["ganna","gana","ana","anna"],
-  ["patri","patricia","paty"],
-  ["cristi","cristina"],
-  ["johana","joana","yohana"],
-  ["tania","tani"],
-  ["maria","maría","ma ria"],
-  ["elisabeth","elisabet","elis"],
-  ["chabely","chabeli","chabelí"],
-  ["edurne","edur"]
-]
-const aliasCanonical = new Map(); for(const arr of STAFF_ALIASES){ for(const a of arr) aliasCanonical.set(a, arr[0]) }
+let EMPLOYEES = parseEmployees()
+function staffLabelFromId(id){
+  const e = EMPLOYEES.find(x=>x.id===id)
+  return e?.labels?.[0]?.toUpperCase() || (id ? `PROF.${String(id).slice(-4)}` : "Equipo")
+}
+// Map de centros por profesional (EMP_CENTER_*)
+function parseStaffCenters(){
+  const map = new Map()
+  for(const [k,v] of Object.entries(process.env)){
+    if(!k.startsWith("EMP_CENTER_")) continue
+    const name = k.replace(/^EMP_CENTER_/,"").toLowerCase().replace(/_/g," ")
+    const centers = String(v||"").split(",").map(x=>x.trim()).filter(Boolean).map(x=> x==="la_luz"?"la_luz":"torremolinos")
+    map.set(name.split(" ")[0], new Set(centers)) // token corto: "tania", "ganna"…
+  }
+  return map
+}
+const STAFF_CENTERS = parseStaffCenters()
+function staffAllowedInSede(shortName, sede){
+  const set = STAFF_CENTERS.get((shortName||"").toLowerCase())
+  if(!set) return true
+  return set.has(sede)
+}
+function staffCentersHuman(shortName){
+  const set = STAFF_CENTERS.get((shortName||"").toLowerCase())
+  if(!set||!set.size) return null
+  return [...set].map(locationNice).join(" / ")
+}
 function resolveStaffFromText(text){
-  const t = " " + norm(text) + " "
-  const m = t.match(/\scon\s+([a-zñáéíóúüï ]{2,})\b/i)
-  const rawToken = m ? norm(m[1]) : null
-  const candidates = []
-  if(rawToken){ candidates.push(rawToken, ...rawToken.split(" ").filter(Boolean)) }
-  for(const [alias,_] of aliasCanonical.entries()){ if(t.includes(" "+alias+" ")) candidates.push(alias) }
-  const canon = candidates.map(x=>aliasCanonical.get(x)||x)
-  for(const c of canon){
-    for(const e of EMPLOYEES){
-      if(e.tokens.has(c)) return { id:e.id, label:e.short }
-    }
+  const t = norm(text||"")
+  const m = t.match(/\bcon\s+([a-zñáéíóúüï ]{2,})/)
+  const token = (m?m[1]:t).split(/\s+/).filter(Boolean)[0]
+  if(!token) return null
+  // match por palabra exacta en labels
+  for(const e of EMPLOYEES){
+    if (e.labels.some(lb=> norm(lb)===token )) return { id:e.id, label: e.labels[0].toUpperCase() }
+  }
+  // contiene token
+  for(const e of EMPLOYEES){
+    if (e.labels.some(lb=> norm(lb).includes(token) )) return { id:e.id, label: e.labels[0].toUpperCase() }
   }
   return null
 }
 
-// ===== Servicios + duración real
+// ====== Servicios y Duraciones
+function cleanDisplayLabel(label){
+  const s = String(label||"").replace(/^\s*(luz|la\s*luz)\s+/i,"").trim()
+  return s
+}
 function servicesForSede(sedeKey){
   const prefix = (sedeKey==="la_luz") ? "SQ_SVC_luz_" : "SQ_SVC_"
   const out=[]
-  const seen = new Set()
-  for(const [k,v] of Object.entries(process.env)){
-    if(!k.startsWith(prefix)) continue
-    const [id,ver] = String(v||"").split("|")
-    if(!id) continue
-    const label = k.replace(prefix,"").replace(/_/g," ").replace(/\b\w/g, m=>m.toUpperCase()).replace(/\bLuz\b/i,"").trim()
-    const key = `${label}::${id}`; if(seen.has(key)) continue
-    seen.add(key)
-    out.push({ key:k, id, version: ver?Number(ver):null, label })
+  for (const [k,v] of Object.entries(process.env)){
+    if (!k.startsWith(prefix)) continue
+    const [id] = String(v||"").split("|"); if (!id) continue
+    const raw = k.replace(prefix,"").replaceAll("_"," ")
+    let label = titleCase(raw)
+    out.push({ sedeKey, key:k, id, label: cleanDisplayLabel(label), norm: norm(label) })
   }
   return out
 }
-function labelToEnvKey(label, sede){
-  const hit = servicesForSede(sede).find(s=> s.label.toLowerCase()===String(label||"").toLowerCase())
-  return hit?.key || null
-}
-function labelFromEnvKey(key){
-  for(const sede of ["torremolinos","la_luz"]){
-    const hit = servicesForSede(sede).find(s=>s.key===key)
-    if(hit) return hit.label
+function allServices(){ return [...servicesForSede("torremolinos"), ...servicesForSede("la_luz")] }
+
+function buildDurationMap(){
+  const map = new Map()
+  for(const [k,v] of Object.entries(process.env)){
+    if(!k.startsWith("SQ_DUR_")) continue
+    let sede = "any"
+    let raw = k.replace(/^SQ_DUR_/,"")
+    if (raw.startsWith("luz_")) { sede="la_luz"; raw=raw.replace(/^luz_/,"") }
+    const label = titleCase(raw.replaceAll("_"," "))
+    const mins = Number(v||"0")||0
+    map.set(`${sede}:${label.toLowerCase()}`, mins)
   }
-  return null
+  return map
 }
-async function getServiceIdAndVersion(envKey){
-  const raw = process.env[envKey]; if(!raw) return null
-  let [id,ver] = String(raw).split("|"); ver=ver?Number(ver):null
-  if(!ver){
-    try{
-      const resp = await square.catalogApi.retrieveCatalogObject(id,true)
-      ver = Number(resp?.result?.object?.version || 1)
-    }catch{ ver=1 }
-  }
-  return { id, version: ver }
+const DUR_MAP = buildDurationMap()
+
+function durationMinForLabel(label, sede){
+  const k1 = `${sede||"any"}:${String(label||"").toLowerCase()}`
+  const k2 = `any:${String(label||"").toLowerCase()}`
+  return DUR_MAP.get(k1) || DUR_MAP.get(k2) || 60
 }
 function durationMinForEnvKey(envKey){
-  if(!envKey) return 60
-  const durKey = String(envKey).replace(/^SQ_SVC/, "SQ_DUR")
-  const v = Number(process.env[durKey] || "")
-  return Number.isFinite(v) && v>0 ? v : 60
+  const svc = allServices().find(s=>s.key===envKey)
+  if(!svc) return 60
+  return durationMinForLabel(svc.label, svc.sedeKey)
 }
 
-// ===== SQLite holds (bloqueo 6h)
-const db = new Database("gapink_holds.db")
-db.pragma("journal_mode = WAL")
-db.exec(`
-CREATE TABLE IF NOT EXISTS holds (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  phone TEXT,
-  sede TEXT,
-  env_service_key TEXT,
-  start_iso TEXT,
-  end_iso TEXT,
-  staff_id TEXT,
-  created_at TEXT,
-  expires_at TEXT,
-  status TEXT DEFAULT 'active'
-);
-CREATE INDEX IF NOT EXISTS idx_holds_lookup ON holds (sede, start_iso, end_iso, status, expires_at);
-CREATE INDEX IF NOT EXISTS idx_holds_phone   ON holds (phone, status, expires_at);
-`)
-const insertHold = db.prepare(`INSERT INTO holds (phone,sede,env_service_key,start_iso,end_iso,staff_id,created_at,expires_at,status)
-VALUES (@phone,@sede,@env_service_key,@start_iso,@end_iso,@staff_id,@created_at,@expires_at,'active')`)
-const findOverlap = db.prepare(`
-SELECT id FROM holds
-WHERE status='active'
-  AND sede=@sede
-  AND expires_at > @now
-  AND NOT( end_iso <= @start_iso OR start_iso >= @end_iso )
-`)
-const expireOld = db.prepare(`UPDATE holds SET status='expired' WHERE status='active' AND expires_at<=@now`)
-const releaseByPhone = db.prepare(`UPDATE holds SET status='released' WHERE phone=@phone AND status='active'`)
-function cleanupHolds(){ try{ expireOld.run({ now: new Date().toISOString() }) }catch(e){ if(BOT_DEBUG) console.error(e) } }
-function hasActiveOverlap({ sede, startISO, endISO }){
-  try{ return !!findOverlap.get({ sede, start_iso:startISO, end_iso:endISO, now:new Date().toISOString() }) }catch{ return false }
-}
-function createHold({ phone, sede, envServiceKey, startISO, endISO, staffId }){
-  try{
-    const exp = dayjs().add(HOLD_HOURS,"hour").toISOString()
-    insertHold.run({ phone, sede, env_service_key: envServiceKey, start_iso:startISO, end_iso:endISO, staff_id:staffId||null, created_at:new Date().toISOString(), expires_at:exp })
-    return true
-  }catch(e){ if(BOT_DEBUG) console.error(e); return false }
-}
-function releaseActiveHoldsByPhone(phone){ try{ releaseByPhone.run({ phone }) }catch(e){ if(BOT_DEBUG) console.error(e) } }
-
-// ===== Mensajes breves
-const MSG = {
-  greet: `¡Hola! Soy el asistente de Gapink Nails 💅\nDime *salón* (Torremolinos/La Luz) y *qué te haces* (ej. “cejas con hilo”).`,
-  askSalon: `¿Salón? *Torremolinos* o *La Luz*.`,
-  askDetail: `Cuéntame un poco más (ej. “cejas con hilo”, “laminación de cejas”, “microblading”).`,
-  self: `Para ver/editar/cancelar usa el enlace del SMS/email ✅`,
-  propose(label, sede, showNames){ return `${label} en ${locationNice(sede)}:\n${showNames?`Huecos con ${showNames}:\n`:`Huecos disponibles:\n`}` },
-  pickHint: `Dime en texto: “la de las 12”, “viernes tarde”, “otra”…`,
-  heldSummary(label, sede, when, dur){ return `He bloqueado **${label}** en **${locationNice(sede)}** para **${fmtES(when)}** (${dur} min).\nUna compañera te da el OK ✅` },
-  noSlots: `No veo huecos ahora. Dime otra fecha/franja y lo busco 🔁`
+// Lista completa de UÑAS (manos)
+function nailServicesForSede(sedeKey){
+  const arr = servicesForSede(sedeKey)
+  return arr
+    .filter(s=>{
+      const L = s.label.toUpperCase()
+      const isNail = /(UÑAS|UNAS|MANICURA|RELLENO|QUITAR U|UÑA ROTA|UNA ROTA|ESCULPIDAS)/.test(L)
+      const isFoot = /(PEDICURA|PIES)/.test(L)
+      return isNail && !isFoot
+    })
+    .map(s=>({ label:s.label, key:s.key, mins: durationMinForLabel(s.label, sedeKey) }))
+    .sort((a,b)=> a.label.localeCompare(b.label,'es',{sensitivity:'base'}))
 }
 
-// ===== Sesión (memoria corta con historial para dar más contexto a la IA)
-const SESS = new Map()
-function getS(phone){
-  return SESS.get(phone) || SESS.set(phone,{
-    greetedAt:0,
-    sede:null,
-    topic:null,
-    shortlist:[],
-    svcKey:null, svcLabel:null,
-    prefStaffName:null, prefStaffId:null,
-    lastSlots:[], prompted:false, lastListAt:0,
-    pickedISO:null, pickedDurMin:60,
-    snoozeUntil:0,
-    lastAsked:null,
-    history:[], // {role:"user"|"assistant", text}
-    phone
-  }).get(phone)
-}
-function pushHistory(s, role, text){
-  s.history.push({ role, text: String(text).slice(0,400) })
-  if(s.history.length>10) s.history = s.history.slice(-10)
-}
+// ====== IA Prompts (cortos para ahorrar tokens)
+function systemNLP(now, sede, svc, staff, haveSlots){
+  return `Eres un orquestador de WhatsApp para un salón de belleza. Devuelve SOLO JSON.
+Fecha/hora EU: ${now.format("YYYY-MM-DD HH:mm")}
+Sede actual: ${sede||"—"}
+Servicio actual: ${svc||"—"}
+Profesional actual: ${staff||"equipo"}
+Tenemos huecos listados ahora: ${haveSlots?"sí":"no"}
 
-// ===== IA: Router/Shortlist/Choose/Pick (con confianza y escalado)
-const TOPIC_VALUES = ["cejas","pestañas","uñas","faciales","depilación facial","depilación corporal","otros"]
-
-function routerSystem(){
-  const now = nowEU().format("YYYY-MM-DD HH:mm")
-  return `Responde SOLO JSON.
-Hoy: ${now} Europe/Madrid.
-Objetivo: entender petición de cita en lenguaje natural (nada de números).
-Campos:
-- intent: "book"|"view"|"edit"|"cancel"|"info"|"other"
-- sede: "torremolinos"|"la_luz"|null
-- topic: ${TOPIC_VALUES.join("|")}
-- staff_name: string|null  // si dice "con <nombre>"
-- date: {type:"none"|"day", day: "YYYY-MM-DD"|null, part:"mañana"|"tarde"|"noche"|null}
-- service_hint: string|null // texto libre tipo “cejas con hilo”
-- confidence: number  // 0..1 tu seguridad total
+Campos posibles:
+{"intent":"greet|set_salon|set_service|set_staff|ask_slots|pick_slot|refine_time|list_nails|view|edit|cancel|none",
+ "salon":"torremolinos|la_luz|null",
+ "service_text":"string|null",
+ "staff_name":"string|null",
+ "time_text":"string|null"}
 
 Reglas:
-- Entiende “la primera”, “otra tarde”, “cuando puedas por la mañana”.
-- Si no hay sala ni tema, intenta deducirlos. Si dudas, deja null y baja confidence.
-- Si detectas “con <nombre>”, rellena staff_name con el nombre tal cual.
-- No inventes.`
+- Si dice “uñas” sin especificar: intent=list_nails.
+- Si menciona “con <nombre>”: intent=set_staff (staff_name).
+- Si pide “huecos”, “horario”, o dice una franja (“viernes tarde”, “me vale 13:00”): intent=ask_slots o refine_time (time_text).
+- Si responde “la primera”, “la de las 13”, “martes 10:30”: intent=pick_slot (time_text).
+- Nunca inventes número; usa lenguaje natural del usuario.
+- Si dice ver/editar/cancelar cita: intent=view|edit|cancel.
+- Si solo saluda: greet.`
 }
 
-async function aiRouter(s, text){
-  const msgs = [
-    { role:"system", content: routerSystem() },
-    ...s.history.map(h=>({ role:h.role, content:h.text })),
-    { role:"user", content: text }
-  ]
-  // LITE
-  let out = await aiCall(msgs,{ maxTokens: TOKENS.router_lite, temperature:0.1 })
-  let obj = stripJSON(out) || {}
-  if((obj.confidence||0) < 0.6){
-    // BOOST (más tokens si duda)
-    out = await aiCall(msgs,{ maxTokens: TOKENS.router_boost, temperature:0.2 })
-    obj = stripJSON(out) || obj
+async function aiUnderstand(userText, ctx){
+  const sys = systemNLP(nowEU(), ctx.sede, ctx.svcLabel, ctx.prefStaffName, Array.isArray(ctx.lastSlots)&&ctx.lastSlots.length>0)
+  const out = await aiChat(sys, `Cliente: "${userText}"\nResponde JSON.`)
+  return stripToJSON(out) || { intent:"none" }
+}
+
+// Elegir servicio por IA (sin números). Se le pasa la lista de la sede.
+async function aiChooseServiceLabel(userText, sedeKey){
+  const list = servicesForSede(sedeKey)
+  const pack = list.map(s=>s.label).slice(0,150) // límite para ahorrar tokens
+  const sys = `Eres un clasificador. Devuelve SOLO JSON {"label":"<exacto o null>"}.
+Elige el *mejor* servicio de esta lista EXACTA (sensible a tildes) según el texto del cliente. Si duda, escoge el más genérico/rápido.
+Lista:\n- ${pack.join("\n- ")}`
+  const out = await aiChat(sys, `Texto del cliente: "${userText}"`)
+  const obj = stripToJSON(out)
+  const label = obj?.label && list.find(s=> s.label.toLowerCase() === String(obj.label||"").toLowerCase())?.label
+  return label || null
+}
+
+// Interpretar elección de hora (sin números): “la de las 13”, “martes”, “viernes tarde”…
+async function aiPickHour(userText, candidateSlots){
+  const options = candidateSlots.map(s=>`${s.date.format("YYYY-MM-DD HH:mm")}${s.staffId?` ${staffLabelFromId(s.staffId)}`:""}`)
+  const sys = `Devuelve SOLO JSON {"iso":"YYYY-MM-DDTHH:mm","fallback":"none|ask_other"}.
+Elige la mejor opción EXACTA de esta lista (prioriza coincidencia de hora/día, luego primera de la lista).
+Lista:\n- ${options.join("\n- ")}`
+  const out = await aiChat(sys, `Cliente: "${userText}"`)
+  const obj = stripToJSON(out)
+  const iso = obj?.iso
+  if (!iso) return null
+  // Validar que esté en candidates (por minuto)
+  const match = candidateSlots.find(s=> s.date.format("YYYY-MM-DDTHH:mm")===iso.slice(0,16))
+  return match || null
+}
+
+// ====== Disponibilidad (solo consulta a Square) + filtros + holds
+async function getServiceIdAndVersion(envKey){
+  const raw = process.env[envKey]; if (!raw) return null
+  let [id, ver] = String(raw).split("|"); ver=ver?Number(ver):null
+  if (!id) return null
+  if (!ver){
+    try{
+      const resp=await square.catalogApi.retrieveCatalogObject(id,true)
+      const vRaw = resp?.result?.object?.version
+      ver = vRaw != null ? Number(vRaw) : 1
+    } catch(e) { ver=1 }
   }
-  // saneo mínimo
-  if(obj && typeof obj==="object"){
-    if(!TOPIC_VALUES.includes(obj.topic)) obj.topic="otros"
-    if(obj.sede!=="torremolinos" && obj.sede!=="la_luz") obj.sede=null
-    if(!obj.date) obj.date={type:"none",day:null,part:null}
-  }
-  return obj
+  return {id,version:ver||1}
 }
 
-function shortlistSystem(labels, topic){
-  return `Solo JSON. Devuelve {"labels":[hasta 5]} con nombres EXACTOS sacados de esta lista:
-${labels.join(" | ")}
-Tema sugerido: ${topic||"auto"}.
-Elige opciones populares y claras del tema (no repitas, nada ambiguo).`
-}
-async function aiShortlist(s, userText){
-  const labels = servicesForSede(s.sede).map(x=>x.label)
-  const msgs = [
-    { role:"system", content: shortlistSystem(labels, s.topic) },
-    ...s.history.map(h=>({ role:h.role, content:h.text })),
-    { role:"user", content: userText }
-  ]
-  const out = await aiCall(msgs,{ maxTokens: TOKENS.shortlist, temperature:0.2 })
-  const obj = stripJSON(out) || {}
-  const arr = Array.isArray(obj.labels) ? obj.labels.filter(l=>labels.some(x=>x.toLowerCase()===String(l).toLowerCase())) : []
-  return (arr.length?arr:[]).slice(0,5)
-}
-
-async function aiChooseFromShortlist(s, userText, shortlist){
-  const sys = `Solo JSON. Lista: ${shortlist.join(" | ")}.
-Si el texto es genérico (“la primera”, “cejas”), escoge la opción base MÁS habitual.
-Devuelve {"pick":"<etiqueta|null>", "confidence":0..1}`
-  const msgs = [
-    { role:"system", content: sys },
-    ...s.history.map(h=>({ role:h.role, content:h.text })),
-    { role:"user", content: userText }
-  ]
-  const out = await aiCall(msgs,{ maxTokens: TOKENS.choose, temperature:0.2 })
-  const obj = stripJSON(out) || {}
-  const pick = shortlist.find(l=>l.toLowerCase()===String(obj.pick||"").toLowerCase()) || null
-  const conf = typeof obj.confidence==="number" ? obj.confidence : 0.5
-  return { pick, confidence: conf }
-}
-
-function pickSystem(slotsCompact){
-  return `Solo JSON. Elige "iso" según frases tipo “la del martes”, “a las 13”, “otra tarde”, “la primera”.
-slots=${JSON.stringify(slotsCompact)}
-Devuelve {"iso":"YYYY-MM-DDTHH:mm|null", "confidence":0..1}`
-}
-async function aiPick(s, userText, slots){
-  if(!slots?.length) return { iso:null, confidence:0 }
-  const compact = slots.map(x=>{
-    const d=x.date.tz(EURO_TZ)
-    return { iso:d.format("YYYY-MM-DDTHH:mm"), dow:["do","lu","ma","mi","ju","vi","sa"][d.day()], ddmm:`${String(d.date()).padStart(2,"0")}/${String(d.month()+1).padStart(2,"0")}`, hhmm:`${String(d.hour()).padStart(2,"0")}:${String(d.minute()).padStart(2,"0")}` }
-  })
-  const msgs = [
-    { role:"system", content: pickSystem(compact) },
-    ...s.history.map(h=>({ role:h.role, content:h.text })),
-    { role:"user", content: userText }
-  ]
-  const out = await aiCall(msgs,{ maxTokens: TOKENS.pick, temperature:0.2 })
-  const obj = stripJSON(out) || {}
-  return { iso: obj.iso || null, confidence: typeof obj.confidence==="number"?obj.confidence:0.5 }
-}
-
-// ===== Disponibilidad por servicio (dur + holds + staff opcional)
-async function searchAvail({ sede, envKey, startEU, endEU, part=null }){
-  const sv = await getServiceIdAndVersion(envKey); if(!sv) return []
-  const durMin = durationMinForEnvKey(envKey)
+async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, limit=500, part=null, forceStaffId=null, durMin=60 }){
+  const sv = await getServiceIdAndVersion(envServiceKey)
+  if (!sv?.id) return []
   const body = {
     query:{ filter:{
       startAtRange:{ startAt: startEU.tz("UTC").toISOString(), endAt: endEU.tz("UTC").toISOString() },
-      locationId: locationToId(sede),
-      segmentFilters:[{ serviceVariationId: sv.id }]
+      locationId: locationToId(locationKey),
+      segmentFilters: [{ serviceVariationId: sv.id }]
     } }
   }
   let avail=[]
   try{
-    const r = await square.bookingsApi.searchAvailability(body)
-    avail = r?.result?.availabilities || []
-  }catch(e){ if(BOT_DEBUG) console.error(e) }
+    const resp = await square.bookingsApi.searchAvailability(body)
+    avail = resp?.result?.availabilities || []
+  }catch(e){ if(BOT_DEBUG) console.error("searchAvailability:", e?.message) }
+
   cleanupHolds()
   const out=[]
-  for(const a of avail){
-    const d=dayjs(a.startAt).tz(EURO_TZ)
-    const end = d.clone().add(durMin,"minute")
-    if(!insideBusinessHours(d,durMin)) continue
-    if(part){
+  for (const a of avail){
+    if (!a?.startAt) continue
+    const d = dayjs(a.startAt).tz(EURO_TZ)
+    if (!insideBusinessHours(d,durMin)) continue
+    let tm = null
+    const segs = Array.isArray(a.appointmentSegments) ? a.appointmentSegments
+                 : Array.isArray(a.segments) ? a.segments
+                 : []
+    if (segs[0]?.teamMemberId) tm = segs[0].teamMemberId
+    if (forceStaffId && tm !== forceStaffId) continue
+    if (part){
+      // recorte franja (sencillo)
       const from = d.clone().hour(part==="mañana"?9:part==="tarde"?15:18).minute(0)
       const to   = d.clone().hour(part==="mañana"?13:part==="tarde"?20:20).minute(0)
-      if(!(d.isAfter(from.subtract(1,"minute")) && d.isBefore(to.add(1,"minute")))) continue
+      if (!(d.isAfter(from.subtract(1,"minute")) && d.isBefore(to.add(1,"minute")))) continue
     }
     const startISO = d.tz("UTC").toISOString()
-    const endISO   = end.tz("UTC").toISOString()
-    if (hasActiveOverlap({ sede, startISO, endISO })) continue
-    const segs = a.appointmentSegments||a.segments||[]
-    out.push({ date:d, end, staffId: segs?.[0]?.teamMemberId || null, durMin })
-    if(out.length>=600) break
+    const endISO   = d.clone().add(durMin,"minute").tz("UTC").toISOString()
+    if (hasActiveOverlap({ sede:locationKey, startISO, endISO })) continue
+    out.push({ date:d, staffId: tm || null, durMin })
+    if (out.length>=limit) break
   }
-  return out.sort((x,y)=>x.date.valueOf()-y.date.valueOf())
+  out.sort((a,b)=>a.date.valueOf()-b.date.valueOf())
+  return out
 }
 
-// ===== Presentación (no nombres salvo que lo pidan)
-function bullets(slots, {showNames=false, name=null}={}){
-  return slots.map(s=>{
-    const base = `• ${fmtES(s.date)}`
-    return (showNames && name) ? `${base} — ${name}` : base
-  }).join("\n")
-}
-async function proposeHoursForService(s, jid, phone, sock, envKey, label, aiDate){
+async function proposeHoursForService(session, jid, phone, sock, envKey, label, dateHint, { enforceStaff=false }={}){
   const base = nextOpeningFrom(nowEU().add(NOW_MIN_OFFSET_MIN,"minute"))
-  let start = base.clone(), end = base.clone().add(SEARCH_WINDOW_DAYS, "day"), part=null
-  if (aiDate && aiDate.type==="day" && aiDate.day){
-    const d = dayjs.tz(aiDate.day + " 09:00", EURO_TZ)
-    start = d.clone().hour(OPEN.start).minute(0)
-    end   = d.clone().hour(OPEN.end).minute(0)
-    part  = aiDate.part || null
-  } else if (aiDate && aiDate.part){ part = aiDate.part }
+  let start = base.clone()
+  let end   = base.clone().add(SEARCH_WINDOW_DAYS,"day")
+  let part  = null
+  if (dateHint && typeof dateHint==="string"){
+    // delega en IA para “viernes tarde”, “martes”, “mañana”, “noche” (pero ahorrando tokens ya lo manejamos arriba si viene text free)
+    if (/tarde/.test(norm(dateHint))) part="tarde"
+    else if (/manana/.test(norm(dateHint))) part="mañana"
+    else if (/noche/.test(norm(dateHint))) part="noche"
+  }
 
-  let slots = await searchAvail({ sede:s.sede, envKey, startEU:start, endEU:end, part })
+  const durMin = durationMinForEnvKey(envKey)
+  let slots = await searchAvailWindow({
+    locationKey: session.sede, envServiceKey: envKey,
+    startEU: start, endEU: end, limit: 500, part,
+    forceStaffId: enforceStaff ? (session.prefStaffId||null) : null,
+    durMin
+  })
   if(!slots.length && part){
-    slots = await searchAvail({ sede:s.sede, envKey, startEU:start, endEU:end, part:null })
+    slots = await searchAvailWindow({
+      locationKey: session.sede, envServiceKey: envKey,
+      startEU: start, endEU: end, limit: 500, part:null,
+      forceStaffId: enforceStaff ? (session.prefStaffId||null) : null,
+      durMin
+    })
   }
   if(!slots.length){
-    const start2 = base.clone(), end2 = base.clone().add(EXTENDED_WINDOW_DAYS, "day")
-    slots = await searchAvail({ sede:s.sede, envKey, startEU:start2, endEU:end2, part:null })
+    const start2 = base.clone()
+    const end2   = base.clone().add(EXTENDED_WINDOW_DAYS,"day")
+    slots = await searchAvailWindow({
+      locationKey: session.sede, envServiceKey: envKey,
+      startEU: start2, endEU: end2, limit: 500, part:null,
+      forceStaffId: enforceStaff ? (session.prefStaffId||null) : null,
+      durMin
+    })
   }
-  // Filtro por profesional si lo pidieron
-  let usedPreferred = false
-  if(s.prefStaffId){
-    const keep = slots.filter(x => x.staffId === s.prefStaffId)
-    if(keep.length){ slots = keep; usedPreferred = true }
+  if(!slots.length && enforceStaff && session.prefStaffName){
+    await sock.sendMessage(jid,{text:`Con *${session.prefStaffName}* no veo huecos en ese rango. Dime otra fecha/franja o si quieres te enseño el *equipo*.`})
+    session.lastSlots=[]; saveSession(phone, session)
+    return false
   }
-  if(!slots.length) return false
-
+  if(!slots.length){
+    await sock.sendMessage(jid,{text:`No veo huecos ahora mismo. Dime otra fecha/franja (ej. “viernes tarde”).`})
+    session.lastSlots=[]; saveSession(phone, session)
+    return false
+  }
+  const usedPreferred = !!(enforceStaff && session.prefStaffId)
   const shown = slots.slice(0, SHOW_TOP_N)
-  s.lastSlots = shown
-  s.prompted  = true
-  s.lastListAt = Date.now()
-  s.svcKey = envKey
-  s.svcLabel = label
-  // Mensaje
-  const title = MSG.propose(label, s.sede, usedPreferred ? (s.prefStaffName || staffLabelFromId(s.prefStaffId)) : null)
-  const list = bullets(shown, { showNames: usedPreferred, name: usedPreferred ? (s.prefStaffName || staffLabelFromId(s.prefStaffId)) : null })
-  await sock.sendMessage(jid,{text:`${title}${list}\n\n${MSG.pickHint}`})
-  s.lastAsked="hours"
+  session.lastSlots = shown
+  session.svcKey = envKey
+  session.svcLabel = label
+  session.lastListAt = Date.now()
+  saveSession(phone, session)
+
+  const bullets = shown.map(s=>{
+    const base = `• ${fmtDay(s.date)} ${fmtHour(s.date)}`
+    if (usedPreferred) return `${base} — ${session.prefStaffName || staffLabelFromId(session.prefStaffId)}`
+    return base
+  }).join("\n")
+
+  const title = usedPreferred
+    ? `Huecos con ${session.prefStaffName} para *${label}*:\n`
+    : `Huecos del equipo para *${label}*:\n`
+  const hint = `\nDime en texto cuál te viene (ej. “me vale la de las 13”, “otra tarde”, “martes”).`
+  await sock.sendMessage(jid,{text: title + bullets + hint})
   return true
 }
-async function proposeHoursWithFallback(s, jid, phone, sock, aiDate, userTextForShortlist){
-  if(s.svcKey){
-    const ok = await proposeHoursForService(s, jid, phone, sock, s.svcKey, s.svcLabel, aiDate)
-    if(ok) return true
+
+// ====== Mini resumen (solo si ya está todo)
+function maybeSendSummary(session, jid, sock){
+  if (session.sede && session.svcLabel && session.chosenSlot){
+    const lines = [
+      `Resumen:`,
+      `• Salón: ${locationNice(session.sede)}`,
+      `• Servicio: ${session.svcLabel}`,
+      session.prefStaffName ? `• Profesional: ${session.prefStaffName}` : `• Profesional: Equipo`,
+      `• Hora: ${fmtES(session.chosenSlot.date)}`,
+      `• Duración: ${session.chosenSlot.durMin} min`
+    ].filter(Boolean)
+    const tail = `\nAhora una de las compañeras dará el OK ✅`
+    sock.sendMessage(jid,{text: lines.join("\n")+tail})
   }
-  // probar shortlist (AI), sin listar infinito
-  if(!s.shortlist.length){
-    const list = await aiShortlist(s, userTextForShortlist || (s.topic||""))
-    s.shortlist = list
-  }
-  // intenta pick automático
-  if(s.shortlist.length){
-    const { pick } = await aiChooseFromShortlist(s, userTextForShortlist || (s.topic||""), s.shortlist)
-    const chosen = pick || s.shortlist[0]
-    const key = labelToEnvKey(chosen, s.sede)
-    if(key){
-      const ok = await proposeHoursForService(s, jid, phone, sock, key, chosen, aiDate)
-      if(ok) return true
-    }
-    // prueba alternativas restantes
-    for(const alt of s.shortlist){
-      if(alt.toLowerCase()===chosen.toLowerCase()) continue
-      const k = labelToEnvKey(alt, s.sede); if(!k) continue
-      const ok = await proposeHoursForService(s, jid, phone, sock, k, alt, aiDate)
-      if(ok) return true
-    }
-  }
-  await sock.sendMessage(jid,{text:MSG.noSlots})
-  s.lastAsked="noSlots"
-  return false
 }
 
-// ===== Mini web QR
-const app = express()
-let lastQR = null, conectado = false
+// ====== Web mini (QR + estado)
+const app=express()
+const PORT=process.env.PORT||8080
+let lastQR=null, conectado=false
 app.get("/", (_req,res)=>{
   res.send(`<!doctype html><meta charset="utf-8"><style>
-  :root{color-scheme:light dark}
-  body{font-family:system-ui,Inter,Segoe UI,Roboto;display:grid;place-items:center;min-height:100vh;margin:0;background:Canvas}
-  .card{max-width:760px;width:92vw;padding:28px 24px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.12);background:CanvasTextBlend}
-  .row{display:flex;gap:8px;align-items:center;margin:8px 0}
-  .pill{padding:6px 10px;border-radius:999px;font-weight:600;font-size:12px}
-  .ok{background:#d1fae5;color:#065f46}.bad{background:#fee2e2;color:#991b1b}.warn{background:#fef3c7;color:#92400e}
-  .qr{margin:16px 0;text-align:center}
-  footer{opacity:.6;font-size:12px;margin-top:12px}
-  </style>
-  <div class="card">
-    <h1>Gapink Nails · Bot</h1>
-    <div class="row">
-      <span class="pill ${conectado?'ok':'bad'}">${conectado?'✅ WhatsApp conectado':'❌ WhatsApp desconectado'}</span>
-      <span class="pill warn">IA DeepSeek · Solo consulta</span>
-    </div>
-    ${!conectado && lastQR ? `<div class="qr"><img src="/qr.png" width="280" alt="QR WhatsApp" style="border-radius:12px"/></div>` : `<p style="opacity:.8;margin:12px 0">Escanea el QR (también sale en consola) o espera reconexión.</p>`}
-    <footer>Puerto ${PORT} · ${new Date().toLocaleString("es-ES",{ timeZone: "Europe/Madrid" })}</footer>
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f8f9fa;margin:0}
+  .card{max-width:760px;padding:32px;border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.08);background:white}
+  .status{padding:12px;border-radius:8px;margin:8px 0}
+  .success{background:#d4edda;color:#155724}
+  .error{background:#f8d7da;color:#721c24}
+  .warning{background:#fff3cd;color:#856404}
+  </style><div class="card">
+  <h1>Gapink Nails Bot</h1>
+  <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
+  ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
+  <div class="status warning">Modo: ${DRY_RUN ? "Simulación" : "Producción"} | IA: DeepSeek (${DEEPSEEK_MODEL})</div>
   </div>`)
 })
 app.get("/qr.png", async (_req,res)=>{
   if(!lastQR) return res.status(404).send("No QR")
-  try{
-    const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
-    res.set("Content-Type","image/png").send(png)
-  }catch{ res.status(500).send("QR error") }
+  const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
+  res.set("Content-Type","image/png").send(png)
 })
 
-// ===== Baileys (import dinámico ESM)
+// ====== Baileys loader (ESM dinámico)
 async function loadBaileys(){
   const mod = await import("@whiskeysockets/baileys")
-  const makeWASocket = mod.makeWASocket ?? mod.default?.makeWASocket ?? mod.default
-  const useMultiFileAuthState = mod.useMultiFileAuthState ?? mod.default?.useMultiFileAuthState
-  const fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion ?? mod.default?.fetchLatestBaileysVersion
-  const Browsers = mod.Browsers ?? mod.default?.Browsers ?? { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
-  if (!makeWASocket || !useMultiFileAuthState) throw new Error("Baileys ESM no expone funciones esperadas")
+  const makeWASocket = mod.makeWASocket || mod.default?.makeWASocket || (typeof mod.default==="function"?mod.default:undefined)
+  const useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
+  const fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion || mod.default?.fetchLatestBaileysVersion || (async()=>({version:[2,3000,0]}))
+  const Browsers = mod.Browsers || mod.default?.Browsers || { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
 
-// ===== Bot loop
+// ====== WhatsApp loop
 async function startBot(){
-  const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info")
-  const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
-  const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:Browsers.macOS("Desktop"), syncFullHistory:false })
+  try{
+    const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
+    if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info")
+    const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
+    const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:Browsers.macOS("Desktop"), syncFullHistory:false })
+    globalThis.sock=sock
 
-  sock.ev.on("creds.update", saveCreds)
-  sock.ev.on("connection.update", ({connection, qr})=>{
-    if (qr){ lastQR = qr; conectado = false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
-    if (connection==="open"){ lastQR=null; conectado=true }
-    if (connection==="close"){ conectado=false; setTimeout(()=>startBot().catch(console.error), 2500) }
-  })
+    sock.ev.on("connection.update", ({connection,qr})=>{
+      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
+      if (connection==="open"){ lastQR=null; conectado=true; }
+      if (connection==="close"){ conectado=false; setTimeout(()=>{ startBot().catch(console.error) }, 3000) }
+    })
+    sock.ev.on("creds.update", saveCreds)
 
-  sock.ev.on("messages.upsert", async ({messages})=>{
-    const m = messages?.[0]; if(!m?.message) return
-    const jid = m.key.remoteJid
-    const isFromMe = !!m.key.fromMe
-    const phone = (jid||"").split("@")[0]
-    const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
-    if(!textRaw) return
+    sock.ev.on("messages.upsert", async ({messages})=>{
+      const m=messages?.[0]; if (!m?.message) return
+      const jid = m.key.remoteJid
+      const isFromMe = !!m.key.fromMe
+      const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
+      const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
+      if (!textRaw) return
+      if (isFromMe) return
 
-    // Puntitos → silencio 6h (si lo envío yo, sin respuesta)
-    if(/^[\s.·•⋅]+$/.test(textRaw)){
-      const s=getS(phone); s.snoozeUntil=nowEU().add(6,"hour").valueOf(); SESS.set(phone,s)
-      if(!isFromMe) return; else return
-    }
-    if(isFromMe) return
+      // Sesión base
+      let s = loadSession(phone) || {
+        greeted:false, sede:null,
+        svcKey:null, svcLabel:null,
+        prefStaffId:null, prefStaffName:null,
+        requestedStaffExplicitly:false,
+        lastSlots:[],
+        chosenSlot:null,
+        lastListAt:0,
+        lastAsked:null
+      }
 
-    const s = getS(phone)
-    if(s.snoozeUntil && Date.now()<s.snoozeUntil) return
+      // Primer saludo (una sola vez por día)
+      if (!s.greeted){
+        s.greeted = true
+        saveSession(phone, s)
+        await sock.sendMessage(jid,{text:`¡Hola! Soy el asistente de Gapink Nails 💅
+Cuéntame en tus palabras qué necesitas (salón, servicio, día/franja y si quieres con alguien). Yo te lo resumo y te paso opciones.
 
-    pushHistory(s,"user",textRaw)
+Horario atención humana: L–V 10–14 y 16–20.`})
+      }
 
-    // Saludo cada 24h máximo
-    if(Date.now()-s.greetedAt > 24*60*60*1000){
-      s.greetedAt = Date.now(); SESS.set(phone,s)
-      await sock.sendMessage(jid,{text:MSG.greet})
-      pushHistory(s,"assistant",MSG.greet)
-    }
+      // ===== IA: entender intención
+      const ai = await aiUnderstand(textRaw, s)
 
-    // Si ya listamos horas y responde con texto → IA elige y bloquea
-    if(s.lastSlots?.length && !s.pickedISO){
-      const picked = await aiPick(s, textRaw, s.lastSlots)
-      const iso = picked?.iso || null
-      if(iso){
-        const hit = s.lastSlots.find(x=>x.date.format("YYYY-MM-DDTHH:mm")===iso)
-        if(hit){
-          const durMin = hit.durMin || durationMinForEnvKey(s.svcKey)
-          const startISO = hit.date.tz("UTC").toISOString()
-          const endISO   = hit.date.clone().add(durMin,"minute").tz("UTC").toISOString()
-          cleanupHolds()
-          if (hasActiveOverlap({ sede:s.sede, startISO, endISO })){
-            const warn = "Ese hueco se acaba de bloquear. Te paso otras opciones:"
-            await sock.sendMessage(jid,{text:warn})
-            pushHistory(s,"assistant",warn)
-            await proposeHoursWithFallback(s, jid, phone, sock, { type:"none", day:null, part:null }, textRaw)
-            return
+      // SALÓN
+      if ((ai.intent==="set_salon" || /torremolinos|la luz|luz\b/i.test(textRaw)) && !s.sede){
+        s.sede = /luz\b/i.test(textRaw) ? "la_luz" : /torremol/i.test(textRaw) ? "torremolinos" : (ai.salon||null)
+        if(!s.sede && ai.salon) s.sede = ai.salon
+        if(s.sede) saveSession(phone, s)
+      }
+
+      // STAFF
+      if (ai.intent==="set_staff" || /\bcon\s+[a-zñáéíóúüï ]{2,}/i.test(norm(textRaw))){
+        const r = resolveStaffFromText(ai.staff_name ? `con ${ai.staff_name}` : textRaw)
+        if(r?.id){
+          s.prefStaffId = r.id
+          s.prefStaffName = r.label
+          s.requestedStaffExplicitly = true
+          saveSession(phone, s)
+          if (s.sede && !staffAllowedInSede(s.prefStaffName, s.sede)){
+            const where = staffCentersHuman(s.prefStaffName)
+            await sock.sendMessage(jid,{text:`${s.prefStaffName} atiende en ${where}. Si quieres, dime “cámbialo a ${where.includes("La Luz")?"La Luz":"Torremolinos"}” o “me da igual, equipo”.`})
+          } else {
+            await sock.sendMessage(jid,{text:`Perfecto, lo miro con *${s.prefStaffName}* 👌`})
           }
-          const ok = createHold({ phone, sede:s.sede, envServiceKey:s.svcKey, startISO, endISO, staffId: hit.staffId||null })
-          if(!ok){
-            const msg="No he podido bloquear ese hueco. Te paso alternativas:"
-            await sock.sendMessage(jid,{text:msg})
-            pushHistory(s,"assistant",msg)
-            await proposeHoursWithFallback(s, jid, phone, sock, { type:"none", day:null, part:null }, textRaw)
-            return
-          }
-          s.pickedISO = iso
-          s.pickedDurMin = durMin
-          SESS.set(phone,s)
+        } else if (ai.staff_name){
+          await sock.sendMessage(jid,{text:`No tengo a “${ai.staff_name}” en el equipo. Te enseño huecos del equipo salvo que me digas otro nombre.`})
         }
       }
-    }
 
-    // IA Router
-    const ai = await aiRouter(s, textRaw)
-
-    // Sede / tema
-    if(ai.sede==="la_luz" || ai.sede==="torremolinos"){ s.sede = ai.sede }
-    if(ai?.topic && TOPIC_VALUES.includes(ai.topic)){ s.topic = ai.topic }
-
-    // Profesional (solo si lo pide)
-    let staffChanged = false
-    if(ai?.staff_name || /\bcon\s+[a-zñáéíóúüï ]{2,}/i.test(norm(textRaw))){
-      const r = resolveStaffFromText(ai?.staff_name ? `con ${ai.staff_name}` : textRaw)
-      if(r?.id && s.prefStaffId!==r.id){ s.prefStaffId=r.id; s.prefStaffName=r.label; staffChanged=true }
-      if(!r && ai?.staff_name){
-        const msg=`No tengo a “${ai.staff_name}” en el equipo. Te paso huecos del equipo 👇`
-        await sock.sendMessage(jid,{text:msg}); pushHistory(s,"assistant",msg)
-        s.prefStaffId=null; s.prefStaffName=null
-      }
-    }
-    SESS.set(phone,s)
-
-    // Autogestión → enlace; si “ver” pone silencio 6h
-    if(ai.intent==="view" || ai.intent==="edit" || ai.intent==="cancel" || ai.intent==="info"){
-      await sock.sendMessage(jid,{text:MSG.self})
-      pushHistory(s,"assistant",MSG.self)
-      if(ai.intent==="view"){ s.snoozeUntil = nowEU().add(6,"hour").valueOf(); SESS.set(phone,s) }
-      return
-    }
-
-    // Falta sede → pregúntalo una vez (no repetir)
-    if(!s.sede){
-      if(s.lastAsked!=="sede"){
-        await sock.sendMessage(jid,{text:MSG.askSalon}); pushHistory(s,"assistant",MSG.askSalon); s.lastAsked="sede"
-      }
-      return
-    }
-
-    // Si cambian profesional y había hold, liberar y recalcular
-    if(staffChanged && s.pickedISO){
-      releaseActiveHoldsByPhone(phone)
-      s.pickedISO = null
-      s.lastSlots = []
-      const msg = `Ok, lo miro con *${s.prefStaffName}* 👌`
-      await sock.sendMessage(jid,{text:msg}); pushHistory(s,"assistant",msg)
-      await proposeHoursWithFallback(s, jid, phone, sock, ai?.date||{type:"none",day:null,part:null}, textRaw)
-      return
-    }
-
-    // Si no hay servicio elegido aún → shortlist IA (máx 5, sin listar infinito)
-    if(!s.svcKey){
-      if(!s.shortlist.length){
-        s.shortlist = await aiShortlist(s, ai?.service_hint || textRaw)
-      }
-      if(s.shortlist.length){
-        const { pick, confidence } = await aiChooseFromShortlist(s, ai?.service_hint || textRaw, s.shortlist)
-        if(pick && confidence>=0.55){
-          const key = labelToEnvKey(pick, s.sede)
-          if(key){ s.svcKey=key; s.svcLabel=labelFromEnvKey(key) }
-        }else{
-          const lines = s.shortlist.map(l=>{
-            const env = labelToEnvKey(l, s.sede)
-            const dur = durationMinForEnvKey(env)
-            return `• ${l} — ${dur} min`
-          }).join("\n")
-          const msg = `En ${locationNice(s.sede)}, ¿cuál prefieres?\n${lines}\n(Dímelo tal cual en texto, p. ej. “${s.shortlist[0]}” o “la primera”)`
-          await sock.sendMessage(jid,{text:msg}); pushHistory(s,"assistant",msg); s.lastAsked="shortlist"
-          return
-        }
-      }else{
-        await sock.sendMessage(jid,{text:MSG.askDetail}); pushHistory(s,"assistant",MSG.askDetail); s.lastAsked="detail"
+      // Si no hay salón, pídelo
+      if (!s.sede){
+        await sock.sendMessage(jid,{text:`¿En qué salón te viene mejor? *Torremolinos* o *La Luz*.`})
         return
       }
-    }
 
-    // Proponer horas si todavía no se han mostrado o han pasado 2 min
-    if(s.svcKey && (!s.prompted || (Date.now()-s.lastListAt>2*60*1000))){
-      await proposeHoursWithFallback(s, jid, phone, sock, ai?.date||{type:"none",day:null,part:null}, textRaw)
-      return
-    }
+      // LISTA COMPLETA DE UÑAS si el tema es uñas y no hay servicio
+      if (ai.intent==="list_nails" || /\buñas|unas|manicura\b/i.test(norm(textRaw))){
+        if (!s.svcKey){
+          const list = nailServicesForSede(s.sede)
+          if(!list.length){
+            await sock.sendMessage(jid,{text:`No tengo servicios de *uñas* configurados en ${locationNice(s.sede)}.`})
+          } else {
+            const chunk=20
+            for(let i=0;i<list.length;i+=chunk){
+              const pg = list.slice(i,i+chunk).map(x=>`• ${x.label} — ${x.mins} min`).join("\n")
+              await sock.sendMessage(jid,{text: (i===0?`Servicios de *uñas* en ${locationNice(s.sede)}:\n`:"Más opciones:\n")+pg })
+            }
+            await sock.sendMessage(jid,{text:`Dímelo tal cual en texto (p. ej. “Manicura Semipermanente” o “Quitar Uñas Esculpidas”).`})
+            s.lastAsked = "fullNails"; saveSession(phone, s)
+            return
+          }
+        }
+      }
 
-    // Si ya hay hold → resumen final (solo una vez)
-    if(s.pickedISO){
-      const when = dayjs.tz(s.pickedISO, EURO_TZ)
-      const msg = MSG.heldSummary(s.svcLabel, s.sede, when, s.pickedDurMin)
-      await sock.sendMessage(jid,{text:msg}); pushHistory(s,"assistant",msg)
-      // reset suave de la parte de horas (mantenemos sede/topic)
-      s.lastSlots=[]; s.prompted=false; s.pickedISO=null; s.lastAsked="summary"
-      SESS.set(phone,s)
-      return
-    }
+      // SERVICIO (por IA, sin números)
+      if (!s.svcKey){
+        const picked = await aiChooseServiceLabel(textRaw, s.sede)
+        if (picked){
+          const svc = servicesForSede(s.sede).find(x=> x.label.toLowerCase()===picked.toLowerCase())
+          if (svc){
+            s.svcKey = svc.key; s.svcLabel = svc.label; saveSession(phone, s)
+            await sock.sendMessage(jid,{text:`Ok, *${s.svcLabel}* en ${locationNice(s.sede)}.`})
+          }
+        } else if (!/horario|huecos|tarde|mañana|noche|hoy|mañana|pasado|con\s+/i.test(textRaw)){
+            await sock.sendMessage(jid,{text:`Dímelo con un poco más de detalle (ej. “cejas con hilo”, “manicura semipermanente”, “carbon peel”).`})
+            return
+        }
+      }
 
-    // Fallback amable sin repetir
-    if(s.lastAsked!=="greet"){
-      await sock.sendMessage(jid,{text:MSG.greet}); pushHistory(s,"assistant",MSG.greet); s.lastAsked="greet"
-    }
-  })
+      // Si ya tenemos servicio, ¿proponemos horas?
+      if (s.svcKey && (ai.intent==="ask_slots" || ai.intent==="refine_time" || /horario|huecos|tarde|mañana|noche|hoy|mañana|pasado|viernes|lunes|martes|miércoles|jueves|sábado|domingo/i.test(textRaw))){
+        const ok = await proposeHoursForService(
+          s, jid, phone, sock, s.svcKey, s.svcLabel, ai.time_text || textRaw,
+          { enforceStaff: !!(s.prefStaffId && s.requestedStaffExplicitly) }
+        )
+        if (ok) return
+      }
+
+      // Si tenemos lista mostrada y el cliente elige “la de las 13 / martes / primera…”
+      if (Array.isArray(s.lastSlots) && s.lastSlots.length && (ai.intent==="pick_slot" || /primera|segunda|la de las|me vale|me viene|esa|esa misma|ok|perfect/i.test(norm(textRaw)))){
+        const choice = await aiPickHour(textRaw, s.lastSlots)
+        if (!choice){
+          await sock.sendMessage(jid,{text:`No me quedó clara la hora. Dímela tal cual (ej. “martes 13:00” o “la de las 17:00”).`})
+          return
+        }
+        // HOLD 6h
+        releaseHoldsForPhone(phone) // soltamos anteriores del mismo cliente
+        const hold = placeHold({ phone, sede:s.sede, envKey:s.svcKey, startEU:choice.date, durMin:choice.durMin, staffId: s.requestedStaffExplicitly ? s.prefStaffId : null })
+        s.chosenSlot = choice; saveSession(phone, s)
+        await sock.sendMessage(jid,{text:`Te reservo *provisionalmente* ${fmtES(choice.date)} (${choice.durMin} min) en ${locationNice(s.sede)}${s.prefStaffName?` con ${s.prefStaffName}`:""} durante 6 h ⏳.
+Si te viene mal, dime otra hora/franja. Si te viene bien, te lo dejamos listo cuando lo revise una compañera.`})
+        maybeSendSummary(s, jid, sock)
+        return
+      }
+
+      // Si tenemos servicio pero aún no hemos mostrado horas
+      if (s.svcKey && (!Array.isArray(s.lastSlots) || !s.lastSlots.length)){
+        const ok = await proposeHoursForService(
+          s, jid, phone, sock, s.svcKey, s.svcLabel, ai.time_text || "",
+          { enforceStaff: !!(s.prefStaffId && s.requestedStaffExplicitly) }
+        )
+        if (ok) return
+      }
+
+      // Ver/editar/cancelar -> mensaje informativo (no gestionamos por aquí)
+      if (ai.intent==="view" || /ver mi cita|cuando es|a que hora/i.test(norm(textRaw))){
+        await sock.sendMessage(jid,{text:`Para *consultar, editar o cancelar* usa el enlace del *SMS/email* de confirmación ✅`})
+        return
+      }
+
+      // Fallback amable
+      if (!s.svcKey){
+        await sock.sendMessage(jid,{text:`¿Qué quieres exactamente? (ej. “cejas con hilo”, “manicura semipermanente”).`})
+      } else {
+        await sock.sendMessage(jid,{text:`Dime una franja u hora (ej. “viernes tarde” o “13:00”) y te propongo huecos.`})
+      }
+
+    })
+  }catch(e){
+    console.error(e)
+    setTimeout(() => startBot().catch(console.error), 4000)
+  }
 }
 
-// ===== Arranque + mini web QR
-const appListen = app.listen(PORT, ()=>{ 
-  console.log(`🩷 Gapink Nails Bot v37.4.0 — DeepSeek-only · IA inteligente · QR http://localhost:${PORT}`)
-  startBot().catch(console.error)
-})
+// ====== Arranque
+console.log(`🩷 Gapink Nails Bot v38.0.0 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
+const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
+process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
+process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
 process.on("SIGTERM", ()=>{ try{ appListen.close(()=>process.exit(0)) }catch{ process.exit(0) } })
 process.on("SIGINT", ()=>{ try{ appListen.close(()=>process.exit(0)) }catch{ process.exit(0) } })
