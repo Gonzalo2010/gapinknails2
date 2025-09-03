@@ -1,10 +1,12 @@
-// index.js — Gapink Nails · v36.4.0
+// index.js — Gapink Nails · v37.0.0
 // DeepSeek-only · conversación limpia · holds SQL 6h · sin tocar Square
-// Fixes en esta versión:
-// - “con Tania/Cristi/…“ ahora filtra huecos por esa profesional (fuzzy: “cristi”→Cristina)
-// - Preferimos perfiles bookable y del mismo centro; si no hay huecos, caemos a equipo con aviso
-// - Dedupe de empleados por ID (fusiona labels/centros; evita matches a registros NO_BOOKABLE)
-// - Resto: anti-loop, listas sin duplicados, uñas primero si la intención es pedicura/manicura
+// Mejora clave en esta versión:
+// - “con cristina/cristi/cris/…” filtra huecos por esa profesional (fuzzy fuerte)
+// - “micropigmentación/microblanding/powder brows/…” entiende la intención y lista SOLO servicios de micropigmentación ordenados por IA
+// - Mapeo IA→servicio exacto (si dices “microblanding”, lo casa con “Microblading” y propone horas)
+// - Mejor detección de salón (“en torremolinos/la luz/…”) sin bucles
+// - Propuestas con profesional elegida; si no hay huecos con ella, cae a equipo con aviso
+// - Listas sin duplicados y texto muy corto/limpio
 
 import express from "express"
 import pino from "pino"
@@ -288,10 +290,23 @@ function staffLabelFromId(id){
   return e?.labels?.[0] || (id ? `Prof. ${String(id).slice(-4)}` : null)
 }
 
-// Fuzzy staff robusto (“con tania”, “con cristi”, “con ella”)
+// Fuzzy staff robusto (“con tania”, “con cristi”, “con cris”, “con ella”)
 function bestStaffFromText(text, sedePref=null){
   const t = " " + norm(text) + " "
   if (/\bcon\s+ella\b/.test(t)) return { withHer:true }
+
+  // diccionario básico de alias → emp label
+  const alias = {
+    "tania":"tania","tani":"tania",
+    "cristina":"cristina","cristin":"cristina","cristi":"cristina","cris":"cristina","crist":"cristina",
+    "chabeli":"chabeli","elisabeth":"elisabeth","eli":"elisabeth","edurne":"edurne","johana":"johana","ganna":"ganna","cristi­na":"cristina"
+  }
+  for (const [k,v] of Object.entries(alias)){
+    if (new RegExp(`\\b${k}\\b`).test(t)){
+      const found = EMPLOYEES.find(e => e.labels.some(l => norm(l)===v))
+      if (found) return found
+    }
+  }
   // candidatos por coincidencia exacta o prefijo ≥60% (mín. 4)
   const matches=[]
   for (const e of EMPLOYEES){
@@ -376,25 +391,58 @@ function resolveEnvKeyFromLabelAndSede(label, sedeKey){
   return found ? { envKey:found.key, id:found.id, version:found.version, label:found.label, mins: attachDurations([found])[0].mins } : null
 }
 
+// --------- Categorías por regex (para filtrar listados) ----------
+const CAT = {
+  unas: /\b(uñ|unas|manicur|pedicur|esmalt|acril|esculpid|rellen|tips|pies)\b/i,
+  cejas: /\b(ceja|henna|dise[ñn]o.*ceja|depilaci[oó]n.*ceja|pinzas.*ceja|hilo.*ceja)\b/i,
+  micropigmentacion: /\b(micropigment|microblading|microshading|powder|shading|aquarela|hairstroke|eyeliner|labios)\b/i,
+  pestanas: /\b(pesta[ñn]|lifting\s*de\s*pesta|extensiones\s*de\s*pesta|relleno\s*pesta)\b/i,
+  depilacion: /\b(depila|fotodepila|axila|ingles|pierna|labio|nasales|pubis|perianal)\b/i,
+  faciales: /\b(facial|limpieza|hydra|dermapen|peel|carbon|manchas|acn[eé]|col[aá]geno|jade|vitamina)\b/i
+}
+function detectCategory(text){
+  if (CAT.unas.test(text)) return "unas"
+  if (CAT.micropigmentacion.test(text)) return "micropigmentacion"
+  if (CAT.cejas.test(text)) return "cejas"
+  if (CAT.pestanas.test(text)) return "pestanas"
+  if (CAT.depilacion.test(text)) return "depilacion"
+  if (CAT.faciales.test(text)) return "faciales"
+  return null
+}
+function servicesByCategory(sedeKey, category){
+  const all = attachDurations(servicesForSedeKeyRaw(sedeKey))
+  const t = category
+  const pick = (regex) => dedupeByLabel(all.filter(s => regex.test(norm(s.label))))
+  switch(t){
+    case "unas":{
+      return dedupeByLabel(all.filter(s => /\b(uñas|manicura|pedicura|esculpidas|relleno|esmaltado)\b/i.test(s.label)))
+    }
+    case "micropigmentacion":{
+      return dedupeByLabel(all.filter(s => /\b(microblading|microshading|efecto polvo|aquarela|eyeliner|labios|retoc|hairstroke)\b/i.test(norm(s.label))))
+    }
+    case "cejas":{
+      return dedupeByLabel(all.filter(s => /\b(ceja|henna|depilaci[oó]n.*cejas?|pinzas.*cejas?|hilo.*cejas?)\b/i.test(norm(s.label))))
+    }
+    case "pestanas":{
+      return dedupeByLabel(all.filter(s => /\b(pestañ|pestanas|lifting|extensiones)\b/i.test(norm(s.label))))
+    }
+    case "depilacion":{
+      return dedupeByLabel(all.filter(s => /\b(depil|fotodepil|axilas|ingles|labio|nasales|pubis|piernas|perianal)\b/i.test(norm(s.label))))
+    }
+    case "faciales":{
+      return dedupeByLabel(all.filter(s => /\b(facial|hydra|dermapen|peel|carbon|manchas|acne|colageno|jade|vitamina)\b/i.test(norm(s.label))))
+    }
+    default: return dedupeByLabel(all)
+  }
+}
+
 // ---------- IA prompts ----------
 function buildSystemPrompt(session){
   const now = nowEU().format("YYYY-MM-DD HH:mm")
-  const staffLines = EMPLOYEES.filter(e=>e.bookable).map(e=>`- ${e.labels[0]} (centros: ${e.centers.map(c=>c==="la_luz"?"La Luz":"Torremolinos").join("/")})`).join("\n")
-  const svcTor = servicesForSedeKeyRaw("torremolinos").map(s=>`- ${s.label}`).join("\n")
-  const svcLuz = servicesForSedeKeyRaw("la_luz").map(s=>`- ${s.label}`).join("\n")
   return `Eres el asistente WhatsApp de Gapink Nails. Responde SOLO JSON válido.
 
 Hora local: ${now} Europe/Madrid.
 Centros: Torremolinos y La Luz.
-
-Profesionales (bookable):
-${staffLines}
-
-Servicios TORREMOLINOS:
-${svcTor}
-
-Servicios LA LUZ:
-${svcLuz}
 
 Devuelve JSON:
 {
@@ -403,12 +451,13 @@ Devuelve JSON:
  "staff_name": "nombre o '__CON_ELLA__' o null",
  "datetime_hint": "frase tiempo o null",
  "need_services_list": boolean,
- "category_guess": "unas|cejas|depilacion|facial|pestanas|null"
+ "category_guess": "unas|cejas|micropigmentacion|depilacion|faciales|pestanas|null"
 }
 
 Reglas:
 - Si dice “con ella” -> staff_name="__CON_ELLA__".
 - Si dice “uñas/pedicura/manicura/quitarme las uñas” o es ambiguo -> need_services_list=true y category_guess="unas".
+- Si dice “micropigmentación/microblading/microshading/powder/eyeliner/labios” -> category_guess="micropigmentacion".
 `
 }
 
@@ -447,12 +496,94 @@ async function rankServicesByAI(userText, services){
   return dedupeByLabel(services)
 }
 
+// Alias comunes → etiqueta exacta de servicio (por sede)
+function buildServiceAliasIndex(sedeKey){
+  const list = servicesForSedeKeyRaw(sedeKey)
+  const byLabel = new Map(list.map(s=>[norm(s.label), s.label]))
+  const alias = new Map()
+  const add = (a, exact)=> alias.set(norm(a), exact)
+
+  // Uñas
+  add("quitarme las uñas","Quitar Uñas Esculpidas")
+  add("quitar uñas","Quitar Uñas Esculpidas")
+  add("retirar uñas","Quitar Uñas Esculpidas")
+  add("manicura semi","Manicura Semipermanente")
+  add("manicura semipermanente","Manicura Semipermanente")
+  add("semi manos","Manicura Semipermanente")
+  add("pedicura semi","Pedicura Spa Con Esmalte Semipermanente")
+  add("pedicura gel","Pedicura Glam Jelly Con Esmalte Semipermanente")
+
+  // Micropigmentación
+  add("microblanding","Microblading")
+  add("micro blading","Microblading")
+  add("powder brows","Cejas Efecto Polvo Microshading")
+  add("microshading","Cejas Efecto Polvo Microshading")
+  add("hairstroke","Cejas Hairstroke")
+  add("labios aquarela","Labios Efecto Aquarela")
+  add("labios acuarela","Labios Efecto Aquarela")
+  add("eye liner","Eyeliner")
+  add("eyeliner","Eyeliner")
+
+  // Pestañas
+  add("lifting pestañas","Lifitng De Pestañas Y Tinte")
+  add("lifting de pestañas","Lifitng De Pestañas Y Tinte")
+  add("lifting y tinte","Lifitng De Pestañas Y Tinte")
+
+  // Cejas depilación
+  add("cejas con hilo","Depilacion Cejas Con Hilo")
+  add("depilacion de cejas con hilo","Depilacion Cejas Con Hilo")
+
+  // Intentar casar con etiquetas existentes (corrigir acentos/mayus)
+  const out = new Map(alias)
+  for (const [k,v] of alias){
+    const found = byLabel.get(norm(v)) || [...byLabel.values()].find(lbl => norm(lbl)===norm(v))
+    if (found) out.set(k, found)
+  }
+  return out
+}
+async function aiMapToServiceLabel(userText, sedeKey){
+  const all = attachDurations(servicesForSedeKeyRaw(sedeKey))
+  const alias = buildServiceAliasIndex(sedeKey)
+  const direct = alias.get(norm(userText))
+  if (direct) return direct
+  // Pide a IA elegir etiqueta exacta
+  try{
+    const sys = `Elige la MEJOR etiqueta exacta de la lista de servicios que encaja con el texto del usuario.
+Devuelve SOLO {"label":"Texto Exacto"} o {"label":null} si no hay match claro.`
+    const msg = `Usuario: "${userText}"\nServicios:\n${all.map(s=>`- ${s.label}`).join("\n")}\nJSON:`
+    const out = await aiChat(sys, msg)
+    const js = stripToJSON(out)
+    if (js?.label && typeof js.label==="string"){
+      const ok = all.find(s => s.label.toLowerCase() === js.label.toLowerCase())
+      if (ok) return ok.label
+    }
+  }catch{}
+  return null
+}
+
 // Uñas: filtra y ordena por IA
 async function nailsServicesForSedeRankedByAI(sedeKey, userText){
-  const raw = servicesForSedeKeyRaw(sedeKey)
-  const withDur = dedupeByLabel(attachDurations(raw))
+  const withDur = servicesByCategory(sedeKey, "unas")
   try{
-    const sys = `De la lista, filtra SOLO servicios de UÑAS (manicura/pedicura/esculturado/esmaltado/relleno/retirar) y ordénalos por relevancia. Devuelve SOLO {"ordered":["label",...]}.`
+    const sys = `De la lista, ordena por relevancia para el usuario. Devuelve SOLO {"ordered":["label",...]}.`
+    const msg = `Usuario: "${userText}"\nServicios:\n${withDur.map(s=>`- ${s.label}`).join("\n")}\nSolo JSON.`
+    const out = await aiChat(sys, msg)
+    const js = stripToJSON(out)
+    if (Array.isArray(js?.ordered) && js.ordered.length){
+      const map = new Map(js.ordered.map((l,i)=>[l.toLowerCase(), i]))
+      const list = withDur.filter(s=>map.has(s.label.toLowerCase()))
+      list.sort((a,b)=>map.get(a.label.toLowerCase()) - map.get(b.label.toLowerCase()))
+      return dedupeByLabel(list)
+    }
+  }catch{}
+  return dedupeByLabel(withDur)
+}
+
+// Micropigmentación: lista y ordena por IA
+async function micropigServicesForSedeRankedByAI(sedeKey, userText){
+  const withDur = servicesByCategory(sedeKey, "micropigmentacion")
+  try{
+    const sys = `Ordena servicios de MICROPIGMENTACIÓN (microblading, powder/microshading, eyeliner, labios) por relevancia. Devuelve SOLO {"ordered":["label",...]}.`
     const msg = `Usuario: "${userText}"\nServicios:\n${withDur.map(s=>`- ${s.label}`).join("\n")}\nSolo JSON.`
     const out = await aiChat(sys, msg)
     const js = stripToJSON(out)
@@ -568,7 +699,7 @@ app.get("/", (_req,res)=>{
   .error{background:#ffe8e8;color:#b00020}
   .muted{color:#666}
   </style><div class="card">
-  <h1>Gapink Nails Bot — v36.4</h1>
+  <h1>Gapink Nails Bot — v37.0</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:16px 0"><img src="/qr.png" width="300" style="border-radius:8px;border:1px solid #eee"></div>`:""}
   <p class="muted">Modo: ${DRY_RUN ? "Simulación" : "Consulta Square"} · IA: DeepSeek</p>
@@ -610,8 +741,7 @@ async function searchCustomersByPhone(phone){
 // ---------- Saludo ----------
 function buildGreeting(){
   return `¡Hola! Soy el asistente de Gapink Nails 💅
-Cuéntame *salón*, lo que quieres y (si quieres) con quién y cuándo. Te propongo horas.
-Horario atención humana: L–V 10–14 y 16–20.`
+Dime *salón* (Torremolinos/La Luz), lo que te haces y (si quieres) con quién y cuándo. Yo te paso horas.`
 }
 
 // ---------- Anti-duplicados ----------
@@ -702,26 +832,22 @@ async function startBot(){
             s.preferStaffLabel = staffByText.labels[0]
             s.preferExplicit = true
             saveSession(phone,s)
-            if (s.sede && !staffByText.centers.includes(s.sede) && shouldPrompt(s,"staff_wrong_center")){
-              await sock.sendMessage(jid,{ text: `${s.preferStaffLabel} atiende en ${staffByText.centers.map(c=>c==="la_luz"?"La Luz":"Torremolinos").join(" / ")}. Si te viene, dime “cámbialo a ${staffByText.centers[0]==="la_luz"?"La Luz":"Torremolinos"}” o “me vale el equipo”.` })
-            }
           } else if (ai.staff_name === "__CON_ELLA__"){
             const uid = uniqueStaffFromLastProposed(s); if (uid){ wantStaffId = uid; s.preferStaffId=uid; s.preferStaffLabel=staffLabelFromId(uid); s.preferExplicit=true; saveSession(phone,s) }
           }
 
-          // Servicio directo si lo trae y hay salón
-          if (ai.service_label && s.sede){
-            const r = resolveEnvKeyFromLabelAndSede(ai.service_label, s.sede)
-            if (r){ s.svcKey=r.envKey; s.svcLabel=r.label; s.durationMin=r.mins; saveSession(phone,s) }
+          // Servicio directo por alias/IA si ya hay salón
+          if (s.sede && !s.svcKey){
+            const aiLabel = await aiMapToServiceLabel(textRaw, s.sede)
+            if (aiLabel){
+              const r = resolveEnvKeyFromLabelAndSede(aiLabel, s.sede)
+              if (r){ s.svcKey=r.envKey; s.svcLabel=r.label; s.durationMin=r.mins; saveSession(phone,s) }
+            }
           }
 
-          // Detectar intención uñas (manicura/pedicura/quitar uñas)
+          // Categoría (uñas / micropigmentación / etc.)
           const tN = norm(textRaw)
-          let categoryGuess = ai.category_guess || s.ctx.lastCategory || null
-          if (!categoryGuess && /\b(pedicur|manicur|uñ|unas|pies)\b/.test(tN)) categoryGuess = "unas"
-
-          let needList = ai.need_services_list
-          if (categoryGuess==="unas" && !s.svcKey) needList = true
+          let categoryGuess = ai.category_guess || detectCategory(tN) || s.ctx.lastCategory || null
 
           // Guardar contexto
           if (!parseSalonFromText(textRaw)) {
@@ -730,18 +856,27 @@ async function startBot(){
             saveSession(phone,s)
           }
 
-          // Listar uñas (si ambigua)
-          if (needList && categoryGuess==="unas" && s.sede){
-            const rankedAll = await nailsServicesForSedeRankedByAI(s.sede, [s.ctx.lastText, textRaw].filter(Boolean).join(" · "))
-            const ranked = rankedAll.slice(0, SERVICES_LIST_MAX_N)
-            const bullets = ranked.map(x=>`• ${x.label} — ${x.mins} min`).join("\n")
-            const listHash = md5(`nails|${s.sede}|${bullets}`)
-            if (s.lastListHash !== listHash){
-              s.lastListHash = listHash; saveSession(phone,s)
+          // Si pidió micropigmentación o similar y no hay servicio aún, lista SOLO micropigmentación ordenada
+          if (!s.svcKey && s.sede && categoryGuess==="micropigmentacion"){
+            const ranked = (await micropigServicesForSedeRankedByAI(s.sede, [s.ctx.lastText, textRaw].filter(Boolean).join(" · ")))
+              .slice(0, SERVICES_LIST_MAX_N)
+            if (ranked.length){
+              const bullets = ranked.map(x=>`• ${x.label} — ${x.mins} min`).join("\n")
               await sock.sendMessage(jid,{ text:
-                `Opciones de uñas en ${locationNice(s.sede)} (ordenadas por lo que más te encaja):\n${bullets}\n\nDímelo tal cual (ej. “Pedicura Spa Con Esmalte Semipermanente”).`
+                `Micropigmentación en ${locationNice(s.sede)} (ordenado por lo que más te encaja):\n${bullets}\n\nEscríbelo tal cual (p. ej. “Microblading”, “Cejas Efecto Polvo Microshading”).`
               })
+              return
             }
+          }
+
+          // Uñas: si ambigua
+          if (!s.svcKey && s.sede && (categoryGuess==="unas")){
+            const ranked = (await nailsServicesForSedeRankedByAI(s.sede, [s.ctx.lastText, textRaw].filter(Boolean).join(" · ")))
+              .slice(0, SERVICES_LIST_MAX_N)
+            const bullets = ranked.map(x=>`• ${x.label} — ${x.mins} min`).join("\n")
+            await sock.sendMessage(jid,{ text:
+              `Opciones de uñas en ${locationNice(s.sede)} (ordenadas por lo que más te encaja):\n${bullets}\n\nDímelo tal cual (ej. “Manicura Semipermanente”, “Quitar Uñas Esculpidas”).`
+            })
             return
           }
 
@@ -753,19 +888,15 @@ async function startBot(){
             return
           }
 
-          // Lista completa si no hay servicio claro
+          // Si no hay servicio claro todavía → lista completa ordenada por IA (pero ya prioriza lo que pidió)
           if (!s.svcKey){
             const full = dedupeByLabel(attachDurations(servicesForSedeKeyRaw(s.sede)))
             const rankedAll = await rankServicesByAI([s.ctx.lastText, textRaw].filter(Boolean).join(" · "), full)
             const ranked = rankedAll.slice(0, SERVICES_LIST_MAX_N)
             const bullets = ranked.map(x=>`• ${x.label} — ${x.mins} min`).join("\n")
-            const listHash = md5(`all|${s.sede}|${bullets}`)
-            if (s.lastListHash !== listHash){
-              s.lastListHash = listHash; saveSession(phone,s)
-              await sock.sendMessage(jid,{ text:
-                `Dímelo en tus palabras o elige (te lo ordeno por lo más probable):\n${bullets}\n\nEscríbelo tal cual en texto (sin números).`
-              })
-            }
+            await sock.sendMessage(jid,{ text:
+              `Dímelo en tus palabras o elige (te lo ordeno por lo más probable):\n${bullets}\n\nEscríbelo tal cual en texto (sin números).`
+            })
             return
           }
 
@@ -863,7 +994,7 @@ He hecho un *bloqueo interno* durante ${HOLD_HOURS}h para ese hueco. `
 
 // ---------- Arranque ----------
 const appListen = app.listen(PORT, ()=>{
-  console.log(`🩷 Gapink Nails Bot v36.4.0 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
+  console.log(`🩷 Gapink Nails Bot v37.0.0 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
   startBot().catch(console.error)
 })
 process.on("uncaughtException", e=>{ console.error("💥 uncaughtException:", e?.stack||e) })
