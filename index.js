@@ -1,12 +1,10 @@
-// index.js — Gapink Nails · v35.2.0
-// TODO por IA (DeepSeek-only). Sin keywords/reglas manuales.
-// - Router IA: intención, sede, staff opcional, día/franja (normalizado).
-// - Shortlist IA desde la lista COMPLETA de servicios por sede.
-// - Si el cliente dice “cejas” (genérico), IA elige 1 servicio de la shortlist automáticamente.
-// - Horas: SOLO después de fijar servicio. Elección de hora por IA a partir de slots.
-// - Disponibilidad: respeta duración (ENV SQ_DUR_*), bloquea con HOLD SQLite 6h, Square solo consulta availability.
-// - Fallbacks si no hay huecos: relaja franja y amplía ventana a 60 días antes de decir “no hay”.
-// - Mini web QR y Baileys ESM con import dinámico.
+// index.js — Gapink Nails · v35.3.0
+// IA total con flujo de reserva persistente (s.flow="book").
+// - Si estamos en reserva, ignoramos intents de ver/editar/cancelar mal detectados.
+// - IA con contexto de sesión: entiende “en torremolinos” como sede dentro del booking.
+// - Square SOLO consultar availability. No creamos cita en Square.
+// - HOLD SQLite 6h por duración de servicio (ENV SQ_DUR_*).
+// - DeepSeek-only. Mini web QR. Baileys ESM import dinámico.
 
 import express from "express"
 import pino from "pino"
@@ -30,13 +28,13 @@ const nowEU = () => dayjs().tz(EURO_TZ)
 // ===== Config
 const OPEN = { start: 9, end: 20 }                     // L–V 09:00–20:00
 const WORK_DAYS = [1,2,3,4,5]
-const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 30)
+const SEARCH_WINDOW_DAYS   = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 30)
 const EXTENDED_WINDOW_DAYS = Number(process.env.BOT_EXTENDED_WINDOW_DAYS || 60)
-const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
-const SHOW_TOP_N = Number(process.env.SHOW_TOP_N || 5)
-const HOLD_HOURS = Number(process.env.HOLD_HOURS || 6)
-const PORT = Number(process.env.PORT || 8080)
-const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
+const NOW_MIN_OFFSET_MIN   = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
+const SHOW_TOP_N           = Number(process.env.SHOW_TOP_N || 5)
+const HOLD_HOURS           = Number(process.env.HOLD_HOURS || 6)
+const PORT                 = Number(process.env.PORT || 8080)
+const BOT_DEBUG            = /^true$/i.test(process.env.BOT_DEBUG || "")
 
 // ===== Square (solo consultar)
 const square = new Client({
@@ -215,13 +213,21 @@ function createHold({ phone, sede, envServiceKey, startISO, endISO, staffId }){
   }catch(e){ if(BOT_DEBUG) console.error(e); return false }
 }
 
-// ===== IA — Router
-function aiRouterSystem(){
+// ===== IA — Router (con contexto de sesión)
+function aiRouterSystem(ctx){
   const now = nowEU().format("YYYY-MM-DD HH:mm")
   return `Devuelve SOLO JSON válido (sin texto extra).
 Fecha actual: ${now} Europe/Madrid
 Sedes: ["torremolinos","la_luz"]
 Staff permitidos (si el cliente pide con alguien): ${JSON.stringify(STAFF_SHORT)}
+
+CONTEXTO:
+${JSON.stringify(ctx)}
+
+REGLAS:
+- Si el contexto indica flujo de reserva en curso ("flow":"book") o ya se pidió cita, por defecto "intent":"book" salvo que el cliente pida explícitamente ver/editar/cancelar.
+- Mensajes cortos como "en torremolinos", "la luz", "con ganna", "viernes tarde" son complementos del booking actual (no cambian a view/edit/cancel/info).
+- Si el cliente dice "cita", "reservar", "hora", "agenda", interpreta como "book" salvo contradicción explícita.
 
 Schema:
 {
@@ -229,15 +235,21 @@ Schema:
  "sede":"torremolinos|la_luz|null",
  "staff":"string|null",
  "date":{"type":"day|range|none","day":"YYYY-MM-DD|null","part_of_day":"mañana|tarde|noche|null"}
-}`
 }
-async function aiResolve(text){
-  const sys = aiRouterSystem()
+
+Ejemplos:
+"quiero una cita pa cejas" -> {"intent":"book","sede":null,"staff":null,"date":{"type":"none","day":null,"part_of_day":null}}
+"en torremolinos" con flow=book -> {"intent":"book","sede":"torremolinos","staff":null,"date":{"type":"none","day":null,"part_of_day":null}}
+"la del martes por la mañana" con flow=book -> {"intent":"book","sede":null,"staff":null,"date":{"type":"day","day":"<proximo martes ISO>","part_of_day":"mañana"}}
+`
+}
+async function aiResolve(text, ctx){
+  const sys = aiRouterSystem(ctx)
   const out = await aiChat(sys, `Cliente: "${text}"`, {maxTokens: AI_TOKENS_ROUTER})
   return stripJSON(out) || {}
 }
 
-// ===== IA — Shortlist (desde la lista COMPLETA, sin reglas locales)
+// ===== IA — Shortlist (desde la lista COMPLETA)
 function aiShortlistSystem(allLabels){
   return `Elige hasta 6 etiquetas EXACTAS de esta lista que encajan con la petición del cliente.
 Si el texto es genérico ("cejas", "uñas", etc.), elige las 6 más habituales para ese tema.
@@ -255,10 +267,10 @@ async function aiShortlist(text, sede){
   }catch{ return [] }
 }
 
-// ===== IA — Elegir UN servicio de la shortlist (ordinals y genéricos los resuelve IA)
+// ===== IA — Elegir UN servicio de la shortlist
 async function aiChooseFromShortlist(text, shortlist){
   const sys = `Shortlist (elige UNA etiqueta exacta): ${shortlist.join(" | ")}
-Si el cliente dice algo genérico como "cejas", elige la opción más básica/común de la lista.
+Si el cliente dice "cejas" sin más, elige la opción base más común.
 Devuelve SOLO JSON: {"pick":"<una etiqueta exacta o null>"}.`
   const out = await aiChat(sys, `Frase del cliente: "${text}"`, {maxTokens: AI_TOKENS_PICK})
   try{
@@ -330,6 +342,7 @@ const SESS = new Map()
 function getS(phone){
   return SESS.get(phone) || SESS.set(phone,{
     greetedAt:0,
+    flow:null,                // "book" | null
     lastPrompt:null,
     sede:null,
     shortlist:[],
@@ -365,12 +378,12 @@ async function proposeHours(session, jid, phone, sock, aiDate){
   // 1) Intento principal
   let slots = await searchAvail({ sede:session.sede, envKey:session.svcKey, startEU:start, endEU:end, part })
 
-  // 2) Fallback A: quitar franja si venía acotada
+  // 2) Fallback A: quitar franja
   if(!slots.length && part){
     slots = await searchAvail({ sede:session.sede, envKey:session.svcKey, startEU:start, endEU:end, part:null })
   }
 
-  // 3) Fallback B: ampliar ventana a 60 días (sin franja)
+  // 3) Fallback B: ampliar a 60 días, sin franja
   if(!slots.length){
     const start2 = base.clone()
     const end2   = base.clone().add(EXTENDED_WINDOW_DAYS, "day")
@@ -378,13 +391,13 @@ async function proposeHours(session, jid, phone, sock, aiDate){
   }
 
   if(!slots.length){
-    await sock.sendMessage(jid,{text:"Ahora mismo no veo huecos. Dime otra fecha/franja en tus palabras (p. ej. “viernes tarde”) y lo vuelvo a mirar."})
+    await sock.sendMessage(jid,{text:"Ahora mismo no veo huecos. Dime otra fecha/franja en tus palabras (p. ej. “viernes tarde”) y lo miro de nuevo."})
     return
   }
 
   const shown = slots.slice(0, SHOW_TOP_N)
   session.lastSlots = shown
-  session.prompted = true
+  session.prompted  = true
   session.lastListAt = Date.now()
 
   const header = session.prefStaff ? `Huecos con ${session.prefStaff}:` : "Huecos del equipo:"
@@ -479,7 +492,7 @@ async function startBot(){
       setPrompt(s,"greet"); SESS.set(phone,s)
     }
 
-    // Si ya mostramos horas y aún no hay elección -> IA decide un slot y bloquea
+    // Si ya mostramos horas y aún no hay elección -> IA decide slot y bloquea
     if(s.lastSlots?.length && !s.pickedISO){
       const picked = await aiPick(textRaw, s.lastSlots)
       const iso = picked?.iso || null
@@ -508,35 +521,45 @@ async function startBot(){
       }
     }
 
-    // IA Router (intención/sede/staff/fecha)
-    const ai = await aiResolve(textRaw)
+    // ===== IA Router con CONTEXTO
+    const ctx = {
+      flow: s.flow,               // "book" | null
+      sede: s.sede,
+      haveShortlist: !!s.shortlist?.length,
+      haveService: !!s.svcKey,
+      awaiting: s.lastPrompt      // greet | ask_sede | ask_service | hours | summary | fallback
+    }
+    const ai = await aiResolve(textRaw, ctx)
 
-    // Navegación rápida
-    if(ai.intent==="view" || ai.intent==="edit" || ai.intent==="cancel" || ai.intent==="info"){
+    // 1) Primero, procesa sede/staff/fecha (para no romper el flujo)
+    if(ai.sede==="la_luz" || ai.sede==="torremolinos"){
+      s.sede = ai.sede
+    }
+    if(ai?.staff){ s.prefStaff = ai.staff }
+    // si ya preguntamos algo de la reserva, marcamos flujo book
+    if(!s.flow && (s.lastPrompt==="ask_sede" || s.lastPrompt==="ask_service" || s.lastPrompt==="hours")) s.flow = "book"
+    // si IA cree que es booking, activamos el flujo
+    if(ai.intent==="book") s.flow = "book"
+    SESS.set(phone,s)
+
+    // 2) Solo si NO estamos en flujo de reserva, atendemos view/edit/cancel/info
+    if(s.flow!=="book" && (ai.intent==="view" || ai.intent==="edit" || ai.intent==="cancel" || ai.intent==="info")){
       await sock.sendMessage(jid,{text:BOOKING_SELF})
       if(ai.intent==="view"){ s.snoozeUntil = nowEU().add(6,"hour").valueOf(); SESS.set(phone,s) }
       return
     }
 
-    // Sede
-    const prevSede = s.sede
-    if(ai.sede==="la_luz" || ai.sede==="torremolinos") s.sede = ai.sede
+    // 3) Si falta sede, pídela una vez
     if(!s.sede){
       if(s.lastPrompt!=="ask_sede"){
+        s.flow = "book" // arranca reserva
         await sock.sendMessage(jid,{text:"¿Salón? *Torremolinos* o *La Luz*."})
         setPrompt(s,"ask_sede"); SESS.set(phone,s)
       }
       return
     }
-    if(prevSede && prevSede!==s.sede){
-      s.svcKey=null; s.svcLabel=null; s.shortlist=[]
-    }
 
-    // Staff (IA -> nombre corto para mostrar, no filtra disponibilidad)
-    s.prefStaff = ai?.staff || null
-    SESS.set(phone,s)
-
-    // Servicio: si ya hay shortlist mostrada, IA decide 1 etiqueta de esa shortlist (aunque el texto sea genérico)
+    // 4) Servicio: shortlist IA -> pick IA
     if(!s.svcKey && s.shortlist.length){
       const pick = await aiChooseFromShortlist(textRaw, s.shortlist)
       if(pick){
@@ -544,35 +567,28 @@ async function startBot(){
         if(key){ s.svcKey=key; s.svcLabel=labelFromEnvKey(key) }
       }
       if(!s.svcKey){
-        // recordatorio corto
-        await sock.sendMessage(jid,{text:`Elige una de las opciones de arriba en tus palabras (vale “la primera” o simplemente el nombre).`})
+        await sock.sendMessage(jid,{text:`Elige una de las opciones de arriba en tus palabras (vale “la primera” o el nombre).`})
         return
       }
       await proposeHours(s, jid, phone, sock, ai?.date||{type:"none",day:null,part_of_day:null})
-      setPrompt(s,"hours"); SESS.set(phone,s)
+      s.flow="book"; setPrompt(s,"hours"); SESS.set(phone,s)
       return
     }
 
-    // Si aún no hay shortlist/servicio: IA genera shortlist desde la LISTA COMPLETA
     if(!s.svcKey){
-      const fullLabels = servicesForSede(s.sede).map(x=>x.label)
+      const labels = servicesForSede(s.sede).map(x=>x.label)
       let list = await aiShortlist(textRaw, s.sede)
-
-      // Si IA devolvió vacío, reintento con indicación explícita de “elige por tema”
       if(!list.length){
-        const sys = `De esta lista completa de servicios, propone hasta 6 que encajen con el tema del mensaje. Devuelve SOLO JSON {"labels":["..."]}. Lista: ${fullLabels.join(" | ")}`
+        const sys = `De esta lista completa de servicios, propone hasta 6 que encajen con el tema del mensaje. Devuelve SOLO JSON {"labels":["..."]}. Lista: ${labels.join(" | ")}`
         const out2 = await aiChat(sys, `Mensaje: "${textRaw}"`, {maxTokens: AI_TOKENS_SHORT})
         try{
           const obj2 = stripJSON(out2) || {}
-          const arr2 = Array.isArray(obj2.labels) ? obj2.labels.filter(l=>fullLabels.some(x=>x.toLowerCase()===String(l).toLowerCase())) : []
+          const arr2 = Array.isArray(obj2.labels) ? obj2.labels.filter(l=>labels.some(x=>x.toLowerCase()===String(l).toLowerCase())) : []
           list = (arr2.length?arr2:[]).slice(0,6)
         }catch{}
       }
-
       s.shortlist = list
-
       if(list.length){
-        // IA intenta auto-elegir 1 (p.ej. si el user repite “cejas” genérico)
         const autoPick = await aiChooseFromShortlist(textRaw, list)
         if(autoPick){
           const key = labelToEnvKey(autoPick, s.sede)
@@ -585,23 +601,24 @@ async function startBot(){
             return `• ${l} — ${dur} min`
           }).join("\n")
           await sock.sendMessage(jid,{text:`En ${locationNice(s.sede)} te encaja algo de esto (respóndeme en texto, p. ej. “la primera” o el nombre):\n${enriched}`})
-          setPrompt(s,"ask_service"); SESS.set(phone,s)
+          s.flow="book"; setPrompt(s,"ask_service"); SESS.set(phone,s)
           return
         }
       }else{
-        await sock.sendMessage(jid,{text:`Dímelo con un pelín más de detalle (ej. “cejas con hilo”, “laminación de cejas”, “microblading”).`})
+        s.flow="book"
+        await sock.sendMessage(jid,{text:`Dímelo con un poco más de detalle (ej. “cejas con hilo”, “laminación de cejas”, “microblading”).`})
         return
       }
     }
 
-    // Si ya hay servicio y no hemos propuesto horas recientemente…
+    // 5) Proponer horas si no lo hemos hecho recientemente
     if(s.svcKey && (!s.prompted || (Date.now()-s.lastListAt>2*60*1000))){
       await proposeHours(s, jid, phone, sock, ai?.date||{type:"none",day:null,part_of_day:null})
-      setPrompt(s,"hours"); SESS.set(phone,s)
+      s.flow="book"; setPrompt(s,"hours"); SESS.set(phone,s)
       return
     }
 
-    // Resumen si ya hay hold
+    // 6) Resumen si ya hay hold
     if(s.pickedISO){
       const picked = dayjs.tz(s.pickedISO, EURO_TZ)
       const summary = `Resumen:\n• Salón: ${locationNice(s.sede)}\n• Servicio: ${s.svcLabel}\n• Profesional: ${s.prefStaff||"Equipo"}\n• Hora: ${fmtES(picked)}\n• Duración: ${s.pickedDurMin} min\n\nAhora una de las compañeras da el OK ✅`
@@ -612,8 +629,9 @@ async function startBot(){
       return
     }
 
-    // Fallback mínimo
+    // 7) Fallback mínimo (manteniendo flujo)
     if(s.lastPrompt!=="fallback"){
+      s.flow="book"
       await sock.sendMessage(jid,{text:GREET})
       setPrompt(s,"fallback"); SESS.set(phone,s)
     }
@@ -622,7 +640,7 @@ async function startBot(){
 
 // ===== Arranque
 const server = app.listen(PORT, ()=>{ 
-  console.log(`🩷 Gapink Nails Bot v35.2.0 — DeepSeek-only · IA total · QR http://localhost:${PORT}`)
+  console.log(`🩷 Gapink Nails Bot v35.3.0 — DeepSeek-only · IA total · QR http://localhost:${PORT}`)
   startBot().catch(console.error)
 })
 process.on("SIGTERM", ()=>{ try{ server.close(()=>process.exit(0)) }catch{ process.exit(0) } })
