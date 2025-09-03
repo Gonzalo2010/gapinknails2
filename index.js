@@ -1,10 +1,12 @@
-// index.js — Gapink Nails · v35.3.0
-// IA total con flujo de reserva persistente (s.flow="book").
-// - Si estamos en reserva, ignoramos intents de ver/editar/cancelar mal detectados.
-// - IA con contexto de sesión: entiende “en torremolinos” como sede dentro del booking.
-// - Square SOLO consultar availability. No creamos cita en Square.
-// - HOLD SQLite 6h por duración de servicio (ENV SQ_DUR_*).
-// - DeepSeek-only. Mini web QR. Baileys ESM import dinámico.
+// index.js — Gapink Nails · v35.4.0
+// IA total con TOPIC persistente ("cejas"/"pestañas"/"uñas"/"faciales"/"depilación facial"/"depilación corporal").
+// - Shortlist IA restringida al topic (sin regex locales). IA-Filter de shortlist.
+// - Regeneración si el cliente reorienta el tema (p.ej. “quiero de cejas” tras shortlist equivocada).
+// - Horas SOLO tras fijar servicio. Elección de hora por IA. HOLD SQLite 6h según SQ_DUR_*.
+// - DeepSeek-only. Square solo consulta. Mini web QR. Flujo de reserva persistente (s.flow="book").
+//
+// Requisitos ENV: SQUARE_ACCESS_TOKEN, SQUARE_LOCATION_ID_TORREMOLINOS, SQUARE_LOCATION_ID_LA_LUZ
+//                 DEEPSEEK_API_KEY, SQ_SVC_*/SQ_SVC_luz_* (servicios) y sus SQ_DUR_* correspondientes.
 
 import express from "express"
 import pino from "pino"
@@ -44,7 +46,7 @@ const square = new Client({
 const LOC_TORRE = (process.env.SQUARE_LOCATION_ID_TORREMOLINOS || "").trim()
 const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "").trim()
 
-// ===== IA DeepSeek (prompts compactos)
+// ===== IA DeepSeek
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ""
 const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL || "deepseek-chat"
 const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 12000)
@@ -82,7 +84,7 @@ function stripJSON(s){
   try{ return JSON.parse(s) }catch{ return null }
 }
 
-// ===== Utils mínimos
+// ===== Utilidades
 function fmtES(d){ const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]; const t=dayjs(d).tz(EURO_TZ); return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")} ${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}` }
 function insideBusinessHours(d,mins){
   const t=dayjs(d); if(!WORK_DAYS.includes(t.day())) return false
@@ -101,7 +103,7 @@ function nextOpeningFrom(d){
 function locationToId(key){ return key==="la_luz" ? LOC_LUZ : LOC_TORRE }
 function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torremolinos" }
 
-// ===== Staff listado para IA (nombre corto)
+// ===== Staff
 function parseEmployees(){
   const out=[]
   for(const [k,v] of Object.entries(process.env)){
@@ -115,9 +117,8 @@ function parseEmployees(){
 }
 const EMPLOYEES = parseEmployees()
 function staffLabelFromId(id){ return EMPLOYEES.find(e=>e.id===id)?.short || "Equipo" }
-const STAFF_SHORT = EMPLOYEES.filter(e=>e.bookable).map(e=>e.short)
 
-// ===== Servicios por sede
+// ===== Servicios
 function servicesForSede(sedeKey){
   const prefix = (sedeKey==="la_luz") ? "SQ_SVC_luz_" : "SQ_SVC_"
   const out=[]
@@ -213,35 +214,34 @@ function createHold({ phone, sede, envServiceKey, startISO, endISO, staffId }){
   }catch(e){ if(BOT_DEBUG) console.error(e); return false }
 }
 
-// ===== IA — Router (con contexto de sesión)
+// ===== IA — Router con CONTEXTO y TOPIC
+const TOPIC_VALUES = ["cejas","pestañas","uñas","faciales","depilación facial","depilación corporal","otros"]
 function aiRouterSystem(ctx){
   const now = nowEU().format("YYYY-MM-DD HH:mm")
   return `Devuelve SOLO JSON válido (sin texto extra).
 Fecha actual: ${now} Europe/Madrid
 Sedes: ["torremolinos","la_luz"]
-Staff permitidos (si el cliente pide con alguien): ${JSON.stringify(STAFF_SHORT)}
 
-CONTEXTO:
+CONTEXTO SESIÓN:
 ${JSON.stringify(ctx)}
 
 REGLAS:
-- Si el contexto indica flujo de reserva en curso ("flow":"book") o ya se pidió cita, por defecto "intent":"book" salvo que el cliente pida explícitamente ver/editar/cancelar.
-- Mensajes cortos como "en torremolinos", "la luz", "con ganna", "viernes tarde" son complementos del booking actual (no cambian a view/edit/cancel/info).
-- Si el cliente dice "cita", "reservar", "hora", "agenda", interpreta como "book" salvo contradicción explícita.
+- Si "flow" es "book" o ya se pidió cita, por defecto "intent":"book" salvo que pida explícitamente ver/editar/cancelar.
+- Mensajes como "en torremolinos", "la luz", "con <nombre>", "viernes tarde" complementan el booking actual.
+- Detecta el TOPIC semántico del servicio en: ${JSON.stringify(TOPIC_VALUES)}. "cejas" incluye hilo, laminación, henna, microblading, polvo/ombre, hairstroke, láser, retoques. Excluye piernas/axilas/ingles/piernas/etc.
 
 Schema:
 {
  "intent":"book|view|edit|cancel|info|other",
  "sede":"torremolinos|la_luz|null",
  "staff":"string|null",
- "date":{"type":"day|range|none","day":"YYYY-MM-DD|null","part_of_day":"mañana|tarde|noche|null"}
+ "date":{"type":"day|range|none","day":"YYYY-MM-DD|null","part_of_day":"mañana|tarde|noche|null"},
+ "topic":"${TOPIC_VALUES.join("|")}"
 }
 
 Ejemplos:
-"quiero una cita pa cejas" -> {"intent":"book","sede":null,"staff":null,"date":{"type":"none","day":null,"part_of_day":null}}
-"en torremolinos" con flow=book -> {"intent":"book","sede":"torremolinos","staff":null,"date":{"type":"none","day":null,"part_of_day":null}}
-"la del martes por la mañana" con flow=book -> {"intent":"book","sede":null,"staff":null,"date":{"type":"day","day":"<proximo martes ISO>","part_of_day":"mañana"}}
-`
+"quiero una cita pa cejas" -> {"intent":"book","sede":null,"staff":null,"date":{"type":"none","day":null,"part_of_day":null},"topic":"cejas"}
+"en torremolinos" con flow=book -> {"intent":"book","sede":"torremolinos","staff":null,"date":{"type":"none","day":null,"part_of_day":null},"topic":"cejas"}`
 }
 async function aiResolve(text, ctx){
   const sys = aiRouterSystem(ctx)
@@ -249,17 +249,20 @@ async function aiResolve(text, ctx){
   return stripJSON(out) || {}
 }
 
-// ===== IA — Shortlist (desde la lista COMPLETA)
-function aiShortlistSystem(allLabels){
-  return `Elige hasta 6 etiquetas EXACTAS de esta lista que encajan con la petición del cliente.
-Si el texto es genérico ("cejas", "uñas", etc.), elige las 6 más habituales para ese tema.
+// ===== IA — Shortlist desde LISTA COMPLETA con topic lock
+function aiShortlistSystem(allLabels, topicHint){
+  const topicTxt = topicHint && TOPIC_VALUES.includes(topicHint) ? `Tema detectado: "${topicHint}".` : "Tema detectado: (intenta inferirlo)."
+  return `${topicTxt}
+Elige hasta 6 *etiquetas EXACTAS* de esta lista que encajan semánticamente con el tema.
+Si el texto del cliente es genérico (“cejas”), prioriza opciones básicas del tema.
+NO incluyas opciones de otros temas (p.ej. si es "cejas", no metas "piernas", "axilas", "pubis", etc.).
 Devuelve SOLO JSON: {"labels":["..."]}.
 Lista completa: ${allLabels.join(" | ")}`
 }
-async function aiShortlist(text, sede){
+async function aiShortlist(text, sede, topicHint=null){
   const labels = servicesForSede(sede).map(s=>s.label)
-  const sys = aiShortlistSystem(labels)
-  const out = await aiChat(sys, `Texto del cliente: "${text}"`, {maxTokens: AI_TOKENS_SHORT})
+  const sys = aiShortlistSystem(labels, topicHint)
+  const out = await aiChat(sys, `Mensaje del cliente: "${text}"`, {maxTokens: AI_TOKENS_SHORT})
   try{
     const obj = stripJSON(out) || {}
     const arr = Array.isArray(obj.labels) ? obj.labels.filter(l=>labels.some(x=>x.toLowerCase()===String(l).toLowerCase())) : []
@@ -267,10 +270,24 @@ async function aiShortlist(text, sede){
   }catch{ return [] }
 }
 
+// IA — Sanitizar shortlist contra el topic (sin reglas locales)
+async function aiFilterShortlist(shortlist, topic){
+  if(!shortlist?.length || !topic) return shortlist||[]
+  const sys = `Filtra esta lista manteniendo SOLO elementos que pertenezcan al tema "${topic}".
+Devuelve SOLO JSON: {"keep":["..."]}. keep debe ser un subconjunto exacto de "lista".
+lista=${JSON.stringify(shortlist)}`
+  const out = await aiChat(sys, "Filtra por tema.", {maxTokens: 120})
+  try{
+    const obj = stripJSON(out) || {}
+    const keep = Array.isArray(obj.keep) ? obj.keep.filter(x=>shortlist.includes(x)) : []
+    return keep.length ? keep : shortlist
+  }catch{ return shortlist }
+}
+
 // ===== IA — Elegir UN servicio de la shortlist
-async function aiChooseFromShortlist(text, shortlist){
-  const sys = `Shortlist (elige UNA etiqueta exacta): ${shortlist.join(" | ")}
-Si el cliente dice "cejas" sin más, elige la opción base más común.
+async function aiChooseFromShortlist(text, shortlist, topic){
+  const sys = `Shortlist (elige UNA etiqueta exacta)${topic?` dentro del tema "${topic}"`:""}: ${shortlist.join(" | ")}
+Si el cliente dice "la primera" o algo genérico del tema, elige la opción base más común del tema.
 Devuelve SOLO JSON: {"pick":"<una etiqueta exacta o null>"}.`
   const out = await aiChat(sys, `Frase del cliente: "${text}"`, {maxTokens: AI_TOKENS_PICK})
   try{
@@ -337,7 +354,7 @@ Dime *salón* (Torremolinos/La Luz) y qué quieres (ej. “cejas con hilo”).`
 const BOOKING_SELF = "Para *ver/editar/cancelar* usa el enlace del SMS/email de confirmación ✅"
 const bullets = slots => slots.map(s=>`• ${fmtES(s.date)}${s.staffId?` — ${staffLabelFromId(s.staffId)}`:""}`).join("\n")
 
-// ===== Estado en memoria simple
+// ===== Estado (memoria simple en proceso)
 const SESS = new Map()
 function getS(phone){
   return SESS.get(phone) || SESS.set(phone,{
@@ -345,6 +362,7 @@ function getS(phone){
     flow:null,                // "book" | null
     lastPrompt:null,
     sede:null,
+    topic:null,               // "cejas"|"pestañas"|...
     shortlist:[],
     svcKey:null, svcLabel:null,
     prefStaff:null,
@@ -355,7 +373,7 @@ function getS(phone){
 }
 function setPrompt(s, p){ s.lastPrompt=p; return s }
 
-// ===== Proponer horas (con fallbacks automáticos si no hay)
+// ===== Proponer horas (con fallbacks)
 async function proposeHours(session, jid, phone, sock, aiDate){
   if(!session.svcKey){
     await sock.sendMessage(jid,{text:`¿Qué *servicio* quieres en ${locationNice(session.sede)}? Dímelo en tus palabras o elige de lo que te proponga.`})
@@ -375,15 +393,15 @@ async function proposeHours(session, jid, phone, sock, aiDate){
     part = aiDate.part_of_day
   }
 
-  // 1) Intento principal
+  // Intento principal
   let slots = await searchAvail({ sede:session.sede, envKey:session.svcKey, startEU:start, endEU:end, part })
 
-  // 2) Fallback A: quitar franja
+  // Fallback A: quitar franja
   if(!slots.length && part){
     slots = await searchAvail({ sede:session.sede, envKey:session.svcKey, startEU:start, endEU:end, part:null })
   }
 
-  // 3) Fallback B: ampliar a 60 días, sin franja
+  // Fallback B: ampliar ventana
   if(!slots.length){
     const start2 = base.clone()
     const end2   = base.clone().add(EXTENDED_WINDOW_DAYS, "day")
@@ -492,7 +510,7 @@ async function startBot(){
       setPrompt(s,"greet"); SESS.set(phone,s)
     }
 
-    // Si ya mostramos horas y aún no hay elección -> IA decide slot y bloquea
+    // Si ya listamos horas y aún no hay elección -> IA decide slot y bloquea
     if(s.lastSlots?.length && !s.pickedISO){
       const picked = await aiPick(textRaw, s.lastSlots)
       const iso = picked?.iso || null
@@ -525,49 +543,75 @@ async function startBot(){
     const ctx = {
       flow: s.flow,               // "book" | null
       sede: s.sede,
+      topic: s.topic,
       haveShortlist: !!s.shortlist?.length,
       haveService: !!s.svcKey,
       awaiting: s.lastPrompt      // greet | ask_sede | ask_service | hours | summary | fallback
     }
     const ai = await aiResolve(textRaw, ctx)
 
-    // 1) Primero, procesa sede/staff/fecha (para no romper el flujo)
+    // 1) Sede / staff / topic
     if(ai.sede==="la_luz" || ai.sede==="torremolinos"){
       s.sede = ai.sede
     }
     if(ai?.staff){ s.prefStaff = ai.staff }
-    // si ya preguntamos algo de la reserva, marcamos flujo book
+    if(ai?.topic && TOPIC_VALUES.includes(ai.topic)){
+      // si cambia de tema y aún no hay servicio elegido, resetea shortlist para regenerar
+      if(!s.topic || (s.topic!==ai.topic && !s.svcKey)){
+        s.topic = ai.topic
+        s.shortlist = []
+      } else {
+        s.topic = ai.topic
+      }
+    }
+    // activa flujo book si corresponde
     if(!s.flow && (s.lastPrompt==="ask_sede" || s.lastPrompt==="ask_service" || s.lastPrompt==="hours")) s.flow = "book"
-    // si IA cree que es booking, activamos el flujo
     if(ai.intent==="book") s.flow = "book"
     SESS.set(phone,s)
 
-    // 2) Solo si NO estamos en flujo de reserva, atendemos view/edit/cancel/info
+    // 2) Solo si NO estamos en reserva, atender view/edit/cancel/info
     if(s.flow!=="book" && (ai.intent==="view" || ai.intent==="edit" || ai.intent==="cancel" || ai.intent==="info")){
       await sock.sendMessage(jid,{text:BOOKING_SELF})
       if(ai.intent==="view"){ s.snoozeUntil = nowEU().add(6,"hour").valueOf(); SESS.set(phone,s) }
       return
     }
 
-    // 3) Si falta sede, pídela una vez
+    // 3) Si falta sede, pídela
     if(!s.sede){
       if(s.lastPrompt!=="ask_sede"){
-        s.flow = "book" // arranca reserva
+        s.flow = "book"
         await sock.sendMessage(jid,{text:"¿Salón? *Torremolinos* o *La Luz*."})
         setPrompt(s,"ask_sede"); SESS.set(phone,s)
       }
       return
     }
 
-    // 4) Servicio: shortlist IA -> pick IA
+    // 4) Servicio: si ya hay shortlist, intenta elegir (pero filtra por topic)
     if(!s.svcKey && s.shortlist.length){
-      const pick = await aiChooseFromShortlist(textRaw, s.shortlist)
+      // filtro IA por topic (evita errores tipo “cejas”→ piernas)
+      if(s.topic){
+        const filtered = await aiFilterShortlist(s.shortlist, s.topic)
+        if(filtered.length && filtered.join("|") !== s.shortlist.join("|")){
+          s.shortlist = filtered
+        }
+        if(!s.shortlist.length){
+          // si filtró todo, forzamos regeneración basada en topic
+          s.shortlist = await aiShortlist(textRaw, s.sede, s.topic)
+        }
+      }
+      const pick = await aiChooseFromShortlist(textRaw, s.shortlist, s.topic)
       if(pick){
         const key = labelToEnvKey(pick, s.sede)
         if(key){ s.svcKey=key; s.svcLabel=labelFromEnvKey(key) }
       }
       if(!s.svcKey){
-        await sock.sendMessage(jid,{text:`Elige una de las opciones de arriba en tus palabras (vale “la primera” o el nombre).`})
+        const enriched = s.shortlist.map(l=>{
+          const env = labelToEnvKey(l, s.sede)
+          const dur = durationMinForEnvKey(env)
+          return `• ${l} — ${dur} min`
+        }).join("\n")
+        await sock.sendMessage(jid,{text:`En ${locationNice(s.sede)} te encaja algo de esto (respóndeme en texto, p. ej. “la primera” o el nombre):\n${enriched}`})
+        s.flow="book"; setPrompt(s,"ask_service"); SESS.set(phone,s)
         return
       }
       await proposeHours(s, jid, phone, sock, ai?.date||{type:"none",day:null,part_of_day:null})
@@ -575,21 +619,15 @@ async function startBot(){
       return
     }
 
+    // 5) Si aún no hay shortlist/servicio: generarla por IA (con topic lock si lo tenemos)
     if(!s.svcKey){
-      const labels = servicesForSede(s.sede).map(x=>x.label)
-      let list = await aiShortlist(textRaw, s.sede)
-      if(!list.length){
-        const sys = `De esta lista completa de servicios, propone hasta 6 que encajen con el tema del mensaje. Devuelve SOLO JSON {"labels":["..."]}. Lista: ${labels.join(" | ")}`
-        const out2 = await aiChat(sys, `Mensaje: "${textRaw}"`, {maxTokens: AI_TOKENS_SHORT})
-        try{
-          const obj2 = stripJSON(out2) || {}
-          const arr2 = Array.isArray(obj2.labels) ? obj2.labels.filter(l=>labels.some(x=>x.toLowerCase()===String(l).toLowerCase())) : []
-          list = (arr2.length?arr2:[]).slice(0,6)
-        }catch{}
+      let list = await aiShortlist(textRaw, s.sede, s.topic)
+      if(s.topic){
+        list = await aiFilterShortlist(list, s.topic)
       }
       s.shortlist = list
       if(list.length){
-        const autoPick = await aiChooseFromShortlist(textRaw, list)
+        const autoPick = await aiChooseFromShortlist(textRaw, list, s.topic)
         if(autoPick){
           const key = labelToEnvKey(autoPick, s.sede)
           if(key){ s.svcKey=key; s.svcLabel=labelFromEnvKey(key) }
@@ -606,19 +644,19 @@ async function startBot(){
         }
       }else{
         s.flow="book"
-        await sock.sendMessage(jid,{text:`Dímelo con un poco más de detalle (ej. “cejas con hilo”, “laminación de cejas”, “microblading”).`})
+        await sock.sendMessage(jid,{text:`Dímelo con un poco más de detalle (p. ej. “cejas con hilo”, “laminación de cejas”, “microblading”).`})
         return
       }
     }
 
-    // 5) Proponer horas si no lo hemos hecho recientemente
+    // 6) Proponer horas si aún no las hemos pasado
     if(s.svcKey && (!s.prompted || (Date.now()-s.lastListAt>2*60*1000))){
       await proposeHours(s, jid, phone, sock, ai?.date||{type:"none",day:null,part_of_day:null})
       s.flow="book"; setPrompt(s,"hours"); SESS.set(phone,s)
       return
     }
 
-    // 6) Resumen si ya hay hold
+    // 7) Resumen si ya hay hold
     if(s.pickedISO){
       const picked = dayjs.tz(s.pickedISO, EURO_TZ)
       const summary = `Resumen:\n• Salón: ${locationNice(s.sede)}\n• Servicio: ${s.svcLabel}\n• Profesional: ${s.prefStaff||"Equipo"}\n• Hora: ${fmtES(picked)}\n• Duración: ${s.pickedDurMin} min\n\nAhora una de las compañeras da el OK ✅`
@@ -629,7 +667,7 @@ async function startBot(){
       return
     }
 
-    // 7) Fallback mínimo (manteniendo flujo)
+    // 8) Fallback manteniendo flujo
     if(s.lastPrompt!=="fallback"){
       s.flow="book"
       await sock.sendMessage(jid,{text:GREET})
@@ -640,7 +678,7 @@ async function startBot(){
 
 // ===== Arranque
 const server = app.listen(PORT, ()=>{ 
-  console.log(`🩷 Gapink Nails Bot v35.3.0 — DeepSeek-only · IA total · QR http://localhost:${PORT}`)
+  console.log(`🩷 Gapink Nails Bot v35.4.0 — DeepSeek-only · IA topic-lock · QR http://localhost:${PORT}`)
   startBot().catch(console.error)
 })
 process.on("SIGTERM", ()=>{ try{ server.close(()=>process.exit(0)) }catch{ process.exit(0) } })
