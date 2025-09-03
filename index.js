@@ -1,12 +1,9 @@
-// index.js — Gapink Nails · v34.1.1 (DeepSeek-only + Mini Web QR + ESM fix)
-// - IA: SOLO DeepSeek (sin OpenAI).
-// - Duración por servicio desde ENV (SQ_DUR_* / SQ_DUR_luz_*).
-// - Bloqueos (HOLD) en SQLite durante 6h al elegir un hueco (sin tocar Square).
-// - Lista de horas sin números; el cliente elige con frases (“la del martes”, “a las 13”…).
-// - Mini web con estado y QR en /  y /qr.png.
-// - Square: solo searchAvailability (no se crea ni modifica nada).
-// - FIX: Baileys se importa con dynamic import (ESM), no con require().
+// index.js — Gapink Nails · v34.1.2
+// DeepSeek-only + Mini Web QR + Holds SQLite 6h + Duraciones por ENV
+// FIX: NUNCA propone horas si no hay servicio elegido (s.svcKey).
+//      Si el cliente dice solo el salón, pedimos servicio y paramos.
 
+// ===== Imports
 import express from "express"
 import pino from "pino"
 import qrcode from "qrcode"
@@ -26,7 +23,7 @@ dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isoWeek); dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
 const nowEU = () => dayjs().tz(EURO_TZ)
 
-// ===== Config básica
+// ===== Config
 const OPEN = { start: 9, end: 20 }               // L–V 09:00–20:00
 const WORK_DAYS = [1,2,3,4,5]
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 30)
@@ -87,7 +84,6 @@ function stripJSON(s){
 
 // ===== Utils
 const norm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase()
-function stableKey(parts){ return createHash("sha256").update(Object.values(parts).join("|")).digest("hex").slice(0,32) }
 function locationToId(key){ return key==="la_luz" ? LOC_LUZ : LOC_TORRE }
 function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torremolinos" }
 function fmtES(d){ const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]; const t=dayjs(d).tz(EURO_TZ); return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")} ${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}` }
@@ -288,7 +284,7 @@ async function aiPick(text, slots){
 
 // ===== Mensajes cortos
 const GREET = `¡Hola! Soy el asistente de Gapink Nails 💅
-Dime salón (Torremolinos/La Luz), servicio y día/franja.`
+Dime *salón* (Torremolinos/La Luz) y *servicio*. Luego te paso horas.`
 const BOOKING_SELF = "Para *ver/editar/cancelar* usa el enlace del SMS/email de confirmación ✅"
 
 // ===== Estado en memoria
@@ -305,12 +301,27 @@ function getS(phone){
   }).get(phone)
 }
 
+// ===== Helpers: validar servicio con sede
+function ensureSvcKeyForSede(s){
+  if(!s.svcKey || !s.sede) return s
+  const ok = !!labelFromEnvKey(s.svcKey) && servicesForSede(s.sede).some(x=>x.key===s.svcKey)
+  if(!ok){ s.svcKey=null; s.svcLabel=null; s.lastSlots=[]; s.prompted=false }
+  return s
+}
+
 // ===== Formateo de lista sin números
 const formatSlots = (slots, showNames=false) =>
   slots.map(s=>`• ${fmtES(s.date)}${showNames && s.staffId?` — ${staffLabelFromId(s.staffId)}`:""}`).join("\n")
 
 // ===== Proponer una tanda (respeta duración y holds)
 async function proposeOnce(session, jid, phone, sock, {text,date_hint,part}){
+  // Seguridad extra: si no hay servicio, NO proponemos
+  if(!session.svcKey){
+    const labels = listLabels(session.sede)
+    await sock.sendMessage(jid,{text:`¿Qué *servicio* quieres en ${locationNice(session.sede)}?\n${labels.map(l=>"• "+l).join("\n")}\n\nEscribe el nombre exacto del servicio.`})
+    return
+  }
+
   const now = nowEU()
   const base = nextOpeningFrom(now.add(NOW_MIN_OFFSET_MIN,"minute"))
   let start = base.clone(), end = base.clone().add(SEARCH_WINDOW_DAYS,"day")
@@ -372,7 +383,6 @@ app.get("/", (_req,res)=>{
     <footer>Puerto ${PORT} · ${new Date().toLocaleString("es-ES",{ timeZone: "Europe/Madrid" })}</footer>
   </div>`)
 })
-
 app.get("/qr.png", async (_req,res)=>{
   if(!lastQR) return res.status(404).send("No QR")
   try{
@@ -381,9 +391,8 @@ app.get("/qr.png", async (_req,res)=>{
   }catch{ res.status(500).send("QR error") }
 })
 
-// ===== Baileys (ESM dynamic import — FIX)
+// ===== Baileys (ESM dynamic import)
 async function loadBaileys(){
-  // Baileys es ESM. Nada de require(); usamos import() dinámico.
   const mod = await import("@whiskeysockets/baileys")
   const makeWASocket = mod.makeWASocket ?? mod.default?.makeWASocket ?? mod.default
   const useMultiFileAuthState = mod.useMultiFileAuthState ?? mod.default?.useMultiFileAuthState
@@ -416,11 +425,10 @@ async function startBot(){
     const jid = m.key.remoteJid
     const isFromMe = !!m.key.fromMe
     const phone = (jid||"").split("@")[0]
-
     const text = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
     if(!text) return
 
-    // Silencio 6h si manda puntitos (tú o cliente)
+    // Silencio 6h si manda puntitos
     if(/^[\s.·•⋅]+$/.test(text)){
       const s=getS(phone); s.snoozeUntil=nowEU().add(6,"hour").valueOf(); SESS.set(phone,s)
       if(!isFromMe) return
@@ -431,13 +439,13 @@ async function startBot(){
     const s = getS(phone)
     if(s.snoozeUntil && Date.now()<s.snoozeUntil) return
 
-    // Saludo cada 24h máx
+    // Saludo 24h
     if(Date.now()-s.greetedAt > 24*60*60*1000){
       s.greetedAt = Date.now(); SESS.set(phone,s)
       await sock.sendMessage(jid,{text:GREET})
     }
 
-    // Si ya mostramos lista y no hay hora -> IA intenta elegir y BLOQUEAR
+    // 0) Si ya hay lista y no hay hora -> IA intenta elegir y BLOQUEAR
     if(s.lastSlots?.length && !s.pickedISO){
       const pick = await aiPick(text, s.lastSlots)
       const iso = pick?.iso || null
@@ -449,7 +457,7 @@ async function startBot(){
           const endISO   = hit.date.clone().add(durMin,"minute").tz("UTC").toISOString()
           cleanupHolds()
           if (hasActiveOverlap({ sede:s.sede, startISO, endISO })){
-            await sock.sendMessage(jid,{text:"Ese hueco acaba de ser reservado por otra conversación. Te paso alternativas:"})
+            await sock.sendMessage(jid,{text:"Ese hueco se acaba de bloquear por otra conversación. Te paso alternativas:"})
             await proposeOnce(s, jid, phone, sock, { text, date_hint:null, part:null })
             return
           }
@@ -466,10 +474,10 @@ async function startBot(){
       }
     }
 
-    // IA router (intención / sede / servicio / franja)
+    // 1) IA router (extrae sede/servicio/franja/opcional staff)
     const ai = await aiResolve(text)
 
-    // Intentos de ver/editar/cancelar/info -> auto texto
+    // “ver/editar/cancelar/info”
     if(ai.intent==="view"){
       await sock.sendMessage(jid,{text:`Si ya tienes cita, revísala desde el SMS/email de confirmación.\n\n${BOOKING_SELF}`})
       s.snoozeUntil = nowEU().add(6,"hour").valueOf(); SESS.set(phone,s); return
@@ -479,8 +487,10 @@ async function startBot(){
     }
 
     // Sede
+    const prevSede = s.sede
     if(ai.sede==="la_luz" || ai.sede==="torremolinos") s.sede = ai.sede
     if(!s.sede){ await sock.sendMessage(jid,{text:"¿Salón? Torremolinos o La Luz."}); return }
+    if(prevSede && prevSede!==s.sede){ ensureSvcKeyForSede(s) } // si cambia sede, limpiamos servicio incompatible
 
     // Profesional opcional
     if(ai.staff_name){
@@ -489,7 +499,7 @@ async function startBot(){
       if(found){ s.prefStaffId=found.id; s.prefStaffLabel=found.label.split(" ")[0] }
     }
 
-    // Servicio (IA intenta; si no, lista etiquetas exactas)
+    // Servicio (IA intenta mapear)
     if(!s.svcKey){
       const label = ai.service_label || null
       if(label){
@@ -498,37 +508,38 @@ async function startBot(){
       }
       if(!s.svcKey){
         const labels = listLabels(s.sede)
-        await sock.sendMessage(jid,{text:`Servicios en ${locationNice(s.sede)}:\n${labels.map(l=>"• "+l).join("\n")}\n\nEscribe el *nombre exacto* del servicio.`})
-        return
+        await sock.sendMessage(jid,{text:`¿Qué *servicio* quieres en ${locationNice(s.sede)}?\n${labels.map(l=>"• "+l).join("\n")}\n\nEscribe el nombre exacto del servicio.`})
+        SESS.set(phone,s); return
       }
     } else {
+      // Si escriben luego el nombre exacto, re-mapeamos
       const keyTry = labelToEnvKey(text, s.sede)
       if(keyTry){ s.svcKey=keyTry; s.svcLabel=labelFromEnvKey(keyTry) }
     }
 
     SESS.set(phone,s)
 
-    // Proponer huecos (una tanda) si no hay hora elegida
+    // 2) Proponer huecos (solo si HAY servicio)
     const wantMore = /\b(otra|mas|m[aá]s|ver horarios?)\b/i.test(norm(text))
-    if(!s.pickedISO && (!s.prompted || wantMore || (Date.now()-s.lastListAt>2*60*1000))){
+    if(!s.pickedISO && s.svcKey && (!s.prompted || wantMore || (Date.now()-s.lastListAt>2*60*1000))){
       await proposeOnce(s, jid, phone, sock, { text, date_hint: ai.date_hint||null, part: ai.part_of_day||null })
       return
     }
 
-    // Resumen final (ya bloqueado 6h)
+    // 3) Resumen (si ya hay hora)
     if(s.pickedISO){
       const picked = dayjs.tz(s.pickedISO, EURO_TZ)
       const staff = s.prefStaffLabel ? s.prefStaffLabel : "Equipo"
       const summary = `Resumen:\n• Salón: ${locationNice(s.sede)}\n• Servicio: ${s.svcLabel}\n• Profesional: ${staff}\n• Hora: ${fmtES(picked)}\n• Duración: ${s.pickedDurMin} min\n\nAhora una de las compañeras da el OK ✅`
       await sock.sendMessage(jid,{text:summary})
-      // reset suave
+      // reset suave (mantenemos sede/servicio por si quiere “otra tarde”)
       s.lastSlots = []; s.lastMap={}; s.prompted=false; s.pickedISO=null
       SESS.set(phone,s)
       return
     }
 
-    // Si aún no eligió
-    if(s.prompted){
+    // 4) Si aún no eligió hora pero ya se listaron, recordatorio corto
+    if(s.prompted && s.svcKey){
       await sock.sendMessage(jid,{text:"Dime la hora/frase (p. ej. “la del martes” o “la de las 13”)."})
       return
     }
@@ -540,7 +551,7 @@ async function startBot(){
 
 // ===== Arranque
 const server = app.listen(PORT, ()=>{ 
-  console.log(`🩷 Gapink Nails Bot v34.1.1 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
+  console.log(`🩷 Gapink Nails Bot v34.1.2 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
   startBot().catch(console.error)
 })
 process.on("SIGTERM", ()=>{ try{ server.close(()=>process.exit(0)) }catch{ process.exit(0) } })
