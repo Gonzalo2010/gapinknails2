@@ -1,12 +1,8 @@
-// index.js — Gapink Nails · v35.4.0
-// IA total con TOPIC persistente ("cejas"/"pestañas"/"uñas"/"faciales"/"depilación facial"/"depilación corporal").
-// - Shortlist IA restringida al topic (sin regex locales). IA-Filter de shortlist.
-// - Regeneración si el cliente reorienta el tema (p.ej. “quiero de cejas” tras shortlist equivocada).
-// - Horas SOLO tras fijar servicio. Elección de hora por IA. HOLD SQLite 6h según SQ_DUR_*.
-// - DeepSeek-only. Square solo consulta. Mini web QR. Flujo de reserva persistente (s.flow="book").
-//
-// Requisitos ENV: SQUARE_ACCESS_TOKEN, SQUARE_LOCATION_ID_TORREMOLINOS, SQUARE_LOCATION_ID_LA_LUZ
-//                 DEEPSEEK_API_KEY, SQ_SVC_*/SQ_SVC_luz_* (servicios) y sus SQ_DUR_* correspondientes.
+// index.js — Gapink Nails · v35.5.0
+// IA total + Topic-Lock “cejas” -> shortlist inmediata tras elegir salón.
+// - DeepSeek-only. Mini web QR. Square solo consulta availability.
+// - HOLD SQLite 6h por duración SQ_DUR_*.
+// - Flujo de reserva persistente (s.flow="book") + elección de hora por IA.
 
 import express from "express"
 import pino from "pino"
@@ -50,9 +46,9 @@ const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "").trim()
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ""
 const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL || "deepseek-chat"
 const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 12000)
-const AI_TOKENS_ROUTER = Number(process.env.AI_TOKENS_ROUTER || 160)
-const AI_TOKENS_SHORT  = Number(process.env.AI_TOKENS_SHORT  || 220)
-const AI_TOKENS_PICK   = Number(process.env.AI_TOKENS_PICK   || 140)
+const AI_TOKENS_ROUTER = Number(process.env.AI_TOKENS_ROUTER || 150)
+const AI_TOKENS_SHORT  = Number(process.env.AI_TOKENS_SHORT  || 200)
+const AI_TOKENS_PICK   = Number(process.env.AI_TOKENS_PICK   || 130)
 
 async function aiChat(system, user, {maxTokens=160, temperature=0.15} = {}){
   if(!DEEPSEEK_API_KEY) return null
@@ -222,13 +218,15 @@ function aiRouterSystem(ctx){
 Fecha actual: ${now} Europe/Madrid
 Sedes: ["torremolinos","la_luz"]
 
-CONTEXTO SESIÓN:
+CONTEXTO:
 ${JSON.stringify(ctx)}
 
 REGLAS:
 - Si "flow" es "book" o ya se pidió cita, por defecto "intent":"book" salvo que pida explícitamente ver/editar/cancelar.
 - Mensajes como "en torremolinos", "la luz", "con <nombre>", "viernes tarde" complementan el booking actual.
-- Detecta el TOPIC semántico del servicio en: ${JSON.stringify(TOPIC_VALUES)}. "cejas" incluye hilo, laminación, henna, microblading, polvo/ombre, hairstroke, láser, retoques. Excluye piernas/axilas/ingles/piernas/etc.
+- Detecta TOPIC en: ${JSON.stringify(TOPIC_VALUES)}. 
+  • "cejas": depilación cejas (hilo/pinza), diseño/henna/laminación, microblading, microshading/efecto polvo, hairstroke, láser cejas, retoques. 
+  • NO confundir con fotodepilación facial/corporal (piernas/axilas/ingles/pubis/brazos/labio/fosas).
 
 Schema:
 {
@@ -237,11 +235,7 @@ Schema:
  "staff":"string|null",
  "date":{"type":"day|range|none","day":"YYYY-MM-DD|null","part_of_day":"mañana|tarde|noche|null"},
  "topic":"${TOPIC_VALUES.join("|")}"
-}
-
-Ejemplos:
-"quiero una cita pa cejas" -> {"intent":"book","sede":null,"staff":null,"date":{"type":"none","day":null,"part_of_day":null},"topic":"cejas"}
-"en torremolinos" con flow=book -> {"intent":"book","sede":"torremolinos","staff":null,"date":{"type":"none","day":null,"part_of_day":null},"topic":"cejas"}`
+}`
 }
 async function aiResolve(text, ctx){
   const sys = aiRouterSystem(ctx)
@@ -249,13 +243,16 @@ async function aiResolve(text, ctx){
   return stripJSON(out) || {}
 }
 
-// ===== IA — Shortlist desde LISTA COMPLETA con topic lock
+// ===== IA — Shortlist con topic lock (refuerzo “cejas”)
 function aiShortlistSystem(allLabels, topicHint){
-  const topicTxt = topicHint && TOPIC_VALUES.includes(topicHint) ? `Tema detectado: "${topicHint}".` : "Tema detectado: (intenta inferirlo)."
+  const topicTxt = topicHint && TOPIC_VALUES.includes(topicHint) ? `Tema: "${topicHint}".` : "Tema: (inferir)."
+  const strongRules = topicHint==="cejas" 
+    ? `Incluye SOLO cejas: depilación de cejas (hilo o pinza), diseño de cejas, henna, laminación, microblading, microshading/efecto polvo, hairstroke, láser cejas, retoques de cejas. 
+       EXCLUYE: piernas, axilas, ingles, pubis, brazos, facial completo, labio, fosas nasales, pestañas, uñas, masajes.`
+    : `Ajusta semánticamente al tema; excluye categorías que no pertenezcan al tema.`
   return `${topicTxt}
-Elige hasta 6 *etiquetas EXACTAS* de esta lista que encajan semánticamente con el tema.
-Si el texto del cliente es genérico (“cejas”), prioriza opciones básicas del tema.
-NO incluyas opciones de otros temas (p.ej. si es "cejas", no metas "piernas", "axilas", "pubis", etc.).
+${strongRules}
+De la lista completa, elige hasta 6 ETIQUETAS EXACTAS que encajen con el tema.
 Devuelve SOLO JSON: {"labels":["..."]}.
 Lista completa: ${allLabels.join(" | ")}`
 }
@@ -270,13 +267,14 @@ async function aiShortlist(text, sede, topicHint=null){
   }catch{ return [] }
 }
 
-// IA — Sanitizar shortlist contra el topic (sin reglas locales)
+// IA — Refinar shortlist contra topic
 async function aiFilterShortlist(shortlist, topic){
   if(!shortlist?.length || !topic) return shortlist||[]
-  const sys = `Filtra esta lista manteniendo SOLO elementos que pertenezcan al tema "${topic}".
+  const extra = topic==="cejas" ? "Recuerda excluir fotodepilación corporal/facial, labio, fosas." : ""
+  const sys = `Filtra esta lista manteniendo SOLO elementos del tema "${topic}". ${extra}
 Devuelve SOLO JSON: {"keep":["..."]}. keep debe ser un subconjunto exacto de "lista".
 lista=${JSON.stringify(shortlist)}`
-  const out = await aiChat(sys, "Filtra por tema.", {maxTokens: 120})
+  const out = await aiChat(sys, "Filtra por tema.", {maxTokens: 110})
   try{
     const obj = stripJSON(out) || {}
     const keep = Array.isArray(obj.keep) ? obj.keep.filter(x=>shortlist.includes(x)) : []
@@ -284,7 +282,7 @@ lista=${JSON.stringify(shortlist)}`
   }catch{ return shortlist }
 }
 
-// ===== IA — Elegir UN servicio de la shortlist
+// ===== IA — Elegir UN servicio
 async function aiChooseFromShortlist(text, shortlist, topic){
   const sys = `Shortlist (elige UNA etiqueta exacta)${topic?` dentro del tema "${topic}"`:""}: ${shortlist.join(" | ")}
 Si el cliente dice "la primera" o algo genérico del tema, elige la opción base más común del tema.
@@ -304,7 +302,7 @@ function aiPickSystem(slots){
     return { iso:d.format("YYYY-MM-DDTHH:mm"), dow:["do","lu","ma","mi","ju","vi","sa"][d.day()], ddmm:`${String(d.date()).padStart(2,"0")}/${String(d.month()+1).padStart(2,"0")}`, time:`${String(d.hour()).padStart(2,"0")}:${String(d.minute()).padStart(2,"0")}` }
   })
   return `Elige un "iso" de la lista que encaje con la frase del cliente. Devuelve SOLO JSON {"iso":"YYYY-MM-DDTHH:mm|null"}.
-Frases tipo: "la del martes", "la de las 13", "la primera", "la última", "otra tarde".
+Frases: "la del martes", "la de las 13", "la primera", "otra tarde".
 slots=${JSON.stringify(comp)}`
 }
 async function aiPick(text, slots){
@@ -314,7 +312,7 @@ async function aiPick(text, slots){
   return stripJSON(out) || { iso:null }
 }
 
-// ===== Disponibilidad (respeta duración + holds) con fallbacks
+// ===== Disponibilidad (respeta duración + holds)
 async function searchAvail({ sede, envKey, startEU, endEU, part=null }){
   const sv = await getServiceIdAndVersion(envKey); if(!sv) return []
   const durMin = durationMinForEnvKey(envKey)
@@ -348,13 +346,13 @@ async function searchAvail({ sede, envKey, startEU, endEU, part=null }){
   return out.sort((x,y)=>x.date.valueOf()-y.date.valueOf())
 }
 
-// ===== Mensajes UX
+// ===== UX
 const GREET = `¡Hola! Soy el asistente de Gapink Nails 💅
 Dime *salón* (Torremolinos/La Luz) y qué quieres (ej. “cejas con hilo”).`
 const BOOKING_SELF = "Para *ver/editar/cancelar* usa el enlace del SMS/email de confirmación ✅"
 const bullets = slots => slots.map(s=>`• ${fmtES(s.date)}${s.staffId?` — ${staffLabelFromId(s.staffId)}`:""}`).join("\n")
 
-// ===== Estado (memoria simple en proceso)
+// ===== Sesión (memoria en proceso)
 const SESS = new Map()
 function getS(phone){
   return SESS.get(phone) || SESS.set(phone,{
@@ -362,7 +360,7 @@ function getS(phone){
     flow:null,                // "book" | null
     lastPrompt:null,
     sede:null,
-    topic:null,               // "cejas"|"pestañas"|...
+    topic:null,               // "cejas"|...
     shortlist:[],
     svcKey:null, svcLabel:null,
     prefStaff:null,
@@ -373,7 +371,20 @@ function getS(phone){
 }
 function setPrompt(s, p){ s.lastPrompt=p; return s }
 
-// ===== Proponer horas (con fallbacks)
+// ===== Presentar shortlist enriquecida (duración)
+async function presentShortlist(s, jid, sock){
+  if(!s.shortlist?.length) return false
+  const enriched = s.shortlist.map(l=>{
+    const env = labelToEnvKey(l, s.sede)
+    const dur = durationMinForEnvKey(env)
+    return `• ${l} — ${dur} min`
+  }).join("\n")
+  await sock.sendMessage(jid,{text:`En ${locationNice(s.sede)} te encaja algo de esto (respóndeme en texto, p. ej. “la primera” o el nombre):\n${enriched}`})
+  s.flow="book"; setPrompt(s,"ask_service"); SESS.set(s.phone,s)
+  return true
+}
+
+// ===== Proponer horas
 async function proposeHours(session, jid, phone, sock, aiDate){
   if(!session.svcKey){
     await sock.sendMessage(jid,{text:`¿Qué *servicio* quieres en ${locationNice(session.sede)}? Dímelo en tus palabras o elige de lo que te proponga.`})
@@ -393,23 +404,17 @@ async function proposeHours(session, jid, phone, sock, aiDate){
     part = aiDate.part_of_day
   }
 
-  // Intento principal
   let slots = await searchAvail({ sede:session.sede, envKey:session.svcKey, startEU:start, endEU:end, part })
 
-  // Fallback A: quitar franja
   if(!slots.length && part){
     slots = await searchAvail({ sede:session.sede, envKey:session.svcKey, startEU:start, endEU:end, part:null })
   }
-
-  // Fallback B: ampliar ventana
   if(!slots.length){
-    const start2 = base.clone()
-    const end2   = base.clone().add(EXTENDED_WINDOW_DAYS, "day")
+    const start2 = base.clone(), end2 = base.clone().add(EXTENDED_WINDOW_DAYS, "day")
     slots = await searchAvail({ sede:session.sede, envKey:session.svcKey, startEU:start2, endEU:end2, part:null })
   }
-
   if(!slots.length){
-    await sock.sendMessage(jid,{text:"Ahora mismo no veo huecos. Dime otra fecha/franja en tus palabras (p. ej. “viernes tarde”) y lo miro de nuevo."})
+    await sock.sendMessage(jid,{text:"Ahora mismo no veo huecos. Dime otra fecha/franja (p. ej. “viernes tarde”) y lo miro de nuevo."})
     return
   }
 
@@ -492,7 +497,7 @@ async function startBot(){
     const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
     if(!textRaw) return
 
-    // Puntitos => silencio 6h (cliente y tú); si lo mandas tú, no responder.
+    // Puntitos => silencio 6h
     if(/^[\s.·•⋅]+$/.test(textRaw)){
       const s=getS(phone); s.snoozeUntil=nowEU().add(6,"hour").valueOf(); SESS.set(phone,s)
       if(!isFromMe) return
@@ -500,7 +505,7 @@ async function startBot(){
     }
     if(isFromMe) return
 
-    const s = getS(phone)
+    const s = getS(phone); s.phone = phone
     if(s.snoozeUntil && Date.now()<s.snoozeUntil) return
 
     // Saludo 24h
@@ -541,35 +546,26 @@ async function startBot(){
 
     // ===== IA Router con CONTEXTO
     const ctx = {
-      flow: s.flow,               // "book" | null
+      flow: s.flow,               
       sede: s.sede,
       topic: s.topic,
       haveShortlist: !!s.shortlist?.length,
       haveService: !!s.svcKey,
-      awaiting: s.lastPrompt      // greet | ask_sede | ask_service | hours | summary | fallback
+      awaiting: s.lastPrompt      
     }
     const ai = await aiResolve(textRaw, ctx)
 
     // 1) Sede / staff / topic
-    if(ai.sede==="la_luz" || ai.sede==="torremolinos"){
-      s.sede = ai.sede
-    }
+    if(ai.sede==="la_luz" || ai.sede==="torremolinos"){ s.sede = ai.sede }
     if(ai?.staff){ s.prefStaff = ai.staff }
     if(ai?.topic && TOPIC_VALUES.includes(ai.topic)){
-      // si cambia de tema y aún no hay servicio elegido, resetea shortlist para regenerar
-      if(!s.topic || (s.topic!==ai.topic && !s.svcKey)){
-        s.topic = ai.topic
-        s.shortlist = []
-      } else {
-        s.topic = ai.topic
-      }
+      if(!s.topic || (s.topic!==ai.topic && !s.svcKey)){ s.topic = ai.topic; s.shortlist = [] } else { s.topic = ai.topic }
     }
-    // activa flujo book si corresponde
     if(!s.flow && (s.lastPrompt==="ask_sede" || s.lastPrompt==="ask_service" || s.lastPrompt==="hours")) s.flow = "book"
     if(ai.intent==="book") s.flow = "book"
     SESS.set(phone,s)
 
-    // 2) Solo si NO estamos en reserva, atender view/edit/cancel/info
+    // 2) Fuera de reserva → autogestión
     if(s.flow!=="book" && (ai.intent==="view" || ai.intent==="edit" || ai.intent==="cancel" || ai.intent==="info")){
       await sock.sendMessage(jid,{text:BOOKING_SELF})
       if(ai.intent==="view"){ s.snoozeUntil = nowEU().add(6,"hour").valueOf(); SESS.set(phone,s) }
@@ -586,32 +582,42 @@ async function startBot(){
       return
     }
 
-    // 4) Servicio: si ya hay shortlist, intenta elegir (pero filtra por topic)
-    if(!s.svcKey && s.shortlist.length){
-      // filtro IA por topic (evita errores tipo “cejas”→ piernas)
-      if(s.topic){
-        const filtered = await aiFilterShortlist(s.shortlist, s.topic)
-        if(filtered.length && filtered.join("|") !== s.shortlist.join("|")){
-          s.shortlist = filtered
-        }
-        if(!s.shortlist.length){
-          // si filtró todo, forzamos regeneración basada en topic
-          s.shortlist = await aiShortlist(textRaw, s.sede, s.topic)
-        }
+    // *** NUEVO: si el topic es "cejas" y aún no hay servicio, auto-lista tras fijar salón ***
+    if(s.topic==="cejas" && !s.svcKey){
+      if(!s.shortlist.length){
+        let list = await aiShortlist(textRaw, s.sede, "cejas")
+        list = await aiFilterShortlist(list, "cejas")
+        s.shortlist = list
       }
+      if(s.shortlist.length){
+        // intento de autopick si el usuario ya dijo "cejas" a secas
+        const autoPick = await aiChooseFromShortlist(textRaw, s.shortlist, "cejas")
+        if(autoPick){
+          const key = labelToEnvKey(autoPick, s.sede)
+          if(key){ s.svcKey=key; s.svcLabel=labelFromEnvKey(key) }
+        }
+        if(!s.svcKey){
+          await presentShortlist(s, jid, sock)
+          return
+        }
+      } else {
+        // si la IA no consigue shortlist, pide detalle pero seguimos en cejas
+        await sock.sendMessage(jid,{text:`Dímelo con un poco más de detalle (p. ej. “cejas con hilo”, “laminación de cejas”, “microblading”).`})
+        s.flow="book"; setPrompt(s,"ask_service"); SESS.set(phone,s)
+        return
+      }
+    }
+
+    // 4) Servicio: si ya hay shortlist, intenta elegir (filtrada por topic si existe)
+    if(!s.svcKey && s.shortlist.length){
+      if(s.topic){ s.shortlist = await aiFilterShortlist(s.shortlist, s.topic) }
       const pick = await aiChooseFromShortlist(textRaw, s.shortlist, s.topic)
       if(pick){
         const key = labelToEnvKey(pick, s.sede)
         if(key){ s.svcKey=key; s.svcLabel=labelFromEnvKey(key) }
       }
       if(!s.svcKey){
-        const enriched = s.shortlist.map(l=>{
-          const env = labelToEnvKey(l, s.sede)
-          const dur = durationMinForEnvKey(env)
-          return `• ${l} — ${dur} min`
-        }).join("\n")
-        await sock.sendMessage(jid,{text:`En ${locationNice(s.sede)} te encaja algo de esto (respóndeme en texto, p. ej. “la primera” o el nombre):\n${enriched}`})
-        s.flow="book"; setPrompt(s,"ask_service"); SESS.set(phone,s)
+        await presentShortlist(s, jid, sock)
         return
       }
       await proposeHours(s, jid, phone, sock, ai?.date||{type:"none",day:null,part_of_day:null})
@@ -622,9 +628,7 @@ async function startBot(){
     // 5) Si aún no hay shortlist/servicio: generarla por IA (con topic lock si lo tenemos)
     if(!s.svcKey){
       let list = await aiShortlist(textRaw, s.sede, s.topic)
-      if(s.topic){
-        list = await aiFilterShortlist(list, s.topic)
-      }
+      if(s.topic){ list = await aiFilterShortlist(list, s.topic) }
       s.shortlist = list
       if(list.length){
         const autoPick = await aiChooseFromShortlist(textRaw, list, s.topic)
@@ -633,13 +637,7 @@ async function startBot(){
           if(key){ s.svcKey=key; s.svcLabel=labelFromEnvKey(key) }
         }
         if(!s.svcKey){
-          const enriched = list.map(l=>{
-            const env = labelToEnvKey(l, s.sede)
-            const dur = durationMinForEnvKey(env)
-            return `• ${l} — ${dur} min`
-          }).join("\n")
-          await sock.sendMessage(jid,{text:`En ${locationNice(s.sede)} te encaja algo de esto (respóndeme en texto, p. ej. “la primera” o el nombre):\n${enriched}`})
-          s.flow="book"; setPrompt(s,"ask_service"); SESS.set(phone,s)
+          await presentShortlist(s, jid, sock)
           return
         }
       }else{
@@ -678,7 +676,7 @@ async function startBot(){
 
 // ===== Arranque
 const server = app.listen(PORT, ()=>{ 
-  console.log(`🩷 Gapink Nails Bot v35.4.0 — DeepSeek-only · IA topic-lock · QR http://localhost:${PORT}`)
+  console.log(`🩷 Gapink Nails Bot v35.5.0 — DeepSeek-only · Auto-list Cejas · QR http://localhost:${PORT}`)
   startBot().catch(console.error)
 })
 process.on("SIGTERM", ()=>{ try{ server.close(()=>process.exit(0)) }catch{ process.exit(0) } })
