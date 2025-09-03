@@ -1,8 +1,8 @@
-// index.js — Gapink Nails · v34.2.0
-// DeepSeek-only · IA en TODO (intención + shortlist servicio + elección hueco) · Holds SQLite 6h
-// Sin listados kilométricos; se propone shortlist inteligente por categoría (p. ej. “cejas”).
-// Mini web QR en / y /qr.png. Square solo se consulta (searchAvailability).
-// Baileys ESM via dynamic import.
+// index.js — Gapink Nails · v34.3.0
+// DeepSeek-only · IA en TODO con mejor comprensión + shortlist inteligente
+// Prefiltro semántico (fuzzy+sinónimos) -> IA (top 6) -> elección natural de hora (sin números)
+// Holds SQLite 6h por duración (ENV SQ_DUR_*). Square solo para consultar availability.
+// Mini web QR. Baileys ESM por dynamic import.
 
 // ===== Imports
 import express from "express"
@@ -15,7 +15,7 @@ import utc from "dayjs/plugin/utc.js"
 import tz from "dayjs/plugin/timezone.js"
 import isoWeek from "dayjs/plugin/isoWeek.js"
 import "dayjs/locale/es.js"
-import { webcrypto, createHash } from "crypto"
+import { webcrypto } from "crypto"
 import Database from "better-sqlite3"
 import { Client, Environment } from "square"
 
@@ -42,11 +42,11 @@ const square = new Client({
 const LOC_TORRE = (process.env.SQUARE_LOCATION_ID_TORREMOLINOS || "").trim()
 const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "").trim()
 
-// ===== IA (DeepSeek only)
+// ===== IA (DeepSeek only; prompts compactos para ahorrar tokens)
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ""
 const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL || "deepseek-chat"
-const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 220)
-const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 12000)
+const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 160)
+const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 10000)
 
 async function aiChat(system, user){
   if(!DEEPSEEK_API_KEY) return null
@@ -82,7 +82,10 @@ function stripJSON(s){
   if(i>=0 && j>i) s=s.slice(i,j+1)
   try{ return JSON.parse(s) }catch{ return null }
 }
-const norm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase()
+
+// ===== Utils
+const rm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"")
+const norm = s => rm(s).toLowerCase().replace(/[+.,;:()/_-]/g," ").replace(/[^\p{Letter}\p{Number}\s]/gu," ").replace(/\s+/g," ").trim()
 function fmtES(d){ const dias=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"]; const t=dayjs(d).tz(EURO_TZ); return `${dias[t.day()]} ${String(t.date()).padStart(2,"0")}/${String(t.month()+1).padStart(2,"0")} ${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}` }
 function insideBusinessHours(d,mins=60){
   const t=dayjs(d); if(!WORK_DAYS.includes(t.day())) return false
@@ -129,7 +132,7 @@ function servicesForSede(sedeKey){
     const key = `${label}::${id}`
     if(seen.has(key)) continue
     seen.add(key)
-    out.push({ key:k, id, version: ver?Number(ver):null, label })
+    out.push({ key:k, id, version: ver?Number(ver):null, label, norm: norm(label) })
   }
   return out
 }
@@ -213,6 +216,169 @@ function createHold({ phone, sede, envServiceKey, startISO, endISO, staffId }){
   }catch(e){ if(BOT_DEBUG) console.error(e); return false }
 }
 
+// ===== Semántica low-cost (mejor comprensión)
+// Stopwords y sinónimos base
+const STOP = new Set("de del la el con para y o a en una un al por las los y".split(" "))
+const SYN = {
+  "cejas":["ceja","caza","henna","henna cejas","diseno","diseño","laminacion","laminación","hilo","microblading","microshading","efecto polvo","hairstroke","retoque"],
+  "pestanas":["pestañas","pestanas","lifting","extensiones","2d","3d","pelo a pelo","relleno"],
+  "unas":["uña","uñas","unias","manicura","semipermanente","gel","acrilico","acrílico","esculpidas","relleno","tips","frances","francés","nivelacion","nivelación","rusa"],
+  "depilacion":["depilación","depilacion","laser","láser","ingles","inglés","axilas","labio","fosas nasales","pubis","perianal","brazos","piernas"],
+  "faciales":["facial","limpieza","hydra","hidra","dermapen","carbon peel","carbón","manchas","acne","acné","vitamina c","oro","jade","hialuronico","hialurónico"],
+  "labios":["labio","lips","aquarela","hydra lips"]
+}
+// Tokenizar servicio -> set de tokens + sinónimos inferidos
+function tokenize(str){
+  return norm(str).split(" ").filter(w=>w && !STOP.has(w))
+}
+function buildServiceIndex(){
+  const index = { torremolinos:[], la_luz:[] }
+  for (const sede of ["torremolinos","la_luz"]){
+    const svcs = servicesForSede(sede)
+    for (const s of svcs){
+      const toks = new Set(tokenize(s.label))
+      // añadir sinónimos por categoría implícita
+      if([...toks].some(t=>["cejas","ceja","hairstroke","microblading","microshading","henna","laminacion","laminación","hilo"].includes(t))){
+        SYN["cejas"].forEach(x=>tokenize(x).forEach(t=>toks.add(t)))
+      }
+      if([...toks].some(t=>["pestañas","pestanas","lifting","extensiones"].includes(t))){
+        SYN["pestanas"].forEach(x=>tokenize(x).forEach(t=>toks.add(t)))
+      }
+      if([...toks].some(t=>["uña","uñas","manicura","esculpidas","semipermanente","rusa"].includes(t))){
+        SYN["unas"].forEach(x=>tokenize(x).forEach(t=>toks.add(t)))
+      }
+      if([...toks].some(t=>["depilacion","depilación","laser","axilas","labio","ingles","inglés"].includes(t))){
+        SYN["depilacion"].forEach(x=>tokenize(x).forEach(t=>toks.add(t)))
+      }
+      if([...toks].some(t=>["facial","limpieza","hydra","dermapen","carbon","manchas","acne"].includes(t))){
+        SYN["faciales"].forEach(x=>tokenize(x).forEach(t=>toks.add(t)))
+      }
+      index[sede].push({ key:s.key, label:s.label, tokens:toks, norm:s.norm })
+    }
+  }
+  return index
+}
+const SVC_INDEX = buildServiceIndex()
+
+function scoreServiceByText(svc, textTokens, catHint){
+  // Jaccard + boosts por sinónimos de la categoría
+  const svcTokens = svc.tokens
+  const inter = textTokens.filter(t=>svcTokens.has(t))
+  const unionSize = new Set([...textTokens, ...svcTokens]).size || 1
+  let s = inter.length / unionSize
+  // boost si el nombre contiene bigramas exactos del texto
+  const txt = " " + textTokens.join(" ") + " "
+  const name = " " + svc.norm + " "
+  if (textTokens.length >= 2){
+    for (let i=0;i<textTokens.length-1;i++){
+      const bg = ` ${textTokens[i]} ${textTokens[i+1]} `
+      if (name.includes(bg)) s += 0.15
+    }
+  }
+  // boost categoría
+  if (catHint){
+    const map = { cejas:"cejas", pestañas:"pestanas", "pestañas":"pestanas", uñas:"unas", "depilación":"depilacion", faciales:"faciales" }
+    const k = map[catHint] || catHint
+    const syn = (SYN[k]||[]).flatMap(w=>tokenize(w))
+    if (syn.some(t=>svcTokens.has(t))) s += 0.2
+  }
+  // pequeña penalización por servicios muy largos si el texto es corto
+  if (svc.norm.split(" ").length>=5 && textTokens.length<=2) s -= 0.05
+  return s
+}
+function prefilterCandidates(text, sede, catHint=null, max=15){
+  const tTokens = tokenize(text)
+  const pool = (SVC_INDEX[sede]||[])
+  const scored = pool.map(svc => ({ svc, score: scoreServiceByText(svc, tTokens, catHint) }))
+  scored.sort((a,b)=>b.score-a.score)
+  return scored.filter(x=>x.score>0).slice(0,max).map(x=>x.svc.label)
+}
+
+// ===== IA — router (mejorado con ejemplos y compactado)
+function aiRouterSystem(){
+  return `JSON solo.
+{"intent":"book|view|edit|cancel|info|other",
+ "sede":"torremolinos|la_luz|null",
+ "category_hint":"uñas|pestañas|cejas|depilación|faciales|null",
+ "staff":"string|null",
+ "date_hint":"string|null",
+ "part_of_day":"mañana|tarde|noche|null",
+ "time_hint":"HH:MM|null"}
+Ejemplos:
+"para cejas con hilo en la luz" -> {"intent":"book","sede":"la_luz","category_hint":"cejas"}
+"quiero cambiar mi cita" -> {"intent":"edit"}
+"viernes tarde" -> {"intent":"book","sede":null,"part_of_day":"tarde"}
+`
+}
+async function aiResolve(text){
+  const sys = aiRouterSystem()
+  const out = await aiChat(sys, `Cliente: "${text}"`)
+  return stripJSON(out) || {}
+}
+
+// ===== IA — shortlist de servicios (top 3–6) con prefiltro semántico
+function aiShortlistSystem(sedeLabels){
+  return `Toma de esta lista (máx 6) las etiquetas exactas que mejor encajan. Devuelve JSON: {"labels":["..."]}. No expliques.
+Lista: ${sedeLabels.join(" | ")}`
+}
+async function aiShortlist(text, sede, catHint){
+  // Prefiltro local (ahorra tokens)
+  const pre = prefilterCandidates(text, sede, catHint, 15)
+  const labels = pre.length ? pre : listLabels(sede).slice(0,20) // guardarraíl
+  const sys = aiShortlistSystem(labels)
+  const out = await aiChat(sys, `Texto: "${text}"`)
+  try{
+    const obj = stripJSON(out) || {}
+    const arr = Array.isArray(obj.labels) ? obj.labels.filter(l=>labels.some(x=>x.toLowerCase()===String(l).toLowerCase())) : []
+    if(arr.length) return arr.slice(0,6)
+    // fallback local si la IA no devuelve nada
+    return pre.slice(0,5)
+  }catch{ return pre.slice(0,5) }
+}
+
+// ===== IA — elegir 1 servicio de shortlist segun frase (con alias)
+async function aiChooseFromShortlist(text, shortlist){
+  const sys = `Shortlist: ${shortlist.join(" | ")}
+JSON solo: {"pick":"uno de la shortlist o null"}
+Alias comunes: hilo->"Depilación cejas con hilo"; micro->"Microblading" o "Cejas efecto polvo microshading"; laminación->"Laminación y diseño de cejas".`
+  const out = await aiChat(sys, `Frase: "${text}"`)
+  try{
+    const obj = stripJSON(out) || {}
+    const pick = shortlist.find(l=>l.toLowerCase()===String(obj.pick||"").toLowerCase())
+    // Fallback por alias directos
+    if(!pick){
+      const t=norm(text)
+      const alias = [
+        { kw:/\bhilo\b/, name: shortlist.find(x=>/hilo/i.test(x)) },
+        { kw:/\bmicro(shading|blading)?\b/, name: shortlist.find(x=>/micro|efecto polvo/i.test(x)) },
+        { kw:/\blaminaci[oó]n\b/, name: shortlist.find(x=>/laminaci/i.test(x)) },
+        { kw:/\bhenna\b/, name: shortlist.find(x=>/henna/i.test(x)) }
+      ]
+      const hit = alias.find(a=>a.name && a.kw.test(t))
+      if(hit?.name) return hit.name
+    }
+    return pick || null
+  }catch{ return null }
+}
+
+// ===== IA — elegir un hueco de la lista sin números (más ejemplos)
+function aiPickSystem(slots){
+  const comp = slots.map(s=>{
+    const d=s.date.tz(EURO_TZ)
+    return { iso:d.format("YYYY-MM-DDTHH:mm"), dow:["do","lu","ma","mi","ju","vi","sa"][d.day()], ddmm:`${String(d.date()).padStart(2,"0")}/${String(d.month()+1).padStart(2,"0")}`, time:`${String(d.hour()).padStart(2,"0")}:${String(d.minute()).padStart(2,"0")}` }
+  })
+  return `JSON solo. Elige "iso" de slots que case con la frase.
+Frases soporte: "la del martes", "la de las 13", "la primera", "la última", "otra tarde", "la de las 1".
+slots=${JSON.stringify(comp)}
+Schema: {"iso":"YYYY-MM-DDTHH:mm|null"}`
+}
+async function aiPick(text, slots){
+  if(!slots?.length) return { iso:null }
+  const sys = aiPickSystem(slots)
+  const out = await aiChat(sys, `Frase: "${text}"`)
+  return stripJSON(out) || { iso:null }
+}
+
 // ===== Disponibilidad (respeta duración + bloqueos)
 async function searchAvail({ sede, envKey, startEU, endEU, part=null }){
   const sv = await getServiceIdAndVersion(envKey); if(!sv) return []
@@ -248,94 +414,21 @@ async function searchAvail({ sede, envKey, startEU, endEU, part=null }){
   return out.sort((x,y)=>x.date.valueOf()-y.date.valueOf())
 }
 
-// ===== IA — router (intención / sede / pista de categoría/fecha)
-function aiRouterSystem(){
-  return `Devuelve SOLO JSON:
-{"intent":"book|view|edit|cancel|info|other",
- "sede":"torremolinos|la_luz|null",
- "category_hint":"uñas|pestañas|cejas|depilación|faciales|null",
- "staff":"string|null",
- "date_hint":"string|null",
- "part_of_day":"mañana|tarde|noche|null",
- "time_hint":"HH:MM|null"}`
-}
-async function aiResolve(text){
-  const sys = aiRouterSystem()
-  const out = await aiChat(sys, `Cliente: "${text}"`)
-  return stripJSON(out) || {}
-}
-
-// ===== IA — shortlist de servicios (top 3–6) dada la sede + texto
-function aiShortlistSystem(sedeLabels){
-  return `Tienes esta lista de servicios EXACTOS: ${sedeLabels.join(" | ")}
-Devuelve SOLO JSON: {"labels":["exact label 1", "exact label 2", "..."]} (máximo 6) que mejor encajan con el texto (acepta sinónimos).`
-}
-async function aiShortlist(text, sede){
-  const labels = listLabels(sede)
-  const sys = aiShortlistSystem(labels)
-  const out = await aiChat(sys, `Texto: "${text}"`)
-  try{
-    const obj = stripJSON(out) || {}
-    const arr = Array.isArray(obj.labels) ? obj.labels.filter(l=>labels.some(x=>x.toLowerCase()===String(l).toLowerCase())) : []
-    // fallback por palabras clave típicas si la IA no devuelve nada
-    if(!arr.length){
-      const t=norm(text)
-      const kw = []
-      if(/\bceja/.test(t)) kw.push("cejas","henna","micro","laminacion","diseño","hilo")
-      if(/\blabio/.test(t)) kw.push("labio","aquarela")
-      if(/\bpesta/.test(t)) kw.push("pestañas","lifting","extensiones")
-      if(/\blimpieza|facial|dermapen|carbon|hydra|mancha|acne/.test(t)) kw.push("limpieza","facial","dermapen","carbon","hydra","manchas","acne")
-      if(/\buñ|manicura|pedicur/.test(t)) kw.push("manicura","pedicura","esculpidas","semipermanente")
-      const top = labels.filter(L => kw.some(k=>norm(L).includes(k))).slice(0,5)
-      return top
-    }
-    return arr.slice(0,6)
-  }catch{ return [] }
-}
-
-// ===== IA — elegir 1 servicio de una shortlist según frase
-async function aiChooseFromShortlist(text, shortlist){
-  const sys = `Shortlist: ${shortlist.join(" | ")}
-Devuelve SOLO JSON: {"pick":"uno de la shortlist o null"}`
-  const out = await aiChat(sys, `Frase: "${text}"`)
-  try{
-    const obj = stripJSON(out) || {}
-    const pick = shortlist.find(l=>l.toLowerCase()===String(obj.pick||"").toLowerCase())
-    return pick || null
-  }catch{ return null }
-}
-
-// ===== IA — elegir un hueco de la lista sin números
-function aiPickSystem(slots){
-  const comp = slots.map(s=>{
-    const d=s.date.tz(EURO_TZ)
-    return { iso:d.format("YYYY-MM-DDTHH:mm"), dow:["do","lu","ma","mi","ju","vi","sa"][d.day()], ddmm:`${String(d.date()).padStart(2,"0")}/${String(d.month()+1).padStart(2,"0")}`, time:`${String(d.hour()).padStart(2,"0")}:${String(d.minute()).padStart(2,"0")}` }
-  })
-  return `Solo JSON. Elige un iso de "slots" que encaje con la frase (p.ej. "la del martes", "la de las 13", "la primera", "otra tarde").
-slots=${JSON.stringify(comp)}
-Schema: {"iso":"YYYY-MM-DDTHH:mm|null"}`
-}
-async function aiPick(text, slots){
-  if(!slots?.length) return { iso:null }
-  const sys = aiPickSystem(slots)
-  const out = await aiChat(sys, `Frase: "${text}"\nDevuelve iso.`)
-  return stripJSON(out) || { iso:null }
-}
-
 // ===== Mensajes cortos
 const GREET = `¡Hola! Soy el asistente de Gapink Nails 💅
-Cuéntame salón (Torremolinos/La Luz) y lo que quieres (p. ej. “cejas con hilo”).`
+Dime *salón* (Torremolinos/La Luz) y qué quieres (ej. “cejas con hilo”).`
 const BOOKING_SELF = "Para *ver/editar/cancelar* usa el enlace del SMS/email de confirmación ✅"
 
-// ===== Estado en memoria
+// ===== Estado en memoria (simple)
 const SESS = new Map() // phone -> session
 function getS(phone){
   return SESS.get(phone) || SESS.set(phone,{
     greetedAt:0,
-    lastPromptType:null, // evita repetir
+    lastPromptType:null,
     sede:null,
+    pendingCat:null,       // <-- NUEVO: guardamos pista de categoría hasta tener sede
     svcKey:null, svcLabel:null,
-    shortlist:[], // labels propuestos por IA
+    shortlist:[],
     prefStaffId:null, prefStaffLabel:null,
     lastSlots:[], lastMap:{}, prompted:false, lastListAt:0,
     pickedISO:null, pickedDurMin:60,
@@ -352,13 +445,14 @@ const formatSlots = (slots, showNames=false) =>
 async function proposeOnce(session, jid, phone, sock, {text,date_hint,part}){
   if(!session.svcKey){
     const labels = listLabels(session.sede)
-    await sock.sendMessage(jid,{text:`¿Qué *servicio* quieres en ${locationNice(session.sede)}?\n(${labels.length} disponibles)\nDímelo con tus palabras (ej. “cejas con hilo”).`})
+    await sock.sendMessage(jid,{text:`¿Qué *servicio* quieres en ${locationNice(session.sede)}?\n(${labels.length} disponibles) Dímelo en tus palabras (ej. “cejas con hilo”).`})
     return
   }
   const now = nowEU()
   const base = nextOpeningFrom(now.add(NOW_MIN_OFFSET_MIN,"minute"))
   let start = base.clone(), end = base.clone().add(SEARCH_WINDOW_DAYS,"day")
   const T = norm([text||"",date_hint||""].join(" "))
+
   const findDay = k=>{
     const map={lunes:1,martes:2,miercoles:3,miércoles:3,jueves:4,viernes:5}
     if(!map[k]) return null; let d=base.clone(); while(d.day()!==map[k]) d=d.add(1,"day"); return d
@@ -459,7 +553,7 @@ async function startBot(){
     const text = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
     if(!text) return
 
-    // Puntitos => silencio 6h
+    // Puntitos => silencio 6h (también si lo mandas tú, sin respuesta)
     if(/^[\s.·•⋅]+$/.test(text)){
       const s=getS(phone); s.snoozeUntil=nowEU().add(6,"hour").valueOf(); SESS.set(phone,s)
       if(!isFromMe) return
@@ -518,7 +612,10 @@ async function startBot(){
       await sock.sendMessage(jid,{text:BOOKING_SELF}); return
     }
 
-    // Sede (obligatoria)
+    // Guardar category_hint si aún no hay sede
+    if(!s.sede && ai.category_hint) s.pendingCat = ai.category_hint
+
+    // Sede (obligatoria antes de shortlist/horas)
     const prevSede = s.sede
     if(ai.sede==="la_luz" || ai.sede==="torremolinos") s.sede = ai.sede
     if(!s.sede){
@@ -533,42 +630,40 @@ async function startBot(){
       if(!servicesForSede(s.sede).some(x=>x.key===s.svcKey)){ s.svcKey=null; s.svcLabel=null; s.shortlist=[] }
     }
 
-    // Profesional opcional
+    // Profesional opcional (IA)
     if(ai.staff){
       const label = norm(ai.staff).split(" ")[0]
       const found = EMPLOYEES.find(e=> e.bookable && e.label.includes(label))
       if(found){ s.prefStaffId=found.id; s.prefStaffLabel=found.label.split(" ")[0] }
     }
 
-    // 2) Servicio: IA shortlist si no hay servicio elegido
+    // 2) Servicio: shortlist IA + prefiltro semántico
     if(!s.svcKey){
-      // Genera/corrige shortlist con IA
-      const shortlist = await aiShortlist(text, s.sede)
+      const shortlist = await aiShortlist(text, s.sede, s.pendingCat || ai.category_hint || null)
       if(shortlist.length){
         s.shortlist = shortlist
-        // ¿El usuario ya dijo algo que mapee a uno? (e.g. “hilo”, “microblading”)
         const pickFromText = await aiChooseFromShortlist(text, shortlist)
         if(pickFromText){
           const key = labelToEnvKey(pickFromText, s.sede)
           if(key){ s.svcKey=key; s.svcLabel=labelFromEnvKey(key) }
         }
       }
-      // Si sigue sin servicio, mostramos shortlist (corta, con duración)
       if(!s.svcKey){
-        const enriched = (s.shortlist.length ? s.shortlist : listLabels(s.sede).slice(0,5))
+        const enriched = (s.shortlist.length ? s.shortlist : prefilterCandidates(text, s.sede, s.pendingCat || ai.category_hint || null, 5))
+          .slice(0,6)
           .map(l=>{
             const env = labelToEnvKey(l, s.sede)
             const dur = durationMinForEnvKey(env)
             return `• ${l} — ${dur} min`
           }).join("\n")
         if(s.lastPromptType!=="ask_service"){
-          await sock.sendMessage(jid,{text:`En ${locationNice(s.sede)} te recomiendo (di uno en texto):\n${enriched}`})
+          await sock.sendMessage(jid,{text:`En ${locationNice(s.sede)} te encaja algo de esto (di uno en texto):\n${enriched}`})
           setPrompt(s,"ask_service"); SESS.set(phone,s)
         }
         return
       }
     } else {
-      // Si escriben luego el nombre exacto, re-mapeamos
+      // Re-map si el usuario suelta un nombre exacto de servicio
       const keyTry = labelToEnvKey(text, s.sede)
       if(keyTry){ s.svcKey=keyTry; s.svcLabel=labelFromEnvKey(keyTry) }
     }
@@ -614,7 +709,7 @@ async function startBot(){
 
 // ===== Arranque
 const server = app.listen(PORT, ()=>{ 
-  console.log(`🩷 Gapink Nails Bot v34.2.0 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
+  console.log(`🩷 Gapink Nails Bot v34.3.0 — DeepSeek-only · mejor comprensión · QR http://localhost:${PORT}`)
   startBot().catch(console.error)
 })
 process.on("SIGTERM", ()=>{ try{ server.close(()=>process.exit(0)) }catch{ process.exit(0) } })
