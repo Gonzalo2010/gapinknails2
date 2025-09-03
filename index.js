@@ -1,23 +1,11 @@
-// index.js — Gapink Nails · v34.1.0 (DeepSeek-only + Mini Web QR)
+// index.js — Gapink Nails · v34.1.1 (DeepSeek-only + Mini Web QR + ESM fix)
 // - IA: SOLO DeepSeek (sin OpenAI).
 // - Duración por servicio desde ENV (SQ_DUR_* / SQ_DUR_luz_*).
-// - Bloqueo (HOLD) en SQLite durante 6h al elegir un hueco (sin tocar Square).
+// - Bloqueos (HOLD) en SQLite durante 6h al elegir un hueco (sin tocar Square).
 // - Lista de horas sin números; el cliente elige con frases (“la del martes”, “a las 13”…).
 // - Mini web con estado y QR en /  y /qr.png.
 // - Square: solo searchAvailability (no se crea ni modifica nada).
-//
-// ENV necesarios:
-//   DEEPSEEK_API_KEY=sk-...
-//   DEEPSEEK_MODEL=deepseek-chat        (opcional; por defecto deepseek-chat)
-//   SQUARE_ACCESS_TOKEN=xxx
-//   SQUARE_ENV=production|sandbox
-//   SQUARE_LOCATION_ID_TORREMOLINOS=LOC_...
-//   SQUARE_LOCATION_ID_LA_LUZ=LOC_...
-//   SQ_SVC_* y SQ_SVC_luz_* (variations)
-//   SQ_DUR_* y SQ_DUR_luz_* (duraciones, como me pasaste)
-//   (opcional) SQ_EMP_<alias>=<teamMemberId>|BOOKABLE
-//
-// npm i @whiskeysockets/baileys better-sqlite3 dayjs qrcode pino dotenv square
+// - FIX: Baileys se importa con dynamic import (ESM), no con require().
 
 import express from "express"
 import pino from "pino"
@@ -30,7 +18,6 @@ import tz from "dayjs/plugin/timezone.js"
 import isoWeek from "dayjs/plugin/isoWeek.js"
 import "dayjs/locale/es.js"
 import { webcrypto, createHash } from "crypto"
-import { createRequire } from "module"
 import Database from "better-sqlite3"
 import { Client, Environment } from "square"
 
@@ -394,14 +381,15 @@ app.get("/qr.png", async (_req,res)=>{
   }catch{ res.status(500).send("QR error") }
 })
 
-// ===== Baileys
+// ===== Baileys (ESM dynamic import — FIX)
 async function loadBaileys(){
-  const require = createRequire(import.meta.url)
-  const mod = require("@whiskeysockets/baileys")
-  const makeWASocket = mod.makeWASocket
-  const useMultiFileAuthState = mod.useMultiFileAuthState
-  const fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion
-  const Browsers = mod.Browsers
+  // Baileys es ESM. Nada de require(); usamos import() dinámico.
+  const mod = await import("@whiskeysockets/baileys")
+  const makeWASocket = mod.makeWASocket ?? mod.default?.makeWASocket ?? mod.default
+  const useMultiFileAuthState = mod.useMultiFileAuthState ?? mod.default?.useMultiFileAuthState
+  const fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion ?? mod.default?.fetchLatestBaileysVersion
+  const Browsers = mod.Browsers ?? mod.default?.Browsers ?? { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
+  if (!makeWASocket || !useMultiFileAuthState) throw new Error("Baileys ESM no expone funciones esperadas")
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
 
@@ -552,7 +540,7 @@ async function startBot(){
 
 // ===== Arranque
 const server = app.listen(PORT, ()=>{ 
-  console.log(`🩷 Gapink Nails Bot v34.1.0 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
+  console.log(`🩷 Gapink Nails Bot v34.1.1 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
   startBot().catch(console.error)
 })
 process.on("SIGTERM", ()=>{ try{ server.close(()=>process.exit(0)) }catch{ process.exit(0) } })
