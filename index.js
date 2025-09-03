@@ -1,12 +1,11 @@
-// index.js — Gapink Nails · v37.0.0
-// DeepSeek-only · conversación limpia · holds SQL 6h · sin tocar Square
-// Mejora clave en esta versión:
-// - “con cristina/cristi/cris/…” filtra huecos por esa profesional (fuzzy fuerte)
-// - “micropigmentación/microblanding/powder brows/…” entiende la intención y lista SOLO servicios de micropigmentación ordenados por IA
-// - Mapeo IA→servicio exacto (si dices “microblanding”, lo casa con “Microblading” y propone horas)
-// - Mejor detección de salón (“en torremolinos/la luz/…”) sin bucles
-// - Propuestas con profesional elegida; si no hay huecos con ella, cae a equipo con aviso
-// - Listas sin duplicados y texto muy corto/limpio
+// index.js — Gapink Nails · v37.1.0
+// Conversación limpia · IA DeepSeek · holds 6h · Square solo consulta
+// Cambios clave (v37.1):
+// - “con Cristina/Cristi/Cris/…” ahora fuerza búsqueda real *con esa profesional*
+//   y si no hay huecos en 14 días, amplía automáticamente hasta 30 días (búsqueda extendida)
+// - Si tampoco hay con ella, cae a huecos del equipo con aviso claro
+// - Fuzzy nombres robusto + “con ella” recuerda la última lista propuesta
+// - Listados de servicios por IA (uñas / micropigmentación) sin duplicados
 
 import express from "express"
 import pino from "pino"
@@ -33,7 +32,8 @@ const WORK_DAYS = [1,2,3,4,5]                  // L–V
 const SLOT_MIN = 15
 const OPEN = { start: 9, end: 20 }
 const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
-const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
+const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)   // ventana normal
+const SEARCH_WINDOW_EXT_DAYS = Number(process.env.BOT_SEARCH_WINDOW_EXT_DAYS || 30) // extendida p/ “con X”
 const HOLIDAYS_EXTRA = (process.env.HOLIDAYS_EXTRA || "06/01,28/02,15/08,12/10,01/11,06/12,08/12,25/12")
   .split(",").map(s=>s.trim()).filter(Boolean)
 const SHOW_TOP_N = Number(process.env.SHOW_TOP_N || 5)
@@ -295,11 +295,12 @@ function bestStaffFromText(text, sedePref=null){
   const t = " " + norm(text) + " "
   if (/\bcon\s+ella\b/.test(t)) return { withHer:true }
 
-  // diccionario básico de alias → emp label
+  // alias directos
   const alias = {
     "tania":"tania","tani":"tania",
     "cristina":"cristina","cristin":"cristina","cristi":"cristina","cris":"cristina","crist":"cristina",
-    "chabeli":"chabeli","elisabeth":"elisabeth","eli":"elisabeth","edurne":"edurne","johana":"johana","ganna":"ganna","cristi­na":"cristina"
+    "chabeli":"chabeli","elisabeth":"elisabeth","eli":"elisabeth","edurne":"edurne","johana":"johana","ganna":"ganna",
+    "thalia":"thalia","talia":"thalia","thalía":"thalia","talía":"thalia"
   }
   for (const [k,v] of Object.entries(alias)){
     if (new RegExp(`\\b${k}\\b`).test(t)){
@@ -307,7 +308,7 @@ function bestStaffFromText(text, sedePref=null){
       if (found) return found
     }
   }
-  // candidatos por coincidencia exacta o prefijo ≥60% (mín. 4)
+  // prefijo ≥60% o exacto
   const matches=[]
   for (const e of EMPLOYEES){
     for (const lbl of e.labels){
@@ -319,7 +320,7 @@ function bestStaffFromText(text, sedePref=null){
     }
   }
   if (!matches.length) return null
-  // ordenar: bookable>no, sedePref>no, label más larga (menos ambiguo)
+  // ordenar: bookable>no, sedePref>no, etiqueta más larga (menos ambigua)
   matches.sort((a,b)=>{
     const b1=(b.bookable?1:0)-(a.bookable?1:0); if (b1) return b1
     const b2=((b.centers||[]).includes(sedePref)?1:0)-((a.centers||[]).includes(sedePref)?1:0); if (b2) return b2
@@ -411,9 +412,7 @@ function detectCategory(text){
 }
 function servicesByCategory(sedeKey, category){
   const all = attachDurations(servicesForSedeKeyRaw(sedeKey))
-  const t = category
-  const pick = (regex) => dedupeByLabel(all.filter(s => regex.test(norm(s.label))))
-  switch(t){
+  switch(category){
     case "unas":{
       return dedupeByLabel(all.filter(s => /\b(uñas|manicura|pedicura|esculpidas|relleno|esmaltado)\b/i.test(s.label)))
     }
@@ -533,7 +532,7 @@ function buildServiceAliasIndex(sedeKey){
   add("cejas con hilo","Depilacion Cejas Con Hilo")
   add("depilacion de cejas con hilo","Depilacion Cejas Con Hilo")
 
-  // Intentar casar con etiquetas existentes (corrigir acentos/mayus)
+  // normaliza a etiqueta real si existe
   const out = new Map(alias)
   for (const [k,v] of alias){
     const found = byLabel.get(norm(v)) || [...byLabel.values()].find(lbl => norm(lbl)===norm(v))
@@ -546,7 +545,6 @@ async function aiMapToServiceLabel(userText, sedeKey){
   const alias = buildServiceAliasIndex(sedeKey)
   const direct = alias.get(norm(userText))
   if (direct) return direct
-  // Pide a IA elegir etiqueta exacta
   try{
     const sys = `Elige la MEJOR etiqueta exacta de la lista de servicios que encaja con el texto del usuario.
 Devuelve SOLO {"label":"Texto Exacto"} o {"label":null} si no hay match claro.`
@@ -561,7 +559,7 @@ Devuelve SOLO {"label":"Texto Exacto"} o {"label":null} si no hay match claro.`
   return null
 }
 
-// Uñas: filtra y ordena por IA
+// Uñas/Micro: listas ordenadas
 async function nailsServicesForSedeRankedByAI(sedeKey, userText){
   const withDur = servicesByCategory(sedeKey, "unas")
   try{
@@ -578,12 +576,10 @@ async function nailsServicesForSedeRankedByAI(sedeKey, userText){
   }catch{}
   return dedupeByLabel(withDur)
 }
-
-// Micropigmentación: lista y ordena por IA
 async function micropigServicesForSedeRankedByAI(sedeKey, userText){
   const withDur = servicesByCategory(sedeKey, "micropigmentacion")
   try{
-    const sys = `Ordena servicios de MICROPIGMENTACIÓN (microblading, powder/microshading, eyeliner, labios) por relevancia. Devuelve SOLO {"ordered":["label",...]}.`
+    const sys = `Ordena servicios de MICROPIGMENTACIÓN por relevancia. Devuelve SOLO {"ordered":["label",...]}.`
     const msg = `Usuario: "${userText}"\nServicios:\n${withDur.map(s=>`- ${s.label}`).join("\n")}\nSolo JSON.`
     const out = await aiChat(sys, msg)
     const js = stripToJSON(out)
@@ -600,7 +596,7 @@ async function micropigServicesForSedeRankedByAI(sedeKey, userText){
 // Elegir una opción textual
 async function aiPickFromOffered(userText, offeredPrettyList){
   try{
-    const sys = `Tienes una lista de fechas/horas. El usuario dice "la de las 13", "viernes tarde", "la primera"... 
+    const sys = `Tienes una lista de fechas/horas. El usuario dice "la de las 13", "viernes tarde", "la primera".
 Devuelve SOLO {"pick_index": <0-based or null>}.`
     const msg = `Opciones:\n${offeredPrettyList.map((t,i)=>`${i+1}. ${t}`).join("\n")}\nUsuario: "${userText}"\nJSON:`
     const out = await aiChat(sys, msg)
@@ -653,6 +649,25 @@ async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, l
   }catch{ return [] }
 }
 
+// ====== BÚSQUEDA EXTENDIDA (como en v31.x): recorre semanas hasta 30 d y filtra por staff si aplica
+async function searchAvailWindowExtended({ locationKey, envServiceKey, startEU, staffId=null, maxDays=SEARCH_WINDOW_EXT_DAYS }){
+  const results = []
+  const endDate = startEU.clone().add(maxDays, 'day')
+  let cursor = startEU.clone()
+  while (cursor.isBefore(endDate) && results.length < 1000) {
+    const chunkEnd = dayjs.min(endDate, cursor.clone().add(7,"day"))
+    const chunk = await searchAvailWindow({
+      locationKey, envServiceKey, startEU: cursor, endEU: chunkEnd, limit: 500
+    })
+    const filtered = staffId ? chunk.filter(s => s.staffId === staffId) : chunk
+    results.push(...filtered)
+    cursor = chunkEnd.clone()
+    await sleep(80)
+  }
+  results.sort((a,b)=>a.date.valueOf()-b.date.valueOf())
+  return results
+}
+
 // ---------- Propuesta de horas + holds 6h ----------
 async function proposeTimes({ phone, sede, svcKey, svcLabel, durationMin, staffIdOrNull=null, temporalHint=null }){
   const now = nowEU()
@@ -668,12 +683,28 @@ async function proposeTimes({ phone, sede, svcKey, svcLabel, durationMin, staffI
     if (/\bmanana|mañana\b/.test(t)) startEU = startEU.hour(9).minute(0)
   }
 
+  // 1) Ventana normal
   const rawSlots = await searchAvailWindow({
     locationKey: sede, envServiceKey: svcKey, startEU, endEU, limit: 500
   })
 
   let slots = staffIdOrNull ? rawSlots.filter(s => s.staffId === staffIdOrNull) : rawSlots
+  let usedStaffFilter = !!staffIdOrNull
+
+  // 2) Si pidió con alguien (Cristina, etc.) y no hay huecos → ventana extendida hasta 30 días
+  if (usedStaffFilter && slots.length === 0){
+    const extended = await searchAvailWindowExtended({
+      locationKey: sede, envServiceKey: svcKey, startEU, staffId: staffIdOrNull, maxDays: SEARCH_WINDOW_EXT_DAYS
+    })
+    if (extended.length) {
+      slots = extended
+      usedStaffFilter = true
+    }
+  }
+
+  // 3) Filtra holds (no mostrar huecos retenidos por otros)
   slots = slots.filter(s => !isHeldByOther({ location_key:sede, service_env_key:svcKey, start_iso:s.date.tz("UTC").toISOString(), phone }))
+
   const top = slots.slice(0, SHOW_TOP_N)
 
   const offeredISO = top.map(s=>s.date.tz("UTC").toISOString())
@@ -682,7 +713,9 @@ async function proposeTimes({ phone, sede, svcKey, svcLabel, durationMin, staffI
   return {
     list: top.map(s=>s.date),
     staffByIso: Object.fromEntries(top.map(s=>[s.date.format("YYYY-MM-DDTHH:mm"), s.staffId || null])),
-    usedStaffFilter: !!staffIdOrNull
+    usedStaffFilter,
+    hadAny: slots.length>0,
+    hadAnyRaw: rawSlots.length>0
   }
 }
 
@@ -699,7 +732,7 @@ app.get("/", (_req,res)=>{
   .error{background:#ffe8e8;color:#b00020}
   .muted{color:#666}
   </style><div class="card">
-  <h1>Gapink Nails Bot — v37.0</h1>
+  <h1>Gapink Nails Bot — v37.1</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:16px 0"><img src="/qr.png" width="300" style="border-radius:8px;border:1px solid #eee"></div>`:""}
   <p class="muted">Modo: ${DRY_RUN ? "Simulación" : "Consulta Square"} · IA: DeepSeek</p>
@@ -821,7 +854,7 @@ async function startBot(){
           const salon = ai.salon || salonFromMsg || s.sede || null
           if (salon) { s.sede = salon; saveSession(phone,s) }
 
-          // Staff por texto (fuzzy)
+          // Staff por texto (fuzzy), p.ej. “con cristina”
           let wantStaffId = null
           const staffByText = bestStaffFromText(textRaw, s.sede||null)
           if (staffByText?.withHer){
@@ -845,7 +878,7 @@ async function startBot(){
             }
           }
 
-          // Categoría (uñas / micropigmentación / etc.)
+          // Categoría
           const tN = norm(textRaw)
           let categoryGuess = ai.category_guess || detectCategory(tN) || s.ctx.lastCategory || null
 
@@ -856,7 +889,7 @@ async function startBot(){
             saveSession(phone,s)
           }
 
-          // Si pidió micropigmentación o similar y no hay servicio aún, lista SOLO micropigmentación ordenada
+          // Micropigmentación → lista solo esa categoría
           if (!s.svcKey && s.sede && categoryGuess==="micropigmentacion"){
             const ranked = (await micropigServicesForSedeRankedByAI(s.sede, [s.ctx.lastText, textRaw].filter(Boolean).join(" · ")))
               .slice(0, SERVICES_LIST_MAX_N)
@@ -869,7 +902,7 @@ async function startBot(){
             }
           }
 
-          // Uñas: si ambigua
+          // Uñas → lista si ambigua
           if (!s.svcKey && s.sede && (categoryGuess==="unas")){
             const ranked = (await nailsServicesForSedeRankedByAI(s.sede, [s.ctx.lastText, textRaw].filter(Boolean).join(" · ")))
               .slice(0, SERVICES_LIST_MAX_N)
@@ -888,7 +921,7 @@ async function startBot(){
             return
           }
 
-          // Si no hay servicio claro todavía → lista completa ordenada por IA (pero ya prioriza lo que pidió)
+          // Si no hay servicio claro todavía → lista completa ordenada por IA
           if (!s.svcKey){
             const full = dedupeByLabel(attachDurations(servicesForSedeKeyRaw(s.sede)))
             const rankedAll = await rankServicesByAI([s.ctx.lastText, textRaw].filter(Boolean).join(" · "), full)
@@ -900,7 +933,7 @@ async function startBot(){
             return
           }
 
-          // Proponer horas (filtro staff si procede)
+          // Proponer horas (AHORA con búsqueda extendida con profesional si procede)
           releaseHoldsForPhone({ phone, location_key:s.sede, service_env_key:s.svcKey })
           const staffIdForQuery = wantStaffId || s.preferStaffId || null
           const prop = await proposeTimes({
@@ -908,25 +941,27 @@ async function startBot(){
             durationMin:s.durationMin||60, staffIdOrNull:staffIdForQuery, temporalHint: ai.datetime_hint
           })
 
-          if (!prop.list.length){
-            if (staffIdForQuery){
-              const propTeam = await proposeTimes({
-                phone, sede:s.sede, svcKey:s.svcKey, svcLabel:s.svcLabel||"Servicio",
-                durationMin:s.durationMin||60, staffIdOrNull:null, temporalHint: ai.datetime_hint
+          // Si sigue sin huecos con la persona → cae a equipo
+          if (!prop.hadAny && prop.hadAnyRaw && staffIdForQuery){
+            const propTeam = await proposeTimes({
+              phone, sede:s.sede, svcKey:s.svcKey, svcLabel:s.svcLabel||"Servicio",
+              durationMin:s.durationMin||60, staffIdOrNull:null, temporalHint: ai.datetime_hint
+            })
+            if (propTeam.list.length){
+              const pretty = propTeam.list.map(d=>`${fmtDay(d)} ${fmtHour(d)}`)
+              s.lastProposedISO = propTeam.list.map(d=>d.format("YYYY-MM-DDTHH:mm"))
+              s.lastStaffByIso = propTeam.staffByIso || {}
+              saveSession(phone,s)
+              await sock.sendMessage(jid,{ text:
+                `No veo huecos con ${s.preferStaffLabel||"esa profesional"} en los próximos ${SEARCH_WINDOW_EXT_DAYS} días.\nTe paso huecos del *equipo* en ${locationNice(s.sede)} para ${s.svcLabel}:\n`+
+                pretty.map(p=>`• ${p}`).join("\n")+
+                `\n\nDime en texto cuál te viene (ej. “la de las 13”, “viernes tarde”, “otra”).`
               })
-              if (propTeam.list.length){
-                const pretty = propTeam.list.map(d=>`${fmtDay(d)} ${fmtHour(d)}`)
-                s.lastProposedISO = propTeam.list.map(d=>d.format("YYYY-MM-DDTHH:mm"))
-                s.lastStaffByIso = propTeam.staffByIso || {}
-                saveSession(phone,s)
-                await sock.sendMessage(jid,{ text:
-                  `No veo huecos con ${s.preferStaffLabel||"esa profesional"}.\nTe paso huecos del *equipo* en ${locationNice(s.sede)} para ${s.svcLabel}:\n`+
-                  pretty.map(p=>`• ${p}`).join("\n")+
-                  `\n\nDime en texto cuál te viene (ej. “la de las 13”, “viernes tarde”, “otra”).`
-                })
-                return
-              }
+              return
             }
+          }
+
+          if (!prop.list.length){
             if (shouldPrompt(s,"no_slots")){
               await sock.sendMessage(jid,{ text:`No veo huecos en ese rango. Dime otra franja/fecha (ej. “viernes tarde”, “la próxima semana”).` })
             }
@@ -994,7 +1029,7 @@ He hecho un *bloqueo interno* durante ${HOLD_HOURS}h para ese hueco. `
 
 // ---------- Arranque ----------
 const appListen = app.listen(PORT, ()=>{
-  console.log(`🩷 Gapink Nails Bot v37.0.0 — DeepSeek-only — Mini Web QR http://localhost:${PORT}`)
+  console.log(`🩷 Gapink Nails Bot v37.1.0 — DeepSeek — http://localhost:${PORT}`)
   startBot().catch(console.error)
 })
 process.on("uncaughtException", e=>{ console.error("💥 uncaughtException:", e?.stack||e) })
