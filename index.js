@@ -1,11 +1,16 @@
-// index.js — Gapink Nails · v33.0.0
-// Cambios v33.0.0:
-// - Nuevo flujo "FullSchedule 120 días": se descarga TODO el horario de los próximos
-//   SCHEDULE_FULL_DAYS (default 120) para salón+servicio. Se guarda en caché de sesión.
-// - Cada slot incluye nombre de la profesional (si Square lo provee).
-// - Filtrado por profesional se hace DESPUÉS, sobre el horario ya cargado.
-// - Propuesta final: primeras SHOW_TOP_N_TIMES (default 10) según el filtro.
-// - Mantiene resumen para gestión (NO confirma).
+// index.js — Gapink Nails · v33.1.0
+// Cambios v33.1.0:
+// - Empleadas parseadas desde env con formato: ID | BOOKABLE|NO_BOOKABLE | LOCS
+//   donde LOCS ∈ { "ALL", "NO_LOCS", "LF5NK1R8RDMRV,LSMNAJFSY1EGS", ... }.
+// - Deduplicación por teamMemberId: se fusionan labels, BOOKABLE = OR, LOCS se
+//   unen (si alguno es ALL ⇒ ALL). Soporta además "ALLOW=" en segmentos extra
+//   para categorías/servicios (backward compatible).
+// - Filtro duro por local y compatibilidad de servicio al construir horario y al
+//   asignar profesional (incluye preferida si procede).
+// - pickStaffForLocation ahora respeta local + compatibilidad servicio.
+//
+// Cambios v33.0.0 (previos):
+// - “FullSchedule 120 días” con caché de sesión y top-N propuestas, etc.
 
 import express from "express"
 import pino from "pino"
@@ -54,10 +59,12 @@ const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment: (process.env.SQUARE_ENV==="production") ? Environment.Production : Environment.Sandbox
 })
-const LOC_TORRE = (process.env.SQUARE_LOCATION_ID_TORREMOLINOS || "").trim()
-const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "").trim()
+const LOC_TORRE = (process.env.SQUARE_LOCATION_ID_TORREMOLINOS || "LSMNAJFSY1EGS").trim()
+const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "LF5NK1R8RDMRV").trim()
 const ADDRESS_TORRE = process.env.ADDRESS_TORREMOLINOS || "Av. de Benyamina 18, Torremolinos"
 const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Luz"
+function locationToId(key){ return key==="la_luz" ? LOC_LUZ : LOC_TORRE }
+function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torremolinos" }
 
 // ====== IA liviana
 const AI_PROVIDER = (process.env.AI_PROVIDER || (process.env.DEEPSEEK_API_KEY? "deepseek" : process.env.OPENAI_API_KEY? "openai" : "none")).toLowerCase()
@@ -145,8 +152,6 @@ function fmtDay(d){
 }
 function fmtHour(d){ const t=(dayjs.isDayjs(d)?d:dayjs(d)).tz(EURO_TZ); return `${String(t.hour()).padStart(2,"0")}:${String(t.minute()).padStart(2,"0")}` }
 function enumerateHours(list){ return list.map((d,i)=>({ index:i+1, iso:d.format("YYYY-MM-DDTHH:mm"), pretty:fmtES(d) })) }
-function locationToId(key){ return key==="la_luz" ? LOC_LUZ : LOC_TORRE }
-function locationNice(key){ return key==="la_luz" ? "Málaga – La Luz" : "Torremolinos" }
 
 // ====== Horario helpers
 function isHolidayEU(d){
@@ -284,9 +289,9 @@ function saveSession(phone,s){
 }
 function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
 
-// ====== Empleadas (ALLOW por categorías o ALL)
+// ====== Empleadas (filtrado por ID + local + categorías opcionales)
 function parseAllowFromParts(parts){
-  const allowPart = parts.find(p => /^ALLOW\s*=/i.test(p))
+  const allowPart = (parts||[]).find(p => /^ALLOW\s*=/i.test(p))
   if (!allowPart) return ["ALL"]
   const raw = allowPart.split("=")[1] || ""
   const tokens = raw.split(",").map(s=>s.trim()).filter(Boolean)
@@ -301,26 +306,84 @@ function deriveLabelsFromEnvKey(envKey){
   if (uniq.length>1) labels.push(uniq.join(" "))
   return labels
 }
+function parseLocIdsToken(tok){
+  if (!tok || !tok.trim()) return null // null = ALL (sin restricción)
+  const t = tok.trim().toUpperCase()
+  if (t==="ALL") return null
+  if (t==="NO_LOCS") return []
+  return tok.split(",").map(s=>s.trim()).filter(Boolean)
+}
+function getLocIdForKey(locKey){ return locKey==="la_luz" ? LOC_LUZ : LOC_TORRE }
+function mergeLocAllow(a, b){
+  // a/b pueden ser: null (ALL), [] (ninguna), o [ids]
+  if (a===null || b===null) return null
+  if (!Array.isArray(a)) a=[]
+  if (!Array.isArray(b)) b=[]
+  return Array.from(new Set([...a, ...b]))
+}
 function parseEmployees(){
-  const out=[]
+  // 1) recopilar entradas crudas
+  const rawEntries=[]
   for (const [k,v] of Object.entries(process.env)) {
     if (!k.startsWith("SQ_EMP_")) continue
     const parts = String(v||"").split("|").map(s=>s.trim())
     const id = parts[0]; if (!id) continue
-    const bookTag = (parts[1]||"BOOKABLE").toUpperCase()
-    const bookable = ["BOOKABLE","TRUE","YES","1"].includes(bookTag)
-    const allow = parseAllowFromParts(parts.slice(2))
+    const tag = (parts[1]||"BOOKABLE").toUpperCase()
+    const bookable = ["BOOKABLE","TRUE","YES","1"].includes(tag)
+    const locAllow = parseLocIdsToken(parts[2]||"")
+    const allowCats = parseAllowFromParts(parts.slice(3))
     const labels = deriveLabelsFromEnvKey(k)
-    out.push({ envKey:k, id, bookable, allow, labels })
+    rawEntries.push({ envKey:k, id, bookable, locAllow, allowCats, labels })
   }
-  return out
+  // 2) deduplicar por id
+  const byId = new Map()
+  for (const e of rawEntries){
+    const prev = byId.get(e.id)
+    if (!prev){
+      byId.set(e.id, {
+        id: e.id,
+        bookable: !!e.bookable,
+        allowedLocIds: e.locAllow,        // null=ALL, []=ninguna, [ids]=lista
+        allow: e.allowCats,               // categorías permitidas (["ALL"] por defecto)
+        labels: Array.from(new Set(e.labels))
+      })
+    } else {
+      prev.bookable = prev.bookable || e.bookable
+      prev.allowedLocIds = mergeLocAllow(prev.allowedLocIds, e.locAllow)
+      if (prev.allow?.includes("ALL") || e.allowCats?.includes("ALL")) {
+        prev.allow = ["ALL"]
+      } else {
+        prev.allow = Array.from(new Set([...(prev.allow||[]), ...(e.allowCats||[])]))
+      }
+      prev.labels = Array.from(new Set([...(prev.labels||[]), ...e.labels]))
+    }
+  }
+  return Array.from(byId.values())
 }
 let EMPLOYEES = parseEmployees()
+
 function staffLabelFromId(id){ const e = EMPLOYEES.find(x=>x.id===id); return e?.labels?.[0] || (id ? `Prof. ${String(id).slice(-4)}` : null) }
-function isStaffAllowedInLocation(staffId, _locKey){ const e = EMPLOYEES.find(x=>x.id===staffId); return !!(e && e.bookable) }
-function pickStaffForLocation(_locKey, preferId=null){
-  if (preferId){ const e = EMPLOYEES.find(x=>x.id===preferId && x.bookable); if (e) return e.id }
-  const found = EMPLOYEES.find(e=>e.bookable); return found?.id || null
+function allowedInLocation(staff, locKey){
+  if (!staff || !staff.bookable) return false
+  const allowed = staff.allowedLocIds
+  if (allowed === null) return true // ALL
+  if (Array.isArray(allowed) && allowed.length===0) return false // NO_LOCS
+  const locId = getLocIdForKey(locKey)
+  if (!locId) return true // por si falta env, no bloqueamos
+  return allowed.includes(locId)
+}
+function isStaffAllowedInLocation(staffId, locKey){
+  const e = EMPLOYEES.find(x=>x.id===staffId)
+  return allowedInLocation(e, locKey)
+}
+function pickStaffForLocation(locKey, envServiceKey, preferId=null){
+  if (preferId){
+    if (isStaffAllowedInLocation(preferId, locKey) && isServiceCompatibleWithStaff(locKey, envServiceKey, preferId)) {
+      return preferId
+    }
+  }
+  const list = EMPLOYEES.filter(e => allowedInLocation(e, locKey) && isServiceCompatibleWithStaff(locKey, envServiceKey, e.id))
+  return list[0]?.id || null
 }
 
 // ====== Servicios y categorías
@@ -360,7 +423,7 @@ const CATS = {
   "depilación": (s,_u)=> /\b(depil|fotodepil|axilas|ingles|inglés|labio|fosas|nasales)\b/i.test(s.label),
   "micropigmentación": (s,_u)=> /\b(microblading|microshading|efecto polvo|aquarela|eyeliner|retoque|labios|cejas)\b/i.test(s.label),
   "faciales": (s,_u)=> /\b(limpieza|facial|dermapen|carbon|peel|vitamina|hidra|acne|manchas|colageno|colágeno)\b/i.test(s.label),
-  "pestañas": (s,_u)=> /\b(pestañ|pestanas|extensiones|lifting|relleno pesta)\b/i.test(s.label)
+  "pestañas": (s,_u)=> /\b(pestañ|pestanas|lifting|extensiones|relleno pesta)\b/i.test(s.label)
 }
 const CAT_ALIASES = { "unas":"uñas","unias":"uñas","unyas":"uñas","depilacion":"depilación","depilacion laser":"depilación","micro":"micropigmentación","micropigmentacion":"micropigmentación","facial":"faciales","pestanas":"pestañas" }
 function parseCategory(text){
@@ -467,8 +530,14 @@ function isSlotBlockedInDB({ locationKey, dateEU }){
   return !!row
 }
 function filterOutBlockedAndIncompatible(slots, locationKey, envServiceKey){
-  return slots.filter(s => !isSlotBlockedInDB({ locationKey, dateEU:s.date }))
-              .filter(s => !s.staffId || isServiceCompatibleWithStaff(locationKey, envServiceKey, s.staffId))
+  return slots
+    .filter(s => !isSlotBlockedInDB({ locationKey, dateEU:s.date }))
+    .filter(s => {
+      if (!s.staffId) return true
+      const okLoc = isStaffAllowedInLocation(s.staffId, locationKey)
+      const okSvc = isServiceCompatibleWithStaff(locationKey, envServiceKey, s.staffId)
+      return okLoc && okSvc
+    })
 }
 
 // ====== Construcción de horario FULL (120 días) + caché
@@ -596,6 +665,8 @@ async function proposeTimesFromFullSchedule(sessionData, phone, sock, jid, { tex
   let usedPreferred=false
   if (sessionData.preferredStaffId){
     const only = list.filter(s => s.staffId === sessionData.preferredStaffId)
+                     .filter(s => isStaffAllowedInLocation(s.staffId, sessionData.sede)
+                               && isServiceCompatibleWithStaff(sessionData.sede, sessionData.selectedServiceEnvKey, s.staffId))
     if (only.length){ list = only; usedPreferred=true }
   }
 
@@ -729,7 +800,7 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>Gapink Nails Bot v33.0.0</h1>
+  <h1>Gapink Nails Bot v33.1.0</h1>
   <div class="status ${conectado ? "success" : "error"}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "Simulación" : "Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
@@ -903,8 +974,8 @@ async function startBot(){
             }
             session.preferredStaffId = fuzzy.id; session.preferredStaffLabel = staffLabelFromId(fuzzy.id); saveSession(phone, session)
             if (session.sede && session.selectedServiceEnvKey){
-              if (!isServiceCompatibleWithStaff(session.sede, session.selectedServiceEnvKey, session.preferredStaffId)){
-                await sendWithLog(sock, jid, `Nota: *${session.preferredStaffLabel}* no realiza este servicio. Te muestro huecos del *equipo*.`, {phone, intent:"staff_incompatible_immediate", action:"guide"})
+              if (!isServiceCompatibleWithStaff(session.sede, session.selectedServiceEnvKey, session.preferredStaffId) || !isStaffAllowedInLocation(session.preferredStaffId, session.sede)){
+                await sendWithLog(sock, jid, `Nota: *${session.preferredStaffLabel}* no realiza este servicio o no tiene agenda en ese salón. Te muestro huecos del *equipo*.`, {phone, intent:"staff_incompatible_immediate", action:"guide"})
                 session.preferredStaffId = null; session.preferredStaffLabel = null; saveSession(phone, session)
               }
               await proposeTimesFromFullSchedule(session, phone, sock, jid, { text:textRaw })
@@ -930,7 +1001,6 @@ async function startBot(){
               else { saveSession(phone, session); noteServiceListSignature(session, sig, phone); const lines = list.map(it=> `${it.index}) ${it.label}`).join("\n"); await sendWithLog(sock, jid, `Elige el *servicio* para mostrarte el horario en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`, {phone, intent:"ask_service_number", action:"guide", stage:session.stage}) }
               return
             }
-            // Aunque exista semanal, para tu requerimiento preferimos el full + top N
             await proposeTimesFromFullSchedule(session, phone, sock, jid, { text:textRaw })
             return
           }
@@ -966,8 +1036,8 @@ async function startBot(){
               const ek = resolveEnvKeyFromLabelAndSede(p.label, session.sede)
               if (ek){
                 session.selectedServiceEnvKey = ek; session.selectedServiceLabel = p.label; session.stage=null; saveSession(phone, session)
-                if (session.preferredStaffId && !isServiceCompatibleWithStaff(session.sede, session.selectedServiceEnvKey, session.preferredStaffId)){
-                  await sendWithLog(sock, jid, `Nota: *${session.preferredStaffLabel}* no realiza este servicio. Te paso huecos del *equipo*.`, {phone, intent:"staff_incompatible_after_choose", action:"guide"})
+                if (session.preferredStaffId && (!isServiceCompatibleWithStaff(session.sede, session.selectedServiceEnvKey, session.preferredStaffId) || !isStaffAllowedInLocation(session.preferredStaffId, session.sede))){
+                  await sendWithLog(sock, jid, `Nota: *${session.preferredStaffLabel}* no realiza este servicio o no tiene agenda en ese salón. Te paso huecos del *equipo*.`, {phone, intent:"staff_incompatible_after_choose", action:"guide"})
                   session.preferredStaffId = null; session.preferredStaffLabel = null; saveSession(phone, session)
                 }
                 await proposeTimesFromFullSchedule(session, phone, sock, jid, { text:textRaw }); return
@@ -1038,11 +1108,14 @@ async function executeCreateLocalHold(sessionData, phone, sock, jid){
   if (!insideBusinessHours(startEU, 60)) { await sendWithLog(sock, jid, "Esa hora está fuera del horario (L–V 09:00–20:00).", {phone, intent:"outside_hours", action:"guide"}); return }
 
   const iso = startEU.format("YYYY-MM-DDTHH:mm")
-  let staffId = sessionData.lastProposeUsedPreferred ? (sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null)
-                                                    : (sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null)
-  if (staffId && !isStaffAllowedInLocation(staffId, sessionData.sede)) staffId = null
-  if (staffId && !isServiceCompatibleWithStaff(sessionData.sede, sessionData.selectedServiceEnvKey, staffId)) staffId = null
-  if (!staffId) staffId = pickStaffForLocation(sessionData.sede, null)
+  let staffId = sessionData.lastProposeUsedPreferred
+      ? (sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null)
+      : (sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null)
+
+  if (staffId && (!isStaffAllowedInLocation(staffId, sessionData.sede) || !isServiceCompatibleWithStaff(sessionData.sede, sessionData.selectedServiceEnvKey, staffId))) {
+    staffId = null
+  }
+  if (!staffId) staffId = pickStaffForLocation(sessionData.sede, sessionData.selectedServiceEnvKey, null)
 
   // Identidad
   let customerId = sessionData.identityResolvedCustomerId || null
@@ -1097,8 +1170,28 @@ Ya tenemos tu *hora* elegida. Una empleada lo tramita en el sistema y te confirm
   clearSession(phone);
 }
 
+// ====== Aux: clientes (reutilizado)
+async function findOrCreateCustomerWithRetry({ name, email, phone }){
+  const e164 = normalizePhoneES(phone)
+  // Buscar primero
+  try{
+    const got = await square.customersApi.searchCustomers({ query:{ filter:{ phoneNumber:{ exact:e164 } } } })
+    const c=(got?.result?.customers||[])[0]
+    if (c) return c
+  }catch{}
+  // Crear
+  const body = { givenName: name || "Cliente", emailAddress: email || undefined, phoneNumber: e164 }
+  for (let i=0;i<2;i++){
+    try{
+      const resp = await square.customersApi.createCustomer(body)
+      return resp?.result?.customer || null
+    }catch(e){ await sleep(250) }
+  }
+  return null
+}
+
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v33.0.0 — FullSchedule ${SCHEDULE_FULL_DAYS}d · Top ${SHOW_TOP_N_TIMES}`)
+console.log(`🩷 Gapink Nails Bot v33.1.0 — FullSchedule ${SCHEDULE_FULL_DAYS}d · Top ${SHOW_TOP_N_TIMES}`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
