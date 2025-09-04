@@ -1,6 +1,7 @@
-// index.js — Gapink Nails · v33.0.0
+// index.js — Gapink Nails · v33.1.0
 // Modo: RESUMEN MANUAL (no crea reserva en Square; genera un resumen para que la empleada lo coja)
-// “Datos del cliente” vienen de Square por número (nombre/email). Sin “¿con quién?” salvo que el cliente lo diga.
+// Fix v33.1.0: si el usuario ya eligió ficha (identityResolvedCustomerId), NO volver a preguntar la identidad.
+// Lee datos de cliente desde Square por teléfono. Sin “¿con quién?” salvo que el cliente lo diga.
 // Overrides: ana/anna/hanna/hana -> Ganna. Anti-repeat. Memoria. Sin revalidación del hueco seleccionado.
 
 import express from "express"
@@ -36,7 +37,7 @@ const MAX_WEEKS_LOOKAHEAD = Number(process.env.MAX_WEEKS_LOOKAHEAD || 52)
 
 // ===== Flags
 const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
-const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "") // no afecta porque no creamos la reserva
+const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "")
 const SQUARE_MAX_RETRIES = Number(process.env.SQUARE_MAX_RETRIES || 3)
 
 // ===== Square (consultas reales)
@@ -49,7 +50,7 @@ const LOC_LUZ   = (process.env.SQUARE_LOCATION_ID_LA_LUZ || "").trim()
 const ADDRESS_TORRE = process.env.ADDRESS_TORREMOLINOS || "Av. de Benyamina 18, Torremolinos"
 const ADDRESS_LUZ   = process.env.ADDRESS_LA_LUZ || "Málaga – Barrio de La Luz"
 
-// ===== IA (opcional; solo para interpretar intención, nunca para repetir listas)
+// ===== IA (solo interpretar intención)
 const AI_PROVIDER = (process.env.AI_PROVIDER || (process.env.DEEPSEEK_API_KEY? "deepseek" : process.env.OPENAI_API_KEY? "openai" : "none")).toLowerCase()
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ""
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-chat"
@@ -283,7 +284,7 @@ function noteAsk(session, key){
   session.lastAskAt[key] = Date.now()
 }
 
-// ===== Empleadas (global, sin bloquear por salón)
+// ===== Empleadas (global)
 function deriveLabelsFromEnvKey(envKey){
   const raw = envKey.replace(/^SQ_EMP_/, "")
   const toks = raw.split("_").map(t=>norm(t)).filter(Boolean)
@@ -312,7 +313,7 @@ function staffLabelFromId(id){
   const base = e?.labels?.[0] || (id ? `Profesional ${String(id).slice(-4)}` : null)
   return base ? titleCase(base) : null
 }
-function isStaffAllowedInLocation(_id, _locKey){ return true } // staff global
+function isStaffAllowedInLocation(_id, _locKey){ return true }
 function pickStaffForLocation(_locKey, preferId=null){
   if (preferId){
     const e = EMPLOYEES.find(x=>x.id===preferId && x.bookable)
@@ -322,7 +323,7 @@ function pickStaffForLocation(_locKey, preferId=null){
   return found?.id || null
 }
 
-// Aliases & overrides (ana -> ganna y familia)
+// Aliases & overrides (ana -> ganna)
 const HARD_NAME_OVERRIDES = { "ana":"ganna", "anna":"ganna", "hanna":"ganna", "hana":"ganna" }
 const NAME_ALIASES = [
   ["patri","patricia"],["patricia","patri"],
@@ -451,7 +452,7 @@ function listServicesByCategory(sedeKey, category, userMsg){
   return out
 }
 
-// ===== Square helpers (clientes por teléfono; datos del cliente para el resumen)
+// ===== Square helpers (clientes por teléfono; respeta identidad ya resuelta)
 async function searchCustomersByPhone(phone){
   try{
     const e164=normalizePhoneES(phone); if(!e164) return []
@@ -460,17 +461,29 @@ async function searchCustomersByPhone(phone){
   }catch{ return [] }
 }
 async function getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid){
+  // Nuevo: si ya tenemos identidad resuelta, devuélvela sin preguntar otra vez
+  if (sessionData?.identityResolvedCustomerId){
+    const all = await searchCustomersByPhone(phone)
+    const found = all.find(c => c.id === sessionData.identityResolvedCustomerId)
+    if (found){
+      sessionData.name = sessionData.name || found.givenName || null
+      sessionData.email = sessionData.email || found.emailAddress || null
+      return { status:"single", customer: found }
+    }
+    // Si no aparece (caso raro), devolvemos single con lo que sabemos
+    return { status:"single", customer: { id: sessionData.identityResolvedCustomerId } }
+  }
+
   const matches = await searchCustomersByPhone(phone)
   if (matches.length === 1){
     const c = matches[0]
     sessionData.identityResolvedCustomerId = c.id
-    sessionData.name = c?.givenName || null
-    sessionData.email = c?.emailAddress || null
+    sessionData.name = sessionData.name || c?.givenName || null
+    sessionData.email = sessionData.email || c?.emailAddress || null
     return { status:"single", customer:c }
   }
   if (matches.length === 0){
-    // No molestamos: para el resumen usaremos “—”
-    return { status:"none" }
+    return { status:"none" } // no molestamos; en resumen mostramos “—”
   }
   const choices = matches.map((c,i)=>({ index:i+1, id:c.id, name:c?.givenName || "Sin nombre", email:c?.emailAddress || "—" }))
   sessionData.identityChoices = choices
@@ -496,7 +509,7 @@ async function getServiceIdAndVersion(envKey){
   return {id,version:ver||1}
 }
 
-// ===== Disponibilidad (guardamos también la duración sugerida por Square si viene)
+// ===== Disponibilidad
 function partOfDayWindow(dateEU, part){
   let start=dateEU.clone().hour(OPEN.start).minute(0).second(0).millisecond(0)
   let end  =dateEU.clone().hour(OPEN.end).minute(0).second(0).millisecond(0)
@@ -662,7 +675,7 @@ function noteServiceListSignature(session, sig, phone){
   saveSession(phone, session)
 }
 
-// ===== Proponer horas (respeta lock; no revalidar selección)
+// ===== Proponer horas
 async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   const now = nowEU();
   const baseFrom = nextOpeningFrom(now.add(NOW_MIN_OFFSET_MIN, "minute"))
@@ -693,7 +706,6 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   const targetPreferred = opts.forceStaffId ?? sessionData.preferredStaffId ?? null
   const strictPreferred = opts.strictPreferred ?? !!sessionData.strictStaffLock
 
-  // ESTRICTO: solo esa profesional, buscar hasta N semanas
   if (strictPreferred && targetPreferred){
     const strictBase = startEU.clone()
     const strictSlots = await findStrictPreferredSlots({
@@ -723,7 +735,6 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
     }
   }
 
-  // Normal (equipo o preferida sin lock)
   const rawSlots = await searchAvailWindow({
     locationKey: sessionData.sede,
     envServiceKey: sessionData.selectedServiceEnvKey,
@@ -737,7 +748,6 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
     if (filtered.length){ slots = filtered; usedPreferred = true }
   }
 
-  // Fallback próxima semana
   if (!slots.length){
     const startNext = startEU.clone().add(7, "day")
     const endNext   = endEU.clone().add(7, "day")
@@ -871,6 +881,7 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
 }
 
 // ===== Resumen manual (datos del cliente desde Square)
+// FIX: si identityResolvedCustomerId existe, NO volver a preguntar.
 async function executeCreateSummary(sessionData, phone, sock, jid){
   if (!sessionData.sede) { if (canAsk(sessionData,"sede")){ noteAsk(sessionData,"sede"); saveSession(phone, sessionData)
       await sendWithLog(sock, jid, "Falta el *salón* (Torremolinos o La Luz)", {phone, intent:"missing_sede", action:"guide"}) } return }
@@ -885,19 +896,32 @@ async function executeCreateSummary(sessionData, phone, sock, jid){
     return
   }
 
-  // Datos del cliente desde Square por teléfono
   let custName="—", custEmail="—", custId=null
-  const custLookup = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid)
-  if (custLookup?.status==="single"){
-    const c = custLookup.customer
-    custId = c?.id || null
-    custName = c?.givenName || "—"
-    custEmail = c?.emailAddress || "—"
-  } else if (custLookup?.status==="need_pick"){
-    // se queda esperando la respuesta del cliente
-    return
+  if (sessionData.identityResolvedCustomerId){
+    // usamos la identidad elegida por el usuario sin volver a preguntar
+    custId = sessionData.identityResolvedCustomerId
+    custName = sessionData.name || "—"
+    custEmail = sessionData.email || "—"
+    // intentar enriquecer en background con Square (sin preguntar)
+    try{
+      const all = await searchCustomersByPhone(phone)
+      const found = all.find(c => c.id === custId)
+      if (found){
+        custName = found?.givenName || custName
+        custEmail = found?.emailAddress || custEmail
+      }
+    }catch{}
   } else {
-    // none -> dejamos “—”
+    const custLookup = await getUniqueCustomerByPhoneOrPrompt(phone, sessionData, sock, jid)
+    if (custLookup?.status==="single"){
+      const c = custLookup.customer
+      custId = c?.id || null
+      custName = c?.givenName || "—"
+      custEmail = c?.emailAddress || "—"
+    } else if (custLookup?.status==="need_pick"){
+      // se queda esperando la respuesta del cliente
+      return
+    } // status "none" -> dejamos “—”
   }
 
   const iso = startEU.format("YYYY-MM-DDTHH:mm")
@@ -910,7 +934,6 @@ async function executeCreateSummary(sessionData, phone, sock, jid){
   const address = sessionData.sede === "la_luz" ? ADDRESS_LUZ : ADDRESS_TORRE
   const svcLabel = serviceLabelFromEnvKey(sessionData.selectedServiceEnvKey) || sessionData.selectedServiceLabel || "Servicio"
 
-  // Guardamos “intención” como registro local (estado: pending_summary)
   const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
   insertAppt.run({
     id: aptId, customer_name: custName, customer_phone: phone,
@@ -983,11 +1006,11 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v33.0.0 — Top ${SHOW_TOP_N}</h1>
+  <h1>🩷 Gapink Nails Bot v33.1.0 — Top ${SHOW_TOP_N}</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
-  <p>Datos de cliente desde Square por teléfono · sin “¿con quién?” · lock si el cliente lo dice · ana→ganna.</p>
+  <p>Lee cliente y agenda desde Square · sin “¿con quién?” (lock solo si el cliente lo pide) · ana→ganna · fix identidad no repetida.</p>
   </div>`)
 })
 app.get("/qr.png", async (_req,res)=>{
@@ -1078,7 +1101,6 @@ async function startBot(){
           const temporal = parseTemporalPreference(textRaw)
           const explicitDT = parseExplicitDateTime(textRaw)
 
-          // Equipo explícito -> limpiar lock
           if (/\b(con el equipo|me da igual|cualquiera|con quien sea|lo que haya)\b/i.test(t)){
             session.preferredStaffId = null
             session.preferredStaffLabel = null
@@ -1097,7 +1119,7 @@ async function startBot(){
             return
           }
 
-          // ===== ELECCIÓN DE SERVICIO POR NÚMERO (FIX)
+          // ===== ELECCIÓN DE SERVICIO POR NÚMERO
           if (session.stage==="awaiting_service_choice" && numMatch && Array.isArray(session.serviceChoices) && session.serviceChoices.length){
             const n = Number(numMatch[1])
             const choice = session.serviceChoices.find(it=>it.index===n)
@@ -1392,7 +1414,7 @@ async function startBot(){
 }
 
 // ===== Arranque
-console.log(`🩷 Gapink Nails Bot v33.0.0 — Top ${SHOW_TOP_N} (Resumen manual · datos cliente desde Square · strictStaffLock · ana→ganna)`)
+console.log(`🩷 Gapink Nails Bot v33.1.0 — Top ${SHOW_TOP_N} (Resumen manual · datos cliente desde Square · strictStaffLock · ana→ganna · fix identidad)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
