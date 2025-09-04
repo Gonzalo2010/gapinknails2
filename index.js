@@ -1,12 +1,10 @@
-// index.js — Gapink Nails · v32.1.0 (backend-first, sin crear en Square)
-// Cambios clave:
-// - Fuzzy staff robusto ("con cristi", "con ganna"...).
-// - Comprobación de compatibilidad servicio↔staff: si en 30 días no hay huecos con esa persona,
-//   avisamos que probablemente no lo realiza y mostramos huecos del equipo.
-// - Búsqueda extendida por semanas (sin dayjs.min).
-// - Trigger directo para "pásame huecos/horas".
-// - parseTemporalPreference reintroducido.
-// - Sin creación en Square: bloqueamos en DB con status "pending_manual".
+// index.js — Gapink Nails · v32.1.1 (backend-first, sin crear en Square)
+// Cambios clave en esta versión:
+// - Ya NO se dice “voy a crear/reservar”; ahora siempre se entrega un RESUMEN:
+//   * Mensajes previos de “Reservo en nuestro sistema” reemplazados por “Te paso el resumen...”
+//   * Mensaje final: “📝 Resumen de tu solicitud (pendiente de confirmación)”
+// - Se mantiene el bloqueo local en DB (status "pending_manual") sin prometer creación.
+// - Resto de mejoras de v32.1.0: fuzzy staff, compatibilidad servicio↔staff, etc.
 
 import express from "express"
 import pino from "pino"
@@ -126,7 +124,6 @@ function applySpanishDiacritics(label){
   x = x.replace(/\bnivelacion\b/gi, m => m[0]==='N' ? 'Nivelación' : 'nivelación')
   x = x.replace(/\bfrances\b/gi, m => m[0]==='F' ? 'Francés' : 'francés')
   x = x.replace(/\bmas\b/gi, (m) => (m[0]==='M' ? 'Más' : 'más'))
-  x = x.replace(/\bsemi ?permanente\b/gi, m => /[A-Z]/.test(m[0]) ? 'Semipermanente' : 'semipermanente')
   x = x.replace(/\bninas\b/gi, 'niñas')
   return x
 }
@@ -701,7 +698,7 @@ function noteServiceListSignature(session, sig, phone){
 function parseTemporalPreference(text){
   const t = norm(text)
   const now = dayjs().tz(EURO_TZ)
-  const mapDia = { "lunes":1,"martes":2,"miercoles":3,"miércoles":3,"jueves":4,"viernes":5,"sabado":6,"sábado":6,"domingo":0 }
+  const mapDia = { "lunes":1,"martes":2,"miercoles":3,"miércoles":3,"jueves":4,"viernes":5,"sabado":6," sábado":6,"domingo":0 }
   let targetDay=null
   for (const k of Object.keys(mapDia)){ if (t.includes(k)) { targetDay = mapDia[k]; break } }
   let when = null
@@ -958,7 +955,7 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   await sendWithLog(sock, jid, `${header}${lines.join("\n")}\n\nResponde con el *número*.`, {phone, intent:"weekly_list", action:"guide", stage:sessionData.stage})
 }
 
-// ====== Crear “reserva” SOLO en DB (bloquea hueco)
+// ====== Crear “hold” SOLO en DB y mostrar RESUMEN (sin prometer creación)
 async function executeCreateLocalHold(sessionData, phone, sock, jid){
   if (!sessionData.sede) { await sendWithLog(sock, jid, "Falta el *salón*.", {phone, intent:"missing_sede", action:"guide"}); return }
   if (!sessionData.selectedServiceEnvKey) { await sendWithLog(sock, jid, "Falta el *servicio*.", {phone, intent:"missing_service", action:"guide"}); return }
@@ -999,6 +996,7 @@ async function executeCreateLocalHold(sessionData, phone, sock, jid){
     return
   }
 
+  // Guardamos hold local silenciosamente (no lo “vendemos” como creación)
   const aptId = `apt_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`
   insertAppt.run({
     id: aptId,
@@ -1023,13 +1021,13 @@ async function executeCreateLocalHold(sessionData, phone, sock, jid){
   const svcLabel = serviceLabelFromEnvKey(sessionData.selectedServiceEnvKey) || sessionData.selectedServiceLabel || "Servicio"
   const proLabel = staffId ? (staffLabelFromId(staffId) || "Equipo") : "Equipo"
 
-  const msg = `✅ Te lo reservo *a falta de confirmación* (lo pasamos nosotros):
+  const msg = `📝 *Resumen de tu solicitud* (pendiente de confirmación):
 📍 ${locationNice(sessionData.sede)} — ${address}
 🧾 ${svcLabel}
 👩‍💼 ${proLabel}
 🕐 ${fmtES(startEU)}
 
-Una empleada te confirma en breve por aquí.`
+Una empleada te confirma por aquí en breve.`
   await sendWithLog(sock, jid, msg, {phone, intent:"booking_local_ok", action:"confirm"})
   clearSession(phone);
 }
@@ -1214,7 +1212,7 @@ async function startBot(){
             session.identityResolvedCustomerId = choice.id
             session.stage = null
             saveSession(phone, session)
-            await sendWithLog(sock, jid, "¡Gracias! Reservo en nuestro sistema…", {phone, intent:"identity_ok", action:"info"})
+            await sendWithLog(sock, jid, "¡Gracias! Te paso el *resumen* de tu solicitud. ✅", {phone, intent:"identity_ok", action:"info"})
             await executeCreateLocalHold(session, phone, sock, jid)
             return
           }
@@ -1228,7 +1226,7 @@ async function startBot(){
             session.identityResolvedCustomerId = created.id
             session.stage = null
             saveSession(phone, session)
-            await sendWithLog(sock, jid, "¡Gracias! Reservo en nuestro sistema…", {phone, intent:"identity_created", action:"info"})
+            await sendWithLog(sock, jid, "¡Gracias! Te paso el *resumen* de tu solicitud. ✅", {phone, intent:"identity_created", action:"info"})
             await executeCreateLocalHold(session, phone, sock, jid)
             return
           }
@@ -1256,7 +1254,7 @@ async function startBot(){
             session.pendingDateTime = pick.tz(EURO_TZ).toISOString()
             if (staffFromIso){ session.preferredStaffId = staffFromIso; session.preferredStaffLabel = staffLabelFromId(staffFromIso) }
             saveSession(phone, session)
-            await sendWithLog(sock, jid, "¡Perfecto! Te la reservo en nuestro sistema…", {phone, intent:"time_selected", action:"info"})
+            await sendWithLog(sock, jid, "¡Perfecto! Te paso el *resumen* de tu solicitud. ✅", {phone, intent:"time_selected", action:"info"})
             await executeCreateLocalHold(session, phone, sock, jid)
             return
           }
@@ -1425,7 +1423,7 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v32.1.0 — Top ${SHOW_TOP_N} (L–V)`)
+console.log(`🩷 Gapink Nails Bot v32.1.1 — Top ${SHOW_TOP_N} (L–V)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
