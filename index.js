@@ -1,16 +1,17 @@
-// index.js — Gapink Nails · v33.1.0
-// Cambios v33.1.0:
-// - Empleadas parseadas desde env con formato: ID | BOOKABLE|NO_BOOKABLE | LOCS
-//   donde LOCS ∈ { "ALL", "NO_LOCS", "LF5NK1R8RDMRV,LSMNAJFSY1EGS", ... }.
-// - Deduplicación por teamMemberId: se fusionan labels, BOOKABLE = OR, LOCS se
-//   unen (si alguno es ALL ⇒ ALL). Soporta además "ALLOW=" en segmentos extra
-//   para categorías/servicios (backward compatible).
-// - Filtro duro por local y compatibilidad de servicio al construir horario y al
-//   asignar profesional (incluye preferida si procede).
-// - pickStaffForLocation ahora respeta local + compatibilidad servicio.
+// index.js — Gapink Nails · v33.2.0
+// Cambios v33.2.0:
+// - Profesional preferida: ahora se aceptan slots con staffId === preferida
+//   **o** slots genéricos (sin staffId) si la preferida está permitida en ese
+//   salón y es compatible con el servicio. Si aun así no hay huecos, fallback
+//   automático al equipo (sin preferida) para no devolver “cero”.
+// - parseSede tolera typos comunes de Torremolinos (ej. “torremolinso”).
 //
-// Cambios v33.0.0 (previos):
-// - “FullSchedule 120 días” con caché de sesión y top-N propuestas, etc.
+// Cambios v33.1.0:
+// - Empleadas parseadas desde env con: ID | BOOKABLE|NO_BOOKABLE | LOCS
+//   (LOCS = ALL/NO_LOCS/ids). Dedupe por ID; BOOKABLE es OR; LOCS se fusiona.
+//   Filtro duro por local + compatibilidad de servicio.
+// - pickStaffForLocation respeta local + compatibilidad.
+// - FullSchedule 120 días y top-N propuestas (heredado de 33.0.0).
 
 import express from "express"
 import pino from "pino"
@@ -37,11 +38,8 @@ const WORK_DAYS = [1,2,3,4,5] // L–V
 const SLOT_MIN = 30
 const OPEN = { start: 9, end: 20 }
 const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
-// Búsquedas ad-hoc (semanal, etc.)
 const SEARCH_WINDOW_DAYS = Number(process.env.BOT_SEARCH_WINDOW_DAYS || 14)
-// Horario “full” para cache (requisito: 120 días)
 const SCHEDULE_FULL_DAYS = Number(process.env.SCHEDULE_FULL_DAYS || 120)
-// Top N de propuestas tras filtrar por nombre
 const SHOW_TOP_N_TIMES = Number(process.env.SHOW_TOP_N_TIMES || 10)
 
 // Para listados varios:
@@ -289,7 +287,7 @@ function saveSession(phone,s){
 }
 function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
 
-// ====== Empleadas (filtrado por ID + local + categorías opcionales)
+// ====== Empleadas (ID + local + categorías opcionales)
 function parseAllowFromParts(parts){
   const allowPart = (parts||[]).find(p => /^ALLOW\s*=/i.test(p))
   if (!allowPart) return ["ALL"]
@@ -307,7 +305,7 @@ function deriveLabelsFromEnvKey(envKey){
   return labels
 }
 function parseLocIdsToken(tok){
-  if (!tok || !tok.trim()) return null // null = ALL (sin restricción)
+  if (!tok || !tok.trim()) return null // null = ALL
   const t = tok.trim().toUpperCase()
   if (t==="ALL") return null
   if (t==="NO_LOCS") return []
@@ -315,14 +313,12 @@ function parseLocIdsToken(tok){
 }
 function getLocIdForKey(locKey){ return locKey==="la_luz" ? LOC_LUZ : LOC_TORRE }
 function mergeLocAllow(a, b){
-  // a/b pueden ser: null (ALL), [] (ninguna), o [ids]
   if (a===null || b===null) return null
   if (!Array.isArray(a)) a=[]
   if (!Array.isArray(b)) b=[]
   return Array.from(new Set([...a, ...b]))
 }
 function parseEmployees(){
-  // 1) recopilar entradas crudas
   const rawEntries=[]
   for (const [k,v] of Object.entries(process.env)) {
     if (!k.startsWith("SQ_EMP_")) continue
@@ -335,7 +331,6 @@ function parseEmployees(){
     const labels = deriveLabelsFromEnvKey(k)
     rawEntries.push({ envKey:k, id, bookable, locAllow, allowCats, labels })
   }
-  // 2) deduplicar por id
   const byId = new Map()
   for (const e of rawEntries){
     const prev = byId.get(e.id)
@@ -343,8 +338,8 @@ function parseEmployees(){
       byId.set(e.id, {
         id: e.id,
         bookable: !!e.bookable,
-        allowedLocIds: e.locAllow,        // null=ALL, []=ninguna, [ids]=lista
-        allow: e.allowCats,               // categorías permitidas (["ALL"] por defecto)
+        allowedLocIds: e.locAllow,  // null=ALL, []=ninguna, [ids]
+        allow: e.allowCats,         // ["ALL"] por defecto
         labels: Array.from(new Set(e.labels))
       })
     } else {
@@ -369,7 +364,7 @@ function allowedInLocation(staff, locKey){
   if (allowed === null) return true // ALL
   if (Array.isArray(allowed) && allowed.length===0) return false // NO_LOCS
   const locId = getLocIdForKey(locKey)
-  if (!locId) return true // por si falta env, no bloqueamos
+  if (!locId) return true
   return allowed.includes(locId)
 }
 function isStaffAllowedInLocation(staffId, locKey){
@@ -506,7 +501,6 @@ async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, l
                  : []
     if (segs[0]?.teamMemberId) tm = segs[0].teamMemberId
     if (part){
-      // parte del día
       const start = d.clone().hour(part==="mañana"?OPEN.start:part==="tarde"?15:18).minute(0)
       const end   = d.clone().hour(part==="mañana"?13:OPEN.end).minute(0)
       if (!(d.isSame(start,"day") && d.isAfter(start.subtract(1,"minute")) && d.isBefore(end.add(1,"minute")))) continue
@@ -550,19 +544,15 @@ async function ensureFullScheduleCache(sessionData){
   const endEU = startEU.clone().add(SCHEDULE_FULL_DAYS,"day").hour(OPEN.end).minute(0)
   const key = stableKey({ sede, envServiceKey, start:startEU.format(), end:endEU.format() })
 
-  // Cache válido 30 minutos
   const freshMs = 30*60*1000
   const cache = sessionData.fullScheduleCache
   if (cache && cache.key===key && (Date.now() - (cache.createdAt_ms||0)) < freshMs){
-    // Normaliza a objetos con dayjs (sólo en runtime)
     return cache.slots.map(it => ({ date: dayjs.tz(it.iso, EURO_TZ), staffId: it.staffId || null }))
   }
 
-  // Descarga completa
   const raw = await searchAvailWindow({ locationKey: sede, envServiceKey, startEU, endEU, limit: 5000 })
   const filtered = filterOutBlockedAndIncompatible(raw, sede, envServiceKey)
 
-  // Guardamos compacto
   sessionData.fullScheduleCache = {
     key,
     createdAt_ms: Date.now(),
@@ -575,7 +565,8 @@ async function ensureFullScheduleCache(sessionData){
 function parseSede(text){
   const t=norm(text)
   if (/\b(luz|la luz)\b/.test(t)) return "la_luz"
-  if (/\b(torre|torremolinos)\b/.test(t)) return "torremolinos"
+  // tolerancia a typos de "torremolinos"
+  if (/\b(torre|torremo|torremoli|torremolin|torremolinso|torremolinos)\b/.test(t)) return "torremolinos"
   return null
 }
 function parseNameEmailFromText(txt){
@@ -631,21 +622,20 @@ function noteServiceListSignature(session, sig, phone){
   saveSession(phone, session)
 }
 
-// ====== BLOQUE: Proponer horas usando HORARIO COMPLETO (120 días)
+// ====== Proponer horas (FullSchedule + preferida tolerante)
 async function proposeTimesFromFullSchedule(sessionData, phone, sock, jid, { text, date_hint, part_of_day } = {}){
   if (!sessionData.sede || !sessionData.selectedServiceEnvKey){
     await sendWithLog(sock, jid, "Antes dime *salón* y *servicio*.", {phone, intent:"need_sede_service", action:"guide", stage:sessionData.stage})
     return
   }
 
-  // 1) Cargar/recargar el horario completo
   const full = await ensureFullScheduleCache(sessionData)
   if (!full || !full.length){
     await sendWithLog(sock, jid, `No encuentro huecos en los próximos ${SCHEDULE_FULL_DAYS} días. ¿Otra fecha/franja (ej. “viernes tarde”)?`, {phone, intent:"no_slots_full", action:"guide"})
     return
   }
 
-  // 2) Aplicar filtro “parte del día” y/o “hint de fecha” si viene
+  // Filtros de franja/fecha
   let list = full
   if (part_of_day || date_hint){
     const hint = parseTemporalPreference(String(date_hint||text||""))
@@ -661,27 +651,32 @@ async function proposeTimesFromFullSchedule(sessionData, phone, sock, jid, { tex
     })
   }
 
-  // 3) AHORA filtramos por profesional si hay preferida
+  // Filtro preferida: aceptar staffId === preferida o slots genéricos
   let usedPreferred=false
   if (sessionData.preferredStaffId){
-    const only = list.filter(s => s.staffId === sessionData.preferredStaffId)
-                     .filter(s => isStaffAllowedInLocation(s.staffId, sessionData.sede)
-                               && isServiceCompatibleWithStaff(sessionData.sede, sessionData.selectedServiceEnvKey, s.staffId))
-    if (only.length){ list = only; usedPreferred=true }
+    const sid = sessionData.preferredStaffId
+    const okPreferred = isStaffAllowedInLocation(sid, sessionData.sede)
+                      && isServiceCompatibleWithStaff(sessionData.sede, sessionData.selectedServiceEnvKey, sid)
+    if (okPreferred){
+      const listPref = list.filter(s => (s.staffId ? s.staffId===sid : true)) // acepta genéricos
+      if (listPref.length){ list = listPref; usedPreferred=true }
+    }
+  }
+
+  // Fallback al equipo si nos quedamos a cero tras aplicar preferida
+  if (!list.length){
+    list = full.slice() // sin filtros preferida
+    usedPreferred = false
   }
 
   if (!list.length){
-    const msg = usedPreferred
-      ? `No veo huecos con *${sessionData.preferredStaffLabel}* en los próximos ${SCHEDULE_FULL_DAYS} días. ¿Te muestro del *equipo* o prefieres otra profesional?`
-      : `No veo huecos en ese filtro. ¿Probamos otra fecha o franja?`
-    await sendWithLog(sock, jid, msg, {phone, intent:"no_slots_after_filter", action:"guide"})
+    await sendWithLog(sock, jid, `No veo huecos en ese filtro. ¿Probamos otra fecha o franja?`, {phone, intent:"no_slots_after_filter", action:"guide"})
     return
   }
 
-  // 4) Proponemos primeras N (10 por defecto), siempre mostrando NOMBRES
+  // Proponemos primeras N
   const shown = list.slice(0, SHOW_TOP_N_TIMES)
   const map={}; for (const s of shown) map[s.date.format("YYYY-MM-DDTHH:mm")] = s.staffId || null
-  const { lines } = proposeLines(shown, map)
 
   sessionData.lastHours = shown.map(s => s.date)
   sessionData.lastStaffByIso = map
@@ -689,13 +684,14 @@ async function proposeTimesFromFullSchedule(sessionData, phone, sock, jid, { tex
   sessionData.stage = "awaiting_time"
   saveSession(phone, sessionData)
 
-  const header = usedPreferred
-    ? `Huecos con ${sessionData.preferredStaffLabel} — primeras ${SHOW_TOP_N_TIMES}:`
+  const header = usedPreferred && sessionData.preferredStaffLabel
+    ? `Huecos (intentaremos con ${sessionData.preferredStaffLabel}) — primeras ${SHOW_TOP_N_TIMES}:`
     : `Huecos del equipo — primeras ${SHOW_TOP_N_TIMES}:`
+  const { lines } = proposeLines(shown, map)
   await sendWithLog(sock, jid, `${header}\n${lines}\n\nResponde con el número.`, {phone, intent:"times_full_list", action:"guide", stage:sessionData.stage})
 }
 
-// ====== HORARIO SEMANAL (se mantiene)
+// ====== HORARIO SEMANAL
 function nextMondayEU(base){ return base.clone().add(1,"week").isoWeekday(1).hour(OPEN.start).minute(0).second(0).millisecond(0) }
 async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   if (!sessionData.sede){ await sendWithLog(sock, jid, "¿Salón? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide"}); return }
@@ -754,7 +750,7 @@ function parseTemporalPreference(text){
   return { when, part, nextWeek }
 }
 
-// ====== Staff fuzzy + handoff (resumen humano)
+// ====== Staff fuzzy + handoff
 const NAME_ALIASES = [
   ["patri","patricia"],["patricia","patri"],
   ["cristi","cristina","cristy"],
@@ -800,7 +796,7 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>Gapink Nails Bot v33.1.0</h1>
+  <h1>Gapink Nails Bot v33.2.0</h1>
   <div class="status ${conectado ? "success" : "error"}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "Simulación" : "Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
@@ -888,7 +884,7 @@ async function startBot(){
             await sendWithLog(sock, jid, buildGreeting(), {phone, intent:"greeting_24h", action:"send_greeting"})
           }
 
-          // Derivar a humana para ciertos casos
+          // Derivar a humana
           if (looksLikeEditOrCancel(textRaw) || looksLikeOtherHumanTask(textRaw) || looksLikeAppointmentInfoQuery(textRaw)){
             session.snooze_until_ms = now.add(6,"hour").valueOf(); saveSession(phone, session)
             await sendWithLog(sock, jid, "Una empleada se pone con ello en un momento. Te escribimos por aquí ✅", {phone, intent:"human_handoff", action:"info"})
@@ -1083,7 +1079,7 @@ async function startBot(){
             return
           }
 
-          // Si ya tenemos todo, proponemos desde horario FULL
+          // Con todo listo → proponer desde FULL
           await proposeTimesFromFullSchedule(session, phone, sock, jid, { text:textRaw })
         }catch(err){
           if (BOT_DEBUG) console.error(err)
@@ -1170,16 +1166,14 @@ Ya tenemos tu *hora* elegida. Una empleada lo tramita en el sistema y te confirm
   clearSession(phone);
 }
 
-// ====== Aux: clientes (reutilizado)
+// ====== Aux: clientes
 async function findOrCreateCustomerWithRetry({ name, email, phone }){
   const e164 = normalizePhoneES(phone)
-  // Buscar primero
   try{
     const got = await square.customersApi.searchCustomers({ query:{ filter:{ phoneNumber:{ exact:e164 } } } })
     const c=(got?.result?.customers||[])[0]
     if (c) return c
   }catch{}
-  // Crear
   const body = { givenName: name || "Cliente", emailAddress: email || undefined, phoneNumber: e164 }
   for (let i=0;i<2;i++){
     try{
@@ -1191,7 +1185,7 @@ async function findOrCreateCustomerWithRetry({ name, email, phone }){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v33.1.0 — FullSchedule ${SCHEDULE_FULL_DAYS}d · Top ${SHOW_TOP_N_TIMES}`)
+console.log(`🩷 Gapink Nails Bot v33.2.0 — FullSchedule ${SCHEDULE_FULL_DAYS}d · Top ${SHOW_TOP_N_TIMES}`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
