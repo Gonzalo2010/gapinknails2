@@ -1,9 +1,7 @@
-// index.js — Gapink Nails · v31.9.1 (resumen manual + “Anna” ≡ “Ganna”)
-// Cambios Gonzalo (fix alias “Anna”):
-// - “anna” mapea a la pro Ganna (grupo: ganna/ghanna/hanna/hana/anna).
-// - Eliminado el mapping anterior “anna → anaira”.
-// - Mantiene: si el cliente dice “con <nombre>”, se filtra SOLO esa pro; nada de preguntar “¿con quién?”.
-// - Modo *resumen manual* (no crea cita en Square): genera resumen para que la coja una empleada.
+// index.js — Gapink Nails · v32.0.0
+// Modo: RESUMEN MANUAL (no reserva en Square)
+// Mejores: anti-repetición (cooldown), respetar fecha/hora explícitas del cliente,
+// no revalidar disponibilidad al elegir un número, alias “Anna” ≡ “Ganna”.
 
 import express from "express"
 import pino from "pino"
@@ -26,7 +24,7 @@ dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isoWeek); dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
 
 // ====== Config horario
-const WORK_DAYS = [1,2,3,4,5]        // L–V (sábado NO)
+const WORK_DAYS = [1,2,3,4,5]        // L–V
 const SLOT_MIN = 30
 const OPEN = { start: 9, end: 20 }
 const NOW_MIN_OFFSET_MIN = Number(process.env.BOT_NOW_OFFSET_MIN || 30)
@@ -40,7 +38,7 @@ const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
 const DRY_RUN = /^true$/i.test(process.env.DRY_RUN || "")
 const SQUARE_MAX_RETRIES = Number(process.env.SQUARE_MAX_RETRIES || 3)
 
-// ====== Square
+// ====== Square (solo para disponibilidad y clientes; NO reservar)
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment: (process.env.SQUARE_ENV==="production") ? Environment.Production : Environment.Sandbox
@@ -280,7 +278,8 @@ async function sendWithLog(sock, jid, text, {phone, intent, action, stage, extra
   }
 }
 
-// ====== Sesión
+// ====== Sesión + anti-repetición de preguntas
+const ASK_COOLDOWN_MS = Number(process.env.ASK_COOLDOWN_MS || (90*1000))
 function loadSession(phone){
   const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
   if (!row?.data_json) return null
@@ -299,6 +298,15 @@ function saveSession(phone,s){
   if (up.changes===0) db.prepare(`INSERT INTO sessions (phone,data_json,updated_at) VALUES (@p,@j,@u)`).run({p:phone,j,u:new Date().toISOString()})
 }
 function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
+function canAsk(session, key){
+  const t = Date.now()
+  const last = session.lastAskAt?.[key] || 0
+  return (t - last) > ASK_COOLDOWN_MS
+}
+function noteAsk(session, key){
+  session.lastAskAt = session.lastAskAt || {}
+  session.lastAskAt[key] = Date.now()
+}
 
 // ====== Empleadas
 function deriveLabelsFromEnvKey(envKey){
@@ -351,7 +359,7 @@ const NAME_ALIASES = [
   ["carmen belen","carmen","belen"],
   ["tania","tani"],
   ["johana","joana","yohana"],
-  ["ganna","ghanna","hanna","hana","anna"], // << Anna ≡ Ganna
+  ["ganna","ghanna","hanna","hana","anna"], // Anna ≡ Ganna
   ["ginna","gina"],
   ["chabely","chabeli","chabelí"],
   ["elisabeth","elisabet","elis"],
@@ -361,7 +369,7 @@ const NAME_ALIASES = [
   ["edurne","edur"],
   ["sudemis","sude"],
   ["maria","maría"],
-  ["anaira","an aira"],    // (sin “anna”)
+  ["anaira","an aira"],   // sin “anna”
   ["ana","anita"],
   ["thalia","thalía","talia","talía"]
 ]
@@ -520,7 +528,7 @@ async function getServiceIdAndVersion(envKey){
   }
   return {id,version:ver||1}
 }
-async function createBookingWithRetry(){ return { success:false, error:"disabled" } } // ⛔️ deshabilitado
+async function createBookingWithRetry(){ return { success:false, error:"disabled" } } // deshabilitado
 
 // ====== DISPONIBILIDAD
 function partOfDayWindow(dateEU, part){
@@ -553,6 +561,25 @@ function parseTemporalPreference(text){
 
   const nextWeek = /\b(pr[oó]xima\s+semana|semana\s+que\s+viene)\b/i.test(t)
   return { when, part, nextWeek }
+}
+
+// NEW: parseo de fecha/hora explícita tipo "17/09 16:00" o "17-09 16:00"
+function parseExplicitDateTime(text){
+  const t = text.trim()
+  const re = /(?<!\d)(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?\s+(?:a\s+las\s+)?(\d{1,2}):(\d{2})(?!\d)/i
+  const m = re.exec(t)
+  if (!m) return null
+  let [_, dd, mm, yyyy, hh, min] = m
+  dd = Number(dd); mm = Number(mm); hh = Number(hh); min = Number(min)
+  if (!yyyy){
+    // año actual
+    yyyy = dayjs().year()
+  } else {
+    yyyy = Number(yyyy.length===2 ? (2000 + Number(yyyy)) : yyyy)
+  }
+  const d = dayjs.tz(`${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}T${String(hh).padStart(2,"0")}:${String(min).padStart(2,"0")}:00`, EURO_TZ)
+  if (!d.isValid()) return null
+  return d
 }
 
 async function searchAvailWindow({ locationKey, envServiceKey, startEU, endEU, limit=200, part=null }){
@@ -661,14 +688,14 @@ async function aiInterpret(textRaw, session){
   return obj
 }
 
-// ====== Anti-repeat heurística
+// ====== Anti-repeat heurística (listas) + cooldown preguntas
 function serviceListSignature({sede, category, list}){
   return stableKey({ sede, category, labels:list.map(i=>i.label).join("|") })
 }
 function shouldSuppressServiceList(session, sig){
   const lastSig = session.lastServiceListSig || null
   const lastAt = session.lastServiceListAt_ms || 0
-  const freshMs = 90 * 1000 // 90s sin repetir
+  const freshMs = 90 * 1000 // 90s
   return (lastSig && lastSig===sig && (Date.now()-lastAt) < freshMs)
 }
 function noteServiceListSignature(session, sig, phone){
@@ -677,7 +704,7 @@ function noteServiceListSignature(session, sig, phone){
   saveSession(phone, session)
 }
 
-// ====== Proponer horas (Top N, con filtrado explícito)
+// ====== Proponer horas (Top N; respeta staff si se pidió)
 async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   const now = nowEU();
   const baseFrom = nextOpeningFrom(now.add(NOW_MIN_OFFSET_MIN, "minute"))
@@ -698,7 +725,10 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   let endEU   = when ? when.clone().hour(OPEN.end).minute(0)   : baseFrom.clone().add(days,"day")
 
   if (!sessionData.sede || !sessionData.selectedServiceEnvKey){
-    await sendWithLog(sock, jid, "Necesito primero *salón* y *servicio* para proponerte horas.", {phone, intent:"need_sede_service", action:"guide", stage:sessionData.stage})
+    if (canAsk(sessionData,"sede_service")){
+      noteAsk(sessionData,"sede_service"); saveSession(phone, sessionData)
+      await sendWithLog(sock, jid, "Necesito primero *salón* y *servicio* para proponerte horas.", {phone, intent:"need_sede_service", action:"guide", stage:sessionData.stage})
+    }
     return
   }
 
@@ -748,7 +778,7 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
       sessionData.stage = "awaiting_time"
       saveSession(phone, sessionData)
       const staffTag = targetPreferred ? ` con ${staffLabelFromId(targetPreferred)}` : ""
-      await sendWithLog(sock, jid, `No había huecos en los próximos ${days} días${targetPreferred&&!usedPreferred?" *con esa profesional*":""}. *La próxima semana* sí hay${usedPreferred?staffTag:""} (primeras ${SHOW_TOP_N}):\n${lines}\n\nResponde con el número.`, {phone, intent:"times_next_week", action:"guide", stage:sessionData.stage})
+      await sendWithLog(sock, jid, `No veía huecos en ese rango. *La próxima semana* sí hay${usedPreferred?staffTag:""} (primeras ${SHOW_TOP_N}):\n${lines}\n\nResponde con el número.`, {phone, intent:"times_next_week", action:"guide", stage:sessionData.stage})
       return
     }
   }
@@ -756,7 +786,7 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
   if (!slots.length){
     const msg = when
       ? `No veo huecos para ese día${part?` por la ${part}`:""}${targetPreferred?` con ${staffLabelFromId(targetPreferred)}`:""}. ¿Otra fecha o franja?`
-      : `No encuentro huecos en los próximos ${days} días${targetPreferred?` con ${staffLabelFromId(targetPreferred)}`:""}. ¿Otra fecha/franja (ej. “viernes por la tarde”)?`
+      : `No encuentro huecos en este rango${targetPreferred?` con ${staffLabelFromId(targetPreferred)}`:""}. ¿Otra fecha/franja (ej. “viernes por la tarde”)?`
     await sendWithLog(sock, jid, msg, {phone, intent:"no_slots", action:"guide"})
     return
   }
@@ -781,11 +811,13 @@ async function proposeTimes(sessionData, phone, sock, jid, opts={}){
 function nextMondayEU(base){ return base.clone().add(1,"week").isoWeekday(1).hour(OPEN.start).minute(0).second(0).millisecond(0) }
 async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   if (!sessionData.sede){
-    await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide"})
+    if (canAsk(sessionData,"sede")){ noteAsk(sessionData,"sede"); saveSession(phone, sessionData)
+      await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide"}) }
     return
   }
   if (!sessionData.selectedServiceEnvKey){
-    await sendWithLog(sock, jid, "Dime el *servicio* (o la *categoría* para listarte opciones) y te muestro el horario semanal.", {phone, intent:"ask_service", action:"guide"})
+    if (canAsk(sessionData,"servicio")){ noteAsk(sessionData,"servicio"); saveSession(phone, sessionData)
+      await sendWithLog(sock, jid, "Dime el *servicio* (o la *categoría* para listarte opciones) y te muestro el horario semanal.", {phone, intent:"ask_service", action:"guide"}) }
     return
   }
   const now = nowEU()
@@ -816,11 +848,7 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
   let slots = rawSlots
   if (staffIdFilter){
     const pf = rawSlots.filter(s => s.staffId === staffIdFilter)
-    if (pf.length){ slots = pf } else {
-      await sendWithLog(sock, jid, `No veo huecos con ${staffLabelFromId(staffIdFilter)} en ese rango. Te muestro el *horario del equipo*:`, {phone, intent:"weekly_fallback_team", action:"guide"})
-      slots = rawSlots
-      staffIdFilter = null
-    }
+    slots = pf.length ? pf : rawSlots
   }
 
   slots.sort((a,b)=>a.date.valueOf()-b.date.valueOf())
@@ -863,29 +891,23 @@ async function weeklySchedule(sessionData, phone, sock, jid, opts={}){
 
 // ====== Crear “reserva” → genera RESUMEN manual (no Square)
 async function executeCreateBooking(sessionData, phone, sock, jid){
-  if (!sessionData.sede) { await sendWithLog(sock, jid, "Falta el *salón* (Torremolinos o La Luz)", {phone, intent:"missing_sede", action:"guide"}); return }
-  if (!sessionData.selectedServiceEnvKey) { await sendWithLog(sock, jid, "Falta el *servicio*", {phone, intent:"missing_service", action:"guide"}); return }
-  if (!sessionData.pendingDateTime) { await sendWithLog(sock, jid, "Falta la *fecha y hora*", {phone, intent:"missing_datetime", action:"guide"}); return }
+  if (!sessionData.sede) { if (canAsk(sessionData,"sede")){ noteAsk(sessionData,"sede"); saveSession(phone, sessionData)
+      await sendWithLog(sock, jid, "Falta el *salón* (Torremolinos o La Luz)", {phone, intent:"missing_sede", action:"guide"}) } return }
+  if (!sessionData.selectedServiceEnvKey) { if (canAsk(sessionData,"servicio")){ noteAsk(sessionData,"servicio"); saveSession(phone, sessionData)
+      await sendWithLog(sock, jid, "Falta el *servicio*", {phone, intent:"missing_service", action:"guide"}) } return }
+  if (!sessionData.pendingDateTime) { if (canAsk(sessionData,"fecha")){ noteAsk(sessionData,"fecha"); saveSession(phone, sessionData)
+      await sendWithLog(sock, jid, "Falta la *fecha y hora*", {phone, intent:"missing_datetime", action:"guide"}) } return }
 
   const startEU = parseToEU(sessionData.pendingDateTime)
-  if (!insideBusinessHours(startEU, 60)) { await sendWithLog(sock, jid, "Esa hora está fuera del horario (L–V 09:00–20:00)", {phone, intent:"outside_hours", action:"guide"}); return }
-
-  const iso = startEU.format("YYYY-MM-DDTHH:mm")
-  let staffId = sessionData.lastProposeUsedPreferred ? (sessionData.preferredStaffId || sessionData.lastStaffByIso?.[iso] || null)
-                                                    : (sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null)
-
-  if (staffId && !isStaffAllowedInLocation(staffId, sessionData.sede)) staffId = null
-  if (!staffId) {
-    const probe = await searchAvailWindow({
-      locationKey: sessionData.sede,
-      envServiceKey: sessionData.selectedServiceEnvKey,
-      startEU: startEU.clone().subtract(5,"minute"),
-      endEU: startEU.clone().add(5,"minute"),
-      limit: 3
-    })
-    const match = probe.find(x => x.date.isSame(startEU, "minute"))
-    if (match?.staffId && isStaffAllowedInLocation(match.staffId, sessionData.sede)) staffId = match.staffId
+  if (!insideBusinessHours(startEU, 60)) {
+    await sendWithLog(sock, jid, "Esa hora está fuera del horario (L–V 09:00–20:00)", {phone, intent:"outside_hours", action:"guide"})
+    return
   }
+
+  // IMPORTANTE: NO revalidamos disponibilidad (para evitar “no hay” tras elegir número).
+  const iso = startEU.format("YYYY-MM-DDTHH:mm")
+  let staffId = sessionData.lastStaffByIso?.[iso] || sessionData.preferredStaffId || null
+  if (staffId && !isStaffAllowedInLocation(staffId, sessionData.sede)) staffId = null
 
   const staffName = staffId ? (staffLabelFromId(staffId) || "Profesional") : (sessionData.preferredStaffLabel || "Equipo")
   const address = sessionData.sede === "la_luz" ? ADDRESS_LUZ : ADDRESS_TORRE
@@ -957,11 +979,12 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v31.9.1 — Top ${SHOW_TOP_N}</h1>
+  <h1>🩷 Gapink Nails Bot v32.0.0 — Top ${SHOW_TOP_N}</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
-  <p>Modo *resumen manual*: no crea reservas en Square, solo genera el resumen para que el equipo la coja.</p>
+  <p>Modo <b>resumen manual</b>: no crea reservas en Square, solo genera el resumen para que el equipo la coja.</p>
+  <p>Antirrepetición activo (cooldown ${Math.round(ASK_COOLDOWN_MS/1000)}s) y bloqueo de fecha/hora explícitas.</p>
   </div>`)
 })
 app.get("/qr.png", async (_req,res)=>{
@@ -1022,7 +1045,8 @@ async function startBot(){
             cancelList:null,
             snooze_until_ms:null, name:null, email:null,
             lastServiceListSig:null, lastServiceListAt_ms:null,
-            serviceChoices:null
+            serviceChoices:null,
+            lastAskAt:{}
           }
           if (isFromMe) { saveSession(phone, session); return }
 
@@ -1052,6 +1076,7 @@ async function startBot(){
           const sedeMention = parseSede(textRaw)
           const catMention = parseCategory(textRaw)
           const temporal = parseTemporalPreference(textRaw)
+          const explicitDT = parseExplicitDateTime(textRaw)
 
           // Equipo explícito
           if (/\b(con el equipo|me da igual|cualquiera|con quien sea|lo que haya)\b/i.test(t)){
@@ -1065,7 +1090,8 @@ async function startBot(){
               if (!session.sede) faltan.push("salón")
               if (!session.category) faltan.push("categoría")
               if (!session.selectedServiceEnvKey) faltan.push("servicio")
-              await sendWithLog(sock, jid, `Perfecto, te paso huecos del equipo en cuanto me digas ${faltan.join(", ")}.`, {phone, intent:"need_data", action:"guide"})
+              if (canAsk(session,"faltan")){ noteAsk(session,"faltan"); saveSession(phone, session)
+                await sendWithLog(sock, jid, `Perfecto, te paso huecos del equipo en cuanto me digas ${faltan.join(", ")}.`, {phone, intent:"need_data", action:"guide"}) }
             }
             return
           }
@@ -1090,7 +1116,7 @@ async function startBot(){
               session.selectedServiceLabel = choice.label
               session.stage = null
               saveSession(phone, session)
-              await proposeTimes(session, phone, sock, jid, { text:"" })
+              await proposeTimes(session, phone, sock, jid, { text:"", forceStaffId: session.preferredStaffId || null })
               return
             }
           }
@@ -1123,7 +1149,8 @@ async function startBot(){
                 await proposeTimes(session, phone, sock, jid, { text:textRaw })
               } else {
                 const faltan=[]; if (!session.sede) faltan.push("salón"); if (!session.category) faltan.push("categoría"); if (!session.selectedServiceEnvKey) faltan.push("servicio")
-                await sendWithLog(sock, jid, `Perfecto, te paso huecos del equipo en cuanto me digas ${faltan.join(", ")}.`, {phone, intent:"prefer_team_again", action:"guide"})
+                if (canAsk(session,"faltan2")){ noteAsk(session,"faltan2"); saveSession(phone, session)
+                  await sendWithLog(sock, jid, `Perfecto, te paso huecos del equipo en cuanto me digas ${faltan.join(", ")}.`, {phone, intent:"prefer_team_again", action:"guide"}) }
               }
               return
             }
@@ -1138,20 +1165,31 @@ async function startBot(){
             const unknownNameMatch = /(?:^|\s)con\s+([a-zñáéíóúüï\s]{2,})\??$/i.exec(textRaw)
             if (unknownNameMatch){
               const alternativas = Array.from(new Set(EMPLOYEES.filter(e=> e.bookable).map(e=>titleCase(e.labels[0])))).slice(0,6)
-              await sendWithLog(sock, jid, `No tengo a *${titleCase(unknownNameMatch[1].trim())}* en el equipo. Disponibles: ${alternativas.join(", ")}. ¿Con quién prefieres?`, {phone, intent:"unknown_staff", action:"guide"})
+              await sendWithLog(sock, jid, `No tengo a *${titleCase(unknownNameMatch[1].trim())}* en el equipo. Disponibles: ${alternativas.join(", ")}.`, {phone, intent:"unknown_staff", action:"guide"})
               return
             }
+          }
+
+          // NEW: si dice fecha/hora explícita y tenemos sede+servicio → crear resumen directo
+          if (explicitDT && session.sede && session.selectedServiceEnvKey){
+            session.pendingDateTime = explicitDT.toISOString()
+            saveSession(phone, session)
+            await sendWithLog(sock, jid, "¡Perfecto! Te paso el *resumen* para que lo coja una empleada…", {phone, intent:"explicit_dt", action:"info"})
+            await executeCreateBooking(session, phone, sock, jid)
+            return
           }
 
           // Disparadores “horario”
           if (/\b(horario|agenda|est[áa]\s+semana|esta\s+semana|pr[oó]xima\s+semana|semana\s+que\s+viene|7\s+d[ií]as|siete\s+d[ií]as)\b/i.test(t)){
             if (!session.selectedServiceEnvKey){
               if (!session.category){
-                await sendWithLog(sock, jid, "Antes del horario, dime *categoría* (Uñas / Depilación / Micropigmentación / Faciales / Pestañas).", {phone, intent:"ask_category_for_schedule", action:"guide"})
+                if (canAsk(session,"categoria")){ noteAsk(session,"categoria"); saveSession(phone, session)
+                  await sendWithLog(sock, jid, "Antes del horario, dime *categoría* (Uñas / Depilación / Micropigmentación / Faciales / Pestañas).", {phone, intent:"ask_category_for_schedule", action:"guide"}) }
                 return
               }
               if (!session.sede){
-                await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede_for_schedule", action:"guide"})
+                if (canAsk(session,"sede")){ noteAsk(session,"sede"); saveSession(phone, session)
+                  await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede_for_schedule", action:"guide"}) }
                 return
               }
               const itemsRaw = listServicesByCategory(session.sede, session.category, textRaw)
@@ -1172,14 +1210,15 @@ async function startBot(){
             await weeklySchedule(session, phone, sock, jid, {
               nextWeek: temporal.nextWeek,
               staffName: null,
-              usePreferred: true
+              usePreferred: true,
+              forceStaffId: session.preferredStaffId || null
             })
             return
           }
 
           // Si ya hay salón+servicio y menciona día/franja → proponer
           if (session.sede && session.selectedServiceEnvKey && /\botro dia\b|\botro día\b|\bhoy\b|\bmanana\b|\bpasado\b|\blunes\b|\bmartes\b|\bmiercoles\b|\bjueves\b|\bviernes\b|\btarde\b|\bpor la manana\b|\bnoche\b/i.test(t)){
-            await proposeTimes(session, phone, sock, jid, { text:textRaw })
+            await proposeTimes(session, phone, sock, jid, { text:textRaw, forceStaffId: session.preferredStaffId || null })
             return
           }
 
@@ -1193,7 +1232,8 @@ async function startBot(){
               const lk = parseSede(String(p.sede))
               if (lk){ session.sede = lk; saveSession(phone, session) }
               if (!session.category){
-                await sendWithLog(sock, jid, "¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*.", {phone, intent:"ask_category", action:"guide"})
+                if (canAsk(session,"categoria")){ noteAsk(session,"categoria"); saveSession(phone, session)
+                  await sendWithLog(sock, jid, "¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*.", {phone, intent:"ask_category", action:"guide"}) }
                 return
               }
             }
@@ -1202,7 +1242,8 @@ async function startBot(){
               const cm = parseCategory(String(p.category))
               if (cm){ session.category = cm; saveSession(phone, session) }
               if (!session.sede){
-                await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide"})
+                if (canAsk(session,"sede")){ noteAsk(session,"sede"); saveSession(phone, session)
+                  await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide"}) }
                 return
               }
             }
@@ -1237,7 +1278,8 @@ async function startBot(){
 
             if (action==="weekly_schedule"){
               if (!session.selectedServiceEnvKey){
-                await sendWithLog(sock, jid, "Dime el *servicio* y te muestro el horario semanal.", {phone, intent:"need_service_for_weekly", action:"guide"})
+                if (canAsk(session,"servicio")){ noteAsk(session,"servicio"); saveSession(phone, session)
+                  await sendWithLog(sock, jid, "Dime el *servicio* y te muestro el horario semanal.", {phone, intent:"need_service_for_weekly", action:"guide"}) }
                 return
               }
               await weeklySchedule(session, phone, sock, jid, {
@@ -1251,10 +1293,14 @@ async function startBot(){
 
             if (action==="propose_times"){
               if (!session.sede){
-                await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"need_sede_for_times", action:"guide"}); return
+                if (canAsk(session,"sede")){ noteAsk(session,"sede"); saveSession(phone, session)
+                  await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"need_sede_for_times", action:"guide"}) }
+                return
               }
               if (!session.category){
-                await sendWithLog(sock, jid, "¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*.", {phone, intent:"need_category_for_times", action:"guide"}); return
+                if (canAsk(session,"categoria")){ noteAsk(session,"categoria"); saveSession(phone, session)
+                  await sendWithLog(sock, jid, "¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*.", {phone, intent:"need_category_for_times", action:"guide"}) }
+                return
               }
               if (!session.selectedServiceEnvKey){
                 const itemsRaw = listServicesByCategory(session.sede, session.category, textRaw)
@@ -1268,7 +1314,7 @@ async function startBot(){
                 } else {
                   saveSession(phone, session); noteServiceListSignature(session, sig, phone)
                   const lines = list.map(it=> `${it.index}) ${it.label}`).join("\n")
-                  await sendWithLog(sock, jid, `Opciones de *${session.category}* en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`, {phone, intent:"ask_service_number", action:"guide", stage:session.stage})
+                  await sendWithLog(sock, jid, `Opciones de *${session.category}* en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el *número*.`, {phone, intent:"ask_service_number", action:"guide", stage:session.stage})
                 }
                 return
               }
@@ -1280,15 +1326,17 @@ async function startBot(){
             if (action==="cancel_appointment"){ await executeCancelAppointment(session, phone, sock, jid); return }
           } // fin IA válida
 
-          // Si faltan datos, guiamos (nunca preguntar “¿con quién?”)
+          // Si faltan datos, guiamos (con cooldown; nunca preguntar “¿con quién?”)
           if (!session.sede){
             session.stage="awaiting_sede"; saveSession(phone, session)
-            await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide", stage:session.stage})
+            if (canAsk(session,"sede")){ noteAsk(session,"sede"); saveSession(phone, session)
+              await sendWithLog(sock, jid, "¿En qué *salón* te viene mejor? *Torremolinos* o *La Luz*.", {phone, intent:"ask_sede", action:"guide", stage:session.stage}) }
             return
           }
           if (!session.category){
             session.stage="awaiting_category"; saveSession(phone, session)
-            await sendWithLog(sock, jid, "¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*.", {phone, intent:"ask_category", action:"guide", stage:session.stage})
+            if (canAsk(session,"categoria")){ noteAsk(session,"categoria"); saveSession(phone, session)
+              await sendWithLog(sock, jid, "¿Qué *categoría* necesitas? *Uñas*, *Depilación*, *Micropigmentación*, *Faciales* o *Pestañas*.", {phone, intent:"ask_category", action:"guide", stage:session.stage}) }
             return
           }
           if (!session.selectedServiceEnvKey){
@@ -1303,8 +1351,15 @@ async function startBot(){
             } else {
               saveSession(phone, session); noteServiceListSignature(session, sig, phone)
               const lines = list.map(it=> `${it.index}) ${it.label}`).join("\n")
-              await sendWithLog(sock, jid, `Opciones de *${session.category}* en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el número.`, {phone, intent:"ask_service_number", action:"guide", stage:session.stage})
+              await sendWithLog(sock, jid, `Opciones de *${session.category}* en ${locationNice(session.sede)}:\n\n${lines}\n\nResponde con el *número*.`, {phone, intent:"ask_service_number", action:"guide", stage:session.stage})
             }
+            return
+          }
+          if (explicitDT){
+            session.pendingDateTime = explicitDT.toISOString()
+            saveSession(phone, session)
+            await sendWithLog(sock, jid, "¡Perfecto! Te paso el *resumen* para que lo coja una empleada…", {phone, intent:"explicit_dt_late", action:"info"})
+            await executeCreateBooking(session, phone, sock, jid)
             return
           }
           if (/\botro dia\b|\botro día\b|\bhoy\b|\bmanana\b|\bpasado\b|\blunes\b|\bmartes\b|\bmiercoles\b|\bjueves\b|\bviernes\b|\btarde\b|\bpor la manana\b|\bnoche\b/i.test(t)){
@@ -1324,7 +1379,7 @@ async function startBot(){
 }
 
 // ====== Arranque
-console.log(`🩷 Gapink Nails Bot v31.9.1 — Top ${SHOW_TOP_N} (L–V, resumen manual · alias Anna≡Ganna)`)
+console.log(`🩷 Gapink Nails Bot v32.0.0 — Top ${SHOW_TOP_N} (L–V · resumen manual · anti-repeat · fecha explícita · Anna≡Ganna)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
