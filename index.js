@@ -1,12 +1,10 @@
-// index.js — Gapink Nails · v32.3.1
+// index.js — Gapink Nails · v32.3.2
 // Modo: RESUMEN MANUAL (no crea reserva en Square; genera resumen para que lo coja el equipo)
 //
-// Cambios v32.3.1:
-// - HARD_NAME_OVERRIDES: "ana" | "anna" | "hanna" | "hana" -> Ganna (sin ambigüedad con Johana/Anaira).
-// - Fuzzy robusto: coincidencias por igualdad/palabra, no por "includes" laxo que daba falsos positivos.
-// - Memoria de huecos: al elegir número no revalido; uso el hueco ofrecido (con guardas extra).
-// - Anti-repetición: cooldown en preguntas de sede/servicio; no se repite si ya está dicho.
-// - Se mantiene strictStaffLock y búsqueda hasta MAX_WEEKS_LOOKAHEAD solo si pides a alguien concreto.
+// Cambios v32.3.2:
+// - FIX: Manejo de número en etapa `awaiting_service_choice`. Si el cliente responde “10”, se selecciona ese servicio y se siguen los pasos.
+// - Mantiene: HARD_NAME_OVERRIDES (“ana/anna/hanna/hana” → Ganna), strictStaffLock cuando piden a alguien,
+//   anti-repetición con cooldown, resumen manual sin revalidar tras elegir número o poner fecha/hora explícita.
 
 import express from "express"
 import pino from "pino"
@@ -332,7 +330,7 @@ function pickStaffForLocation(_locKey, preferId=null){
 
 // Aliases & overrides
 const HARD_NAME_OVERRIDES = {
-  "ana":"ganna", "anna":"ganna", "hanna":"ganna", "hana":"ganna" // <- lo prometido
+  "ana":"ganna", "anna":"ganna", "hanna":"ganna", "hana":"ganna"
 }
 const NAME_ALIASES = [
   ["patri","patricia"],["patricia","patri"],
@@ -341,7 +339,7 @@ const NAME_ALIASES = [
   ["carmen belen","carmen","belen"],
   ["tania","tani"],
   ["johana","joana","yohana"],
-  ["ganna","ghanna","hanna","hana","anna"], // "ana" se fuerza en HARD_NAME_OVERRIDES
+  ["ganna","ghanna","hanna","hana","anna"],
   ["ginna","gina"],
   ["chabely","chabeli","chabelí"],
   ["elisabeth","elisabet","elis"],
@@ -359,18 +357,16 @@ const NAME_ALIASES = [
 function canonicalizeNameToken(token){
   let t = norm(token)
   if (HARD_NAME_OVERRIDES[t]) t = HARD_NAME_OVERRIDES[t]
-  // Si capturó "con carmen belen", mantenemos frase completa
   return t
 }
 
-// Coincidencia fuerte: igualdad o palabra exacta en labels; evita falsos positivos (ej. "ana" != "johana"/"anaira")
+// Coincidencia fuerte: igualdad o palabra exacta en labels
 function matchEmployeeByToken(token){
   const t = canonicalizeNameToken(token)
-  // 1) Intento por alias table (igualdad exacta contra alias)
+  // 1) por aliases
   for (const arr of NAME_ALIASES){
     const base = arr[0]
     if (arr.some(a => t === norm(a))) {
-      // Hallar empleada cuyo label contenga base como palabra (o sea igual)
       const found = EMPLOYEES.find(e => e.labels.some(lbl=>{
         const n = norm(lbl)
         return n === base || n.split(" ").includes(base)
@@ -378,13 +374,12 @@ function matchEmployeeByToken(token){
       if (found) return found
     }
   }
-  // 2) Intento directo sobre labels por palabra exacta
+  // 2) directo por palabra exacta
   const byWord = EMPLOYEES.find(e => e.labels.some(lbl=>{
     const n = norm(lbl)
     return n === t || n.split(" ").includes(t)
   }))
   if (byWord) return byWord
-  // 3) Fallback cero; nada de includes laxo
   return null
 }
 
@@ -392,7 +387,6 @@ function fuzzyStaffFromText(text){
   const tnorm = norm(text)
   if (/\b(con el equipo|me da igual|cualquiera|con quien sea|lo que haya)\b/i.test(tnorm)) return { anyTeam:true }
 
-  // Capturar "con <nombre...>"
   const m = /(?:^|\s)con\s+([a-zñáéíóúüï\s]{2,})(?:[?.!]|$)/i.exec(text)
   let token = null
   if (m) token = m[1].trim()
@@ -402,10 +396,7 @@ function fuzzyStaffFromText(text){
   }
   if (!token) return null
 
-  // Overrides (ana -> ganna)
   token = canonicalizeNameToken(token)
-
-  // Match fuerte sin includes difuso
   const emp = matchEmployeeByToken(token)
   return emp ? emp : null
 }
@@ -1016,11 +1007,11 @@ app.get("/", (_req,res)=>{
   .error{background:#f8d7da;color:#721c24}
   .warning{background:#fff3cd;color:#856404}
   </style><div class="card">
-  <h1>🩷 Gapink Nails Bot v32.3.1 — Top ${SHOW_TOP_N}</h1>
+  <h1>🩷 Gapink Nails Bot v32.3.2 — Top ${SHOW_TOP_N}</h1>
   <div class="status ${conectado ? 'success' : 'error'}">WhatsApp: ${conectado ? "✅ Conectado" : "❌ Desconectado"}</div>
   ${!conectado&&lastQR?`<div style="text-align:center;margin:20px 0"><img src="/qr.png" width="300" style="border-radius:8px"></div>`:""}
   <div class="status warning">Modo: ${DRY_RUN ? "🧪 Simulación" : "🚀 Producción"} | IA: ${AI_PROVIDER.toUpperCase()}</div>
-  <p>Overrides activos: "ana/anna/hanna/hana" → Ganna. Sin revalidaciones al elegir número.</p>
+  <p>Fix activo: aceptar número en <code>awaiting_service_choice</code> sin repetir mensajes.</p>
   </div>`)
 })
 app.get("/qr.png", async (_req,res)=>{
@@ -1130,6 +1121,23 @@ async function startBot(){
             return
           }
 
+          // ===== ELECCIÓN DE SERVICIO POR NÚMERO (FIX v32.3.2)
+          if (session.stage==="awaiting_service_choice" && numMatch && Array.isArray(session.serviceChoices) && session.serviceChoices.length){
+            const n = Number(numMatch[1])
+            const choice = session.serviceChoices.find(it=>it.index===n)
+            if (!choice){
+              await sendWithLog(sock, jid, "No encontré esa opción. Responde con el número de la lista.", {phone, intent:"bad_service_pick", action:"guide", stage:session.stage})
+              return
+            }
+            session.selectedServiceEnvKey = choice.key
+            session.selectedServiceLabel = choice.label
+            session.stage = null
+            saveSession(phone, session)
+            // Si ya hay profesional bloqueada, se respeta; si no, equipo
+            await proposeTimes(session, phone, sock, jid, { text:textRaw, forceStaffId: session.preferredStaffId || null, strictPreferred: session.strictStaffLock })
+            return
+          }
+
           // ===== ELECCIÓN POR NÚMERO -> resumen directo (no revalidar)
           if ((!session.stage || session.stage==="awaiting_time") && numMatch){
             const idx = Number(numMatch[1]) - 1
@@ -1190,7 +1198,6 @@ async function startBot(){
               return
             }
           } else {
-            // Si escribe "con X" desconocida: proponer opciones (sin repetir pesado)
             const unknownNameMatch = /(?:^|\s)con\s+([a-zñáéíóúüï\s]{2,})\??$/i.exec(textRaw)
             if (unknownNameMatch){
               const alternativas = Array.from(new Set(EMPLOYEES.filter(e=> e.bookable).map(e=>titleCase(e.labels[0])))).slice(0,6)
@@ -1355,7 +1362,7 @@ async function startBot(){
             if (action==="cancel_appointment"){ await executeCancelAppointment(session, phone, sock, jid); return }
           } // fin IA
 
-          // Faltan datos (no repetir si ya están)
+          // Faltan datos
           if (!session.sede){
             session.stage="awaiting_sede"; saveSession(phone, session)
             if (canAsk(session,"sede")){ noteAsk(session,"sede"); saveSession(phone, session)
@@ -1408,7 +1415,7 @@ async function startBot(){
 }
 
 // ===== Arranque
-console.log(`🩷 Gapink Nails Bot v32.3.1 — Top ${SHOW_TOP_N} (Resumen manual · strictStaffLock · overrides ana→ganna)`)
+console.log(`🩷 Gapink Nails Bot v32.3.2 — Top ${SHOW_TOP_N} (Resumen manual · strictStaffLock · overrides ana→ganna)`)
 const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", (e)=>{ console.error("💥 uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", (e)=>{ console.error("💥 unhandledRejection:", e) })
