@@ -953,14 +953,13 @@ ${address}
 🧾 ${svcLabel}
 👤 ${staffId ? `Con ${staffName}` : `Con el equipo (${staffName})`}
 📅 ${fmtES(startEU)}
-⏱️ ${durationMin} min
 
-*Datos del cliente (Square):*
+*Datos del cliente:*
 • Nombre: ${custName}
 • Teléfono: ${phone}
 • Email: ${custEmail}
 
-Cuando lo coja una compañera, te llegará la confirmación ✅`
+Cuando lo coja una compañera, te llegará la confirmación`
 
   try{
     insertSquareLog.run({
