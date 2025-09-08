@@ -58,7 +58,7 @@ async function loadBaileys(){
   const makeWASocket = mod.makeWASocket || mod.default?.makeWASocket || (typeof mod.default==="function"?mod.default:undefined)
   const useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
   const fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion || mod.default?.fetchLatestBaileysVersion || (async()=>({version:[2,3000,0]}))
-  const Browsers = mod.Browsers || mod.default?.Browsers || { macOS:(n="Desktop")=>["MacOS",n,"121.0.0"] }
+  const Browsers = mod.Browsers || mod.default?.Browsers || { macOS:(n="Desarrollado por Gonzalo García Aranda · https://gonzalog.co")=>["MacOS",n,"121.0.0"] }
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
 
