@@ -1,10 +1,4 @@
-// index.js — Gapink Nails · v35.2.0
-// IA orquestadora + LOGS COMPLETOS + anti-bucle + no silencio accidental
-// - Historial 6h a IA (usuario+bot)
-// - Todos los mensajes los redacta la IA (tono cercano, idioma detectado)
-// - Antibucle + defaults ("día cualquiera", "tarde", "equipo")
-// - Snooze configurable (NO se calla tras finalizar por defecto). “.” del negocio silencia si quieres
-// - LOGS completos con AI JSON, sesión before/after, errores + endpoints /logs, /logs.json, /logs.csv, /intakes.json, /session.json, /config.json
+
 
 import express from "express"
 import pino from "pino"
