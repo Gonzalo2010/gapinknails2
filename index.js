@@ -1,14 +1,13 @@
-// index.js — Gapink Nails · v35.0.0
-// Modo: ORQUESTACIÓN TOTAL CON IA (DeepSeek/OpenAI)
-// - La IA ve el historial de las últimas 6 h (usuario y bot) y rellena huecos sin pedir de nuevo.
-// - Todos los mensajes al cliente los escribe la IA (tono cercano, idioma detectado).
-// - Saludo automático al arrancar conversación (si no hemos escrito nada en 6 h).
-// - Intake final (salón + servicio + staff_any/staff_name + día + parte) → guardado en SQLite + silencio 6 h.
-// - “.” enviado por el negocio en ese chat → silencio 6 h.
-// - Sin listas; preguntas directas y personalizadas según contexto.
-
-// Requisitos de entorno: DEEPSEEK_API_KEY o OPENAI_API_KEY
-// npm i express pino qrcode qrcode-terminal better-sqlite3 dayjs @whiskeysockets/baileys
+// index.js — Gapink Nails · v35.1.0
+// Modo: ORQUESTACIÓN TOTAL CON IA + ANTIBUCLES y VALORES POR DEFECTO
+// - Historial 6h (usuario+bot) → IA no repite.
+// - Saludo al inicio de conversación (si 6h sin hablar).
+// - Si el cliente dice "me da igual" para el día → day_text="cualquiera".
+// - Si también "le da igual" la franja → part_of_day="tarde" (defecto).
+// - Antibucle: si la misma pregunta se repite ≥2 veces, el servidor asume por defecto y finaliza.
+// - Intake completo (salon + servicio + [staff_any|staff_name] + day + part) ⇒ guardado + silencio 6h.
+// - "." enviado por el negocio ⇒ silencio 6h.
+// Requisitos: DEEPSEEK_API_KEY o OPENAI_API_KEY
 
 import express from "express"
 import pino from "pino"
@@ -35,7 +34,8 @@ const PORT = process.env.PORT || 8080
 const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
 const SNOOZE_HOURS = Number(process.env.SNOOZE_HOURS || 6)
 const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 6)
-const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 60) // límite seguridad
+const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 60)
+const MAX_SAME_REPLY = Number(process.env.MAX_SAME_REPLY || 2) // tras 2 repeticiones: forzamos defaults
 
 // ===== IA
 const AI_PROVIDER = (process.env.AI_PROVIDER || (process.env.DEEPSEEK_API_KEY? "deepseek" : process.env.OPENAI_API_KEY? "openai" : "none")).toLowerCase()
@@ -57,7 +57,6 @@ function normalizePhoneES(raw){
 }
 const norm = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase().trim()
 const titleCase = str => String(str||"").toLowerCase().replace(/\b([a-z])/g, m=>m.toUpperCase())
-
 function safeJSONStringify(value){
   const seen = new WeakSet()
   try{
@@ -95,7 +94,7 @@ CREATE TABLE IF NOT EXISTS intakes (
 CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   phone TEXT,
-  direction TEXT, -- "in" | "out" | "sys"
+  direction TEXT,
   action TEXT,
   message TEXT,
   extra TEXT,
@@ -139,7 +138,6 @@ function getHistory(phone, hours = HISTORY_HOURS, limit = HISTORY_MAX_MSGS){
   const rows = db.prepare(`SELECT direction, message, ts FROM logs
                            WHERE phone=@p AND ts>=@since AND message IS NOT NULL
                            ORDER BY id DESC LIMIT @limit`).all({p:phone, since, limit})
-  // Devuelve cronológico ascendente
   return rows.reverse().map(r=>{
     const role = r.direction === "in" ? "user" : (r.direction === "out" ? "assistant" : "system")
     return { role, text: r.message, ts: r.ts }
@@ -185,50 +183,41 @@ function stripToJSON(text){
 
 function buildOrchestratorSystemPrompt(){
   const now = nowEU().format("YYYY-MM-DD HH:mm")
-  return `Eres el orquestador de WhatsApp de *Gapink Nails*. Tu trabajo:
-- Leer TODA la conversación de las últimas 6 horas (usuario y bot) y **no repetir** lo ya preguntado.
-- Detectar el idioma (ES por defecto). Mantén un tono **cercano, educado y natural** (estilo WhatsApp, sin emojis raros).
-- Objetivo: obtener *salón* (Torremolinos o La Luz), *servicio* (texto libre como "cejas", "uñas semipermanente", etc.), preferencia de *profesional* (nombre o "equipo"), *día* y *franja* ("mañana"/"tarde"/"noche").
-- **Nunca muestres listas largas.** Pregunta directo y personalizado.
-- Si en el historial ya aparecen datos (p.ej., "cejas"), **no los pidas**.
-- Al inicio de conversación (si en 6 h el bot no ha hablado), **saluda** (breve).
-- Si ya están todos los datos (salón + servicio + [staff_any o staff_name] + día + parte), marca "finalize": true. El servidor guardará el intake y **no enviará más mensajes**.
-- Mantén mensajes cortos, claros y con una sola pregunta a la vez cuando falten datos. Si falta más de uno, prioriza en este orden: salón → servicio → staff → día → parte.
+  return `Eres el orquestador de WhatsApp de *Gapink Nails*. Lee el histórico (últimas 6h) y NO repitas lo ya preguntado.
+- Detecta el idioma y escribe con tono cercano, claro y natural.
+- Objetivo de datos: "salon" ("torremolinos"|"la_luz"), "service_text" (libre), "staff_any" (boolean) o "staff_name", "day_text", "part_of_day" ("mañana"|"tarde"|"noche").
+- Si el cliente dice "me da igual / cualquiera / lo que sea" sobre el DÍA → usa {"day_text":"cualquiera"}.
+- Si también "le da igual" la FRANJA → usa {"part_of_day":"tarde"} por defecto.
+- NO preguntes más de una vez exactamente lo mismo. Si detectas bloqueo, aplica los valores por defecto anteriores y continúa.
+- No muestres listas. Pregunta directo y personalizado.
+- Cuando tengas todos los datos, responde breve de cierre y devuelve "finalize": true.
 
-Devuelve SOLO JSON con este formato:
+Devuelve SOLO JSON:
 {
-  "language": "es" | "en" | "fr" | "...",
+  "language": "es" | "en" | "...",
   "intent": "appointment" | "greeting" | "other",
   "updates": {
-    "salon": "torremolinos" | "la_luz" | null,
+    "salon": "torremolinos"|"la_luz"|null,
     "service_text": string|null,
     "staff_any": true|false|null,
     "staff_name": string|null,
     "day_text": string|null,
     "part_of_day": "mañana"|"tarde"|"noche"|null
   },
-  "reply": "texto del mensaje a enviar al cliente",
+  "reply": "texto a enviar",
   "finalize": true|false
 }
 
-Fecha actual (Madrid): ${now}
-Reglas extra:
-- "salon": valores canónicos "torremolinos" o "la_luz".
-- Si el usuario dice "me da igual/cualquiera/equipo", usa {"staff_any": true, "staff_name": null}.
-- No inventes datos. Si dudas, deja el campo en null y formula una pregunta breve en "reply".
-- Mantén el idioma elegido de forma consistente en "reply".
-- No uses listas; personaliza con lo ya dicho.`
+Fecha (Madrid): ${now}
+Si ya saludaste hace poco, no vuelvas a saludar; si no, empieza con un saludo breve.`
 }
 
 function formatHistoryForModel(history){
-  // Recortamos a HISTORY_MAX_MSGS por cola
   const last = history.slice(-HISTORY_MAX_MSGS)
-  // Convertimos a mensajes ChatML
   return last.map(h=>{
     const role = h.role === "assistant" ? "assistant"
                : h.role === "user" ? "user" : "system"
-    const content = `${h.text}`
-    return { role, content }
+    return { role, content: `${h.text}` }
   })
 }
 
@@ -270,7 +259,7 @@ app.get("/", (_req,res)=>{
   .foot{margin-top:16px;font-size:12px;opacity:.7}
   </style>
   <div class="card">
-    <h1>🩷 Gapink Nails Bot v35.0.0</h1>
+    <h1>🩷 Gapink Nails Bot v35.1.0</h1>
     <div class="row">
       <div class="pill ${conectado ? "ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</div>
       <div class="pill warn">IA total · Historial ${HISTORY_HOURS}h · Silencio ${SNOOZE_HOURS}h</div>
@@ -278,7 +267,7 @@ app.get("/", (_req,res)=>{
       <div class="pill">Intakes: ${count}</div>
     </div>
     ${!conectado && lastQR ? `<div class="mt"><img src="/qr.png" width="300" style="border-radius:8px"/></div>`:""}
-    <p class="mt" style="opacity:.75">Todos los mensajes los escribe la IA; detecta idioma, evita repeticiones y saluda al iniciar conversación.</p>
+    <p class="mt" style="opacity:.75">Antibucle: si el cliente dice “me da igual”, se asumen valores por defecto y no se martillea la misma pregunta.</p>
     <div class="foot">Desarrollado por <strong>Gonzalo García Aranda</strong></div>
   </div>`)
 })
@@ -323,16 +312,17 @@ async function startBot(){
     })
     sock.ev.on("creds.update", saveCreds)
 
-    // Cola por teléfono
     if (!globalThis.__q) globalThis.__q = new Map()
     const QUEUE = globalThis.__q
 
-    // Helper: enviar y loguear
     async function sendText(jid, phone, text){
       if (!text) return
       try{ await sock.sendMessage(jid, { text }) }catch(e){}
       logEvent({phone, direction:"out", action:"send", message:text})
     }
+
+    // Helpers de interpretación de "me da igual"
+    const NON_ANSWER_ANY = /\b(me da igual|cualquiera|como veas|lo que sea|me la pela|da igual|lo mismo|x|no se|no sé)\b/i
 
     sock.ev.on("messages.upsert", async ({messages})=>{
       const m = messages?.[0]; if (!m?.message) return
@@ -353,10 +343,12 @@ async function startBot(){
             staff_name: null,
             day_text: null,
             part_of_day: null,
-            snooze_until_ms: null
+            snooze_until_ms: null,
+            last_bot_reply: null,
+            same_reply_count: 0
           }
 
-          // Si TÚ (negocio) envías ".", silencio 6h a ese cliente
+          // Silencio manual (negocio): "."
           if (isFromMe && textRaw.trim()==="."){
             s.snooze_until_ms = nowEU().add(SNOOZE_HOURS, "hour").valueOf()
             saveSession(phone, s)
@@ -367,27 +359,30 @@ async function startBot(){
           // Silencio activo
           const now = nowEU()
           if (s.snooze_until_ms && now.valueOf() < s.snooze_until_ms){
-            // Logueamos pero no respondemos
             logEvent({phone, direction:"sys", action:"snoozed_drop", message:textRaw})
             return
           }
 
-          // Loguea entrada
+          // Log entrada
           logEvent({phone, direction:"in", action:"message", message:textRaw})
 
-          // Construye historial 6h
+          // Normalizamos “me da igual” para día/franja si faltan
+          if (!s.day_text && NON_ANSWER_ANY.test(textRaw)) s.day_text = "cualquiera"
+          if (!s.part_of_day && NON_ANSWER_ANY.test(textRaw)) s.part_of_day = s.part_of_day || null // lo decide IA; server pondrá "tarde" si se atasca
+
+          // Historial 6h
           const history = getHistory(phone, HISTORY_HOURS, HISTORY_MAX_MSGS)
 
-          // Orquestación IA
+          // IA orquestadora
           const ai = await aiOrchestrate({ session: s, history, userText: textRaw })
 
           if (!ai){
-            // Fallback mínimo (intento mantener tono, pero sin IA)
-            await sendText(jid, phone, "Ahora mismo estoy procesando mucha info. ¿Me puedes repetir en qué salón y qué servicio quieres? 🙏")
+            // Fallback mínimo
+            await sendText(jid, phone, "¿Te viene mejor *Torremolinos* o *La Luz*? Y dime el *servicio* que quieres 🙌")
             return
           }
 
-          // Aplica updates
+          // Aplicar updates IA
           const up = ai.updates || {}
           if (up.salon && (up.salon==="torremolinos" || up.salon==="la_luz")) s.salon = up.salon
           if (typeof up.service_text === "string" && up.service_text.trim()) s.service_text = up.service_text.trim()
@@ -398,15 +393,32 @@ async function startBot(){
           if (typeof up.day_text === "string" && up.day_text.trim()) s.day_text = up.day_text.trim()
           if (up.part_of_day && ["mañana","tarde","noche"].includes(up.part_of_day)) s.part_of_day = up.part_of_day
 
-          // ¿Finalizado?
-          const haveAll = !!(s.salon && s.service_text && (s.staff_any===true || (s.staff_name && s.staff_name.length>0)) && s.day_text && s.part_of_day)
-          const finalize = !!ai.finalize || haveAll
+          // Antibucle: si IA repite EXACTAMENTE el mismo reply varias veces
+          const replyText = (typeof ai.reply === "string" && ai.reply.trim()) ? ai.reply.trim() : null
+          if (replyText && s.last_bot_reply && replyText === s.last_bot_reply){
+            s.same_reply_count = (s.same_reply_count||0) + 1
+          } else {
+            s.same_reply_count = 0
+          }
 
-          // Guarda sesión
+          // ¿Tenemos todo?
+          let haveAll = !!(s.salon && s.service_text && (s.staff_any===true || (s.staff_name && s.staff_name.length>0)) && s.day_text && s.part_of_day)
+          let finalize = !!ai.finalize || haveAll
+
+          // Si se repite la misma pregunta demasiadas veces, imponemos defaults y finalizamos
+          if (!finalize && s.same_reply_count >= MAX_SAME_REPLY){
+            if (!s.day_text) s.day_text = "cualquiera"
+            if (!s.part_of_day) s.part_of_day = "tarde"
+            // Si aún falta staff, y el usuario no especificó, asumimos equipo
+            if (s.staff_any==null && !s.staff_name) s.staff_any = true
+            haveAll = !!(s.salon && s.service_text && (s.staff_any===true || (s.staff_name && s.staff_name.length>0)) && s.day_text && s.part_of_day)
+            finalize = haveAll
+          }
+
+          // Guardar sesión
           saveSession(phone, s)
 
           if (finalize){
-            // Inserta intake y silencia 6h (no respondemos más)
             const intakeId = `int_${createHash("sha256").update(`${phone}|${Date.now()}`).digest("hex").slice(0,16)}`
             db.prepare(`INSERT INTO intakes
               (id, phone, salon, service_text, staff_any, staff_name, day_text, part_of_day, created_at, raw_last_msg)
@@ -426,22 +438,34 @@ async function startBot(){
             logEvent({phone, direction:"sys", action:"intake_saved", message:intakeId, extra:{s}})
             s.snooze_until_ms = nowEU().add(SNOOZE_HOURS, "hour").valueOf()
             saveSession(phone, s)
-            // Silencio: no enviamos respuesta (cumple tu requisito)
+            // Silencio post-intake (no respondemos más)
             return
           }
 
-          // Responder con IA
-          const reply = (typeof ai.reply === "string" && ai.reply.trim()) ? ai.reply.trim() : null
-          if (reply){
-            await sendText(jid, phone, reply)
+          // Enviar respuesta IA (evita mandar la misma frase en bucle)
+          if (replyText){
+            // Si lleva repitiéndose, matizamos con pista distinta:
+            let toSend = replyText
+            if (s.same_reply_count >= 1){
+              // Ajuste ligero para romper el bucle visual
+              if (!s.day_text && /día/i.test(replyText)) {
+                toSend = "Si te viene bien, lo dejamos en *cualquier día*. ¿Te va mejor *mañana* o *tarde*?"
+              } else if (!s.part_of_day && /(mañana|tarde|noche)/i.test(replyText)===false) {
+                toSend = "¿Prefieres *mañana* o *tarde*? Si te da igual, pongo *tarde* por defecto."
+              }
+            }
+            await sendText(jid, phone, toSend)
+            s.last_bot_reply = toSend
+            saveSession(phone, s)
           } else {
-            // Fallback si el JSON vino sin reply
             await sendText(jid, phone, "¿Te viene mejor *Torremolinos* o *La Luz*? Y dime el *servicio* que quieres 🙌")
+            s.last_bot_reply = "¿Te viene mejor *Torremolinos* o *La Luz*? Y dime el *servicio* que quieres 🙌"
+            saveSession(phone, s)
           }
         }catch(err){
           if (BOT_DEBUG) console.error(err)
           logEvent({phone, direction:"sys", action:"handler_error", message: err?.message, extra:{stack: err?.stack}})
-          try{ await sock.sendMessage(jid, { text: "Se me ha cruzado un cable un segundo 🤯. ¿Me repites salón y servicio, porfa?" }) }catch{}
+          try{ await sock.sendMessage(jid, { text: "Se me cruzó un cable un segundo 🤯. Si te da igual el día, pongo *cualquier día*; ¿*mañana* o *tarde*?" }) }catch{}
         }
       })
       QUEUE.set(phone, job.finally(()=>{ if (QUEUE.get(phone)===job) QUEUE.delete(phone) }))
@@ -453,7 +477,7 @@ async function startBot(){
 }
 
 // ===== Arranque
-console.log(`🩷 Gapink Nails Bot v35.0.0 · IA total · Historial ${HISTORY_HOURS}h · Silencio ${SNOOZE_HOURS}h · IA:${AI_PROVIDER.toUpperCase()}`)
+console.log(`🩷 Gapink Nails Bot v35.1.0 · IA total + antibucle · Historial ${HISTORY_HOURS}h · Silencio ${SNOOZE_HOURS}h · IA:${AI_PROVIDER.toUpperCase()}`)
 const server = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", e=>{ console.error("uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", e=>{ console.error("unhandledRejection:", e) })
