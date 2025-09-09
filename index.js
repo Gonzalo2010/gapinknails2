@@ -1,10 +1,13 @@
-// index.js — Gapink Nails · v41.0.0
-// “IA decide saludo/cita/info · 1 sola pregunta + mute 6h (auto y por '.')”
+// index.js — Gapink Nails · v42.0.0
+// “IA decide saludo/cita/info · 1 sola pregunta + mute 6h (auto y por '.') + búsqueda avanzada de logs”
 //
-// Novedades v41:
-// - Silencio AUTO 6h cuando ya tenemos: servicio, salón, preferencia de día y franja (u hora), y preferencia de profesional (alguien en concreto o cualquiera).
-// - Silencio MANUAL 6h por mensaje con un "." (punto) enviado por el cliente o por vosotros desde el mismo chat.
-// - El saludo incluye el enlace de reserva: https://gapinknails.square.site/
+// Novedades v42:
+// - FIX: SyntaxError por backticks escapados en db.prepare(...).
+// - /logs.json con filtros: phone, q (texto), dir (in|out|sys), from, to, limit, offset, order (asc|desc).
+// - /logs.ndjson para stream de resultados grandes.
+// - /sessions.json (listar o una sesión concreta) y /session/unmute?phone=... para desmutear rápido.
+// - FTS5 opcional: si está disponible, búsquedas por texto usan logs_fts MATCH; si no, fallback a LIKE.
+// - Se mantiene: mute 6h por "." y auto-mute al tener datos completos; saludo con https://gapinknails.square.site/
 //
 // ENV (opcionales):
 //   PORT, BOT_DEBUG, HISTORY_HOURS, HISTORY_MAX_MSGS, HISTORY_TRUNC_EACH,
@@ -79,12 +82,16 @@ function normalizePhoneE164(raw){
 function isJustDot(text){
   if (!text) return false
   const t = text.trim()
-  // Acepta solo un carácter punto típico
   return t === "."
+}
+function parseDateOrNull(v){
+  if (!v) return null
+  const d = dayjs(v).isValid() ? dayjs(v) : null
+  return d ? d.toISOString() : null
 }
 
 // ===== DB
-const db = new Database("gapink_ai_classifier_v410.db"); db.pragma("journal_mode = WAL")
+const db = new Database("gapink_ai_classifier_v420.db"); db.pragma("journal_mode = WAL")
 db.exec(`
 CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,10 +106,35 @@ CREATE TABLE IF NOT EXISTS sessions (
   data_json TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
+CREATE INDEX IF NOT EXISTS idx_logs_phone ON logs(phone);
+CREATE INDEX IF NOT EXISTS idx_logs_direction ON logs(direction);
 `)
+let FTS_AVAILABLE = false
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS logs_fts USING fts5(message, content='logs', content_rowid='id');
+    CREATE TRIGGER IF NOT EXISTS logs_ai AFTER INSERT ON logs BEGIN
+      INSERT INTO logs_fts(rowid, message) VALUES (new.id, new.message);
+    END;
+    CREATE TRIGGER IF NOT EXISTS logs_ad AFTER DELETE ON logs BEGIN
+      INSERT INTO logs_fts(logs_fts, rowid, message) VALUES('delete', old.id, old.message);
+    END;
+    CREATE TRIGGER IF NOT EXISTS logs_au AFTER UPDATE ON logs BEGIN
+      INSERT INTO logs_fts(logs_fts, rowid, message) VALUES('delete', old.id, old.message);
+      INSERT INTO logs_fts(rowid, message) VALUES (new.id, new.message);
+    END;
+  `)
+  // Smoke test
+  db.prepare(`SELECT count(*) AS n FROM logs_fts`).get()
+  FTS_AVAILABLE = true
+} catch {
+  FTS_AVAILABLE = false
+}
+
 function logEvent({phone, direction, message, extra}){
   try{
-    db.prepare(\`INSERT INTO logs (phone,direction,message,extra,ts) VALUES (@p,@d,@m,@e,@t)\`).run({
+    db.prepare("INSERT INTO logs (phone,direction,message,extra,ts) VALUES (@p,@d,@m,@e,@t)").run({
       p: phone || "unknown",
       d: direction || "sys",
       m: message || null,
@@ -119,7 +151,7 @@ function getHistoryCompact(phone){
     ORDER BY id DESC LIMIT @limit`).all({p:phone, since, limit:HISTORY_MAX_MSGS})
   return rows.reverse().map(r=>{
     const tag = r.direction==="in" ? "U" : r.direction==="out" ? "A" : "S"
-    return \`\${tag}:\${truncate(r.message||"", HISTORY_TRUNC_EACH)}\`
+    return `${tag}:${truncate(r.message||"", HISTORY_TRUNC_EACH)}`
   })
 }
 function loadSession(phone){
@@ -221,45 +253,200 @@ Rules:
   }
 }
 
-// ===== Mini web (estado y QR)
+// ===== Mini web (estado, QR y endpoints de logs)
 const app = express()
 let lastQR = null, conectado = false
+
 app.get("/", (_req,res)=>{
   res.send(`<!doctype html><meta charset="utf-8"><style>
-  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f6f7f9}
-  .card{max-width:900px;padding:28px;border-radius:18px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.08)}
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f6f7f9;margin:0}
+  .card{max-width:1000px;padding:28px;border-radius:18px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.08)}
   .row{display:flex;gap:10px;flex-wrap:wrap}
   .pill{padding:6px 10px;border-radius:999px;background:#eef1f4;font-size:13px}
   .ok{background:#d9f7e8;color:#0f5132}.bad{background:#fde2e1;color:#842029}
   .mt{margin-top:12px}
   a{color:#1f6feb;text-decoration:none}
   .foot{margin-top:8px;opacity:.7;font-size:12px}
+  code{background:#f4f6f8;padding:2px 6px;border-radius:6px}
   </style>
   <div class="card">
-    <h1>🩷 ${BRAND} — IA Clasificador v41.0.0</h1>
+    <h1>🩷 ${BRAND} — IA Clasificador v42.0.0</h1>
     <div class="row">
       <span class="pill ${conectado?"ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</span>
       <span class="pill">Historial IA ${HISTORY_HOURS}h · máx ${HISTORY_MAX_MSGS} msgs</span>
       <span class="pill">IA: ${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}</span>
       <span class="pill">Mute default: ${MUTE_HOURS}h</span>
+      <span class="pill">FTS: ${FTS_AVAILABLE?"ON":"OFF"}</span>
     </div>
     ${!conectado && lastQR ? `<div class="mt"><img src="/qr.png" width="280" style="border-radius:10px"/></div>`:""}
     <p class="mt">Reserva online: <a target="_blank" href="${BOOKING_URL}">${BOOKING_URL}</a></p>
+
+    <h3 class="mt">🔎 Filtros rápidos de logs</h3>
+    <p><code>/logs.json?phone=+34666...&q=cejas&dir=in&from=2025-09-09T00:00:00&to=2025-09-10&limit=200&offset=0&order=desc</code></p>
+    <p><code>/logs.ndjson?... (mismos parámetros, salida por líneas)</code></p>
+    <p><code>/sessions.json</code> · <code>/sessions.json?phone=+34...</code> · <code>/session/unmute?phone=+34...</code></p>
+
     <div class="foot">Desarrollado por <strong>Gonzalo García Aranda</strong></div>
   </div>`)
 })
+
 app.get("/qr.png", async (_req,res)=>{
   if(!lastQR) return res.status(404).send("No QR")
   const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
   res.set("Content-Type","image/png").send(png)
 })
+
+// --- Logs JSON con filtros ---
 app.get("/logs.json", (req,res)=>{
   const phone = req.query.phone || null
-  const limit = Number(req.query.limit || 500)
-  const rows = phone
-    ? db.prepare(`SELECT id,phone,direction,message,extra,ts FROM logs WHERE phone=@p ORDER BY id DESC LIMIT @limit`).all({p:phone, limit})
-    : db.prepare(`SELECT id,phone,direction,message,extra,ts FROM logs ORDER BY id DESC LIMIT @limit`).all({limit})
-  res.json(rows.map(r=>({ ...r, extra: r.extra? JSON.parse(r.extra): null })))
+  const q     = (req.query.q || "").toString().trim()
+  const dir   = (req.query.dir || "").toString().trim().toLowerCase()
+  const from  = parseDateOrNull(req.query.from)
+  const to    = parseDateOrNull(req.query.to)
+  const limit = Math.min(Number(req.query.limit || 200), 1000)
+  const offset= Math.max(Number(req.query.offset || 0), 0)
+  const order = (req.query.order||"desc").toString().toLowerCase()==="asc" ? "ASC" : "DESC"
+
+  let params = {}
+  let where = ["1=1"]
+
+  if (phone){ where.push("phone=@phone"); params.phone = phone }
+  if (dir && ["in","out","sys"].includes(dir)){ where.push("direction=@dir"); params.dir = dir }
+  if (from){ where.push("ts>=@from"); params.from = from }
+  if (to){ where.push("ts<=@to"); params.to = to }
+
+  let sql
+  if (q){
+    if (FTS_AVAILABLE){
+      // full-text (rápido y relevante)
+      sql = `
+        SELECT l.id,l.phone,l.direction,l.message,l.extra,l.ts
+        FROM logs l
+        JOIN logs_fts f ON f.rowid = l.id
+        WHERE (${where.join(" AND ")}) AND f.logs_fts MATCH @q
+        ORDER BY l.id ${order}
+        LIMIT @limit OFFSET @offset
+      `
+      params.q = q
+    } else {
+      // fallback LIKE
+      sql = `
+        SELECT id,phone,direction,message,extra,ts
+        FROM logs
+        WHERE (${where.join(" AND ")}) AND message LIKE @like
+        ORDER BY id ${order}
+        LIMIT @limit OFFSET @offset
+      `
+      params.like = `%${q}%`
+    }
+  } else {
+    sql = `
+      SELECT id,phone,direction,message,extra,ts
+      FROM logs
+      WHERE ${where.join(" AND ")}
+      ORDER BY id ${order}
+      LIMIT @limit OFFSET @offset
+    `
+  }
+
+  params.limit = limit
+  params.offset = offset
+
+  const rows = db.prepare(sql).all(params).map(r => ({ ...r, extra: r.extra? JSON.parse(r.extra): null }))
+  res.json({ fts: FTS_AVAILABLE, count: rows.length, items: rows })
+})
+
+// --- Logs NDJSON (stream) ---
+app.get("/logs.ndjson", (req,res)=>{
+  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8")
+  // Reutilizamos la misma query builder de /logs.json
+  const phone = req.query.phone || null
+  const q     = (req.query.q || "").toString().trim()
+  const dir   = (req.query.dir || "").toString().trim().toLowerCase()
+  const from  = parseDateOrNull(req.query.from)
+  const to    = parseDateOrNull(req.query.to)
+  const limit = Math.min(Number(req.query.limit || 5000), 20000)
+  const offset= Math.max(Number(req.query.offset || 0), 0)
+  const order = (req.query.order||"desc").toString().toLowerCase()==="asc" ? "ASC" : "DESC"
+
+  let params = {}
+  let where = ["1=1"]
+
+  if (phone){ where.push("phone=@phone"); params.phone = phone }
+  if (dir && ["in","out","sys"].includes(dir)){ where.push("direction=@dir"); params.dir = dir }
+  if (from){ where.push("ts>=@from"); params.from = from }
+  if (to){ where.push("ts<=@to"); params.to = to }
+
+  let sql
+  if (q){
+    if (FTS_AVAILABLE){
+      sql = `
+        SELECT l.id,l.phone,l.direction,l.message,l.extra,l.ts
+        FROM logs l JOIN logs_fts f ON f.rowid=l.id
+        WHERE (${where.join(" AND ")}) AND f.logs_fts MATCH @q
+        ORDER BY l.id ${order}
+        LIMIT @limit OFFSET @offset
+      `
+      params.q = q
+    } else {
+      sql = `
+        SELECT id,phone,direction,message,extra,ts
+        FROM logs
+        WHERE (${where.join(" AND ")}) AND message LIKE @like
+        ORDER BY id ${order}
+        LIMIT @limit OFFSET @offset
+      `
+      params.like = `%${q}%`
+    }
+  } else {
+    sql = `
+      SELECT id,phone,direction,message,extra,ts
+      FROM logs
+      WHERE ${where.join(" AND ")}
+      ORDER BY id ${order}
+      LIMIT @limit OFFSET @offset
+    `
+  }
+
+  params.limit = limit
+  params.offset = offset
+
+  const stmt = db.prepare(sql)
+  const iter = stmt.iterate(params)
+  for (const r of iter){
+    const out = { ...r, extra: r.extra? JSON.parse(r.extra): null }
+    res.write(JSON.stringify(out) + "\n")
+  }
+  res.end()
+})
+
+// --- Sessions helpers ---
+app.get("/sessions.json", (req,res)=>{
+  const phone = req.query.phone || null
+  if (phone){
+    const row = db.prepare(`SELECT data_json, updated_at FROM sessions WHERE phone=@p`).get({p:phone})
+    if (!row) return res.json(null)
+    let data = null; try{ data = JSON.parse(row.data_json) }catch{}
+    return res.json({ phone, data, updated_at: row.updated_at })
+  } else {
+    const rows = db.prepare(`SELECT phone, data_json, updated_at FROM sessions ORDER BY updated_at DESC LIMIT 500`).all()
+    const out = rows.map(r=>{
+      let data = null; try{ data = JSON.parse(r.data_json) }catch{}
+      return { phone:r.phone, data, updated_at:r.updated_at }
+    })
+    return res.json(out)
+  }
+})
+
+app.get("/session/unmute", (req,res)=>{
+  const phone = req.query.phone
+  if (!phone) return res.status(400).json({ ok:false, error:"phone required" })
+  const s = loadSession(phone)
+  s.mute_until = null
+  s.mute_reason = null
+  saveSession(phone, s)
+  logEvent({phone, direction:"sys", message:"manual_unmute", extra:{by:"http"}})
+  res.json({ ok:true, phone, mute_until:s.mute_until })
 })
 
 // ===== WhatsApp (Baileys)
@@ -315,33 +502,33 @@ async function startBot(){
       const prev = QUEUE.get(phone)||Promise.resolve()
       const job = prev.then(async ()=>{
         try{
-          // Cargamos sesión SIEMPRE (para poder mutear aunque sea "fromMe")
+          // Sesión para mute, etc.
           let session = loadSession(phone)
 
-          // 0) Silencio manual por '.' (cliente o staff). No respondemos nada.
+          // 0) Silencio manual por "." — no responder
           if (isJustDot(textRaw)){
             session = setMute(session, MUTE_HOURS, isFromMe ? "manual-dot-staff" : "manual-dot-user")
             saveSession(phone, session)
-            logEvent({phone, direction: isFromMe?"in":"in", message:textRaw, extra:{fromMe:isFromMe, action:"mute", until:session.mute_until}})
+            logEvent({phone, direction:"in", message:textRaw, extra:{fromMe:isFromMe, action:"mute", until:session.mute_until}})
             return
           }
 
-          // Log de entrada (incluye fromMe, pero si es fromMe y no es '.', no hacemos nada más)
+          // Log de entrada (incluye info de si viene de nosotros)
           logEvent({phone, direction:"in", message:textRaw, extra:{fromMe:isFromMe}})
 
-          // Si es un mensaje enviado por nosotros (desde el número del negocio) y no es '.', no activar bot
+          // Si es mensaje “fromMe” (vosotros) y no es ".", no activar bot
           if (isFromMe) return
 
-          // 1) Si la conversación está en silencio, no respondemos
+          // 1) Si la conversación está muteada, no respondemos
           if (isMuted(session)){
             logEvent({phone, direction:"sys", message:"muted_skip", extra:{until:session.mute_until, reason:session.mute_reason}})
             return
           }
 
-          // 2) Compacta historial (últimas 6h) para la IA
+          // 2) Compacta historial para IA
           const hist = getHistoryCompact(phone)
 
-          // 3) IA: SOLO clasificación + extracción
+          // 3) IA: clasificación + extracción
           const ai = await aiClassify({
             brand: BRAND,
             bookingURL: BOOKING_URL,
@@ -350,19 +537,19 @@ async function startBot(){
           })
           logEvent({phone, direction:"sys", message:"ai_json", extra: ai})
 
-          // 4) Respuesta mínima basada en IA
+          // 4) Respuesta mínima
           let reply = ""
           const lang = ai?.lang || "es"
           const ex   = ai?.extracted || {}
           const missing = Array.isArray(ai?.missing) ? ai.missing : []
 
-          // Si no hay IA o no clasificó -> una pregunta genérica (con enlace en saludo)
+          // Sin IA -> saludo + enlace
           if (!ai){
             reply = `¡Hola! Soy la asistente de ${BRAND} 💖 Puedes reservar aquí también: ${BOOKING_URL}. ¿Quieres reservar una cita?`
             await sendText(jid, phone, reply); return
           }
 
-          // Saludo sin intención de cita -> saludo corto + enlace
+          // Saludo sin cita -> saludo + enlace
           if (ai.is_greeting && !ai.wants_appointment){
             reply = (lang==="en")
               ? `Hi! I'm ${BRAND}'s assistant 💖 You can also book here: ${BOOKING_URL}. How can I help you?`
@@ -372,10 +559,9 @@ async function startBot(){
             await sendText(jid, phone, reply); return
           }
 
-          // Quiere cita: preguntamos SOLO lo que falte (primero de la lista)
+          // Quiere cita -> preguntar SOLO lo que falte
           if (ai.wants_appointment){
             if (!missing.length){
-              // Todo listo → resumen corto + confirmación (1 sola pregunta)
               const salonTxt = ex.salon==="la_luz" ? "La Luz" : (ex.salon==="torremolinos" ? "Torremolinos" : "—")
               const staffTxt = (ex.staff_any===true) ? "cualquiera del equipo" : (ex.staff? ex.staff : "—")
               const resumen = (lang==="en")
@@ -386,7 +572,7 @@ async function startBot(){
 
               await sendText(jid, phone, resumen)
 
-              // ★ Auto-mute 6h tras tener toda la info (deja paso a gestión humana)
+              // Auto-mute 6h tras datos completos
               session = setMute(session, MUTE_HOURS, "auto-after-data-complete")
               session.last_summary = resumen
               saveSession(phone, session)
@@ -423,7 +609,7 @@ async function startBot(){
             }
           }
 
-          // No saludo, no cita → respuesta mínima neutra (sin molestar)
+          // No saludo, no cita → respuesta mínima neutra
           reply = (lang==="en") ? "Got it. Tell me if you want to book an appointment."
                 : (lang==="fr") ? "Compris. Dis-moi si tu veux réserver."
                 : "Entendido. Dime si quieres reservar una cita."
