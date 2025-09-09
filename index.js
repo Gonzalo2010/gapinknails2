@@ -1,24 +1,26 @@
-// index.js — Gapink Nails · v37.2.0 “IA 1-pass · sin keywords · saludo con link solo al inicio”
+// index.js — Gapink Nails · v38.2.0 “IA secuencial anti-bucle + saludo con enlace (solo al inicio)”
 //
-// Qué hace:
-// - TODO el flujo pasa por IA (1 única llamada por mensaje), sin keywords ni regex de contenido.
-// - Prompt mínimo + claves cortas (svc/salon/staff/day/part).
-// - Saludo variable SOLO al inicio de ventana 6h, e incluye el link: https://gapinknails.square.site/
-//   (si la IA mete el link fuera del saludo, el servidor lo quita).
-// - Anti-bucle server-side: preguntamos SIEMPRE el siguiente campo que falta; si la IA pregunta otra cosa o repite,
-//   reescribimos la respuesta a una pregunta estándar del campo que toque (sin inspeccionar el texto del usuario).
-// - Memoria de preferencias por teléfono (lang y últimas elecciones) — no se usan para inferir el texto del usuario,
-//   solo para pre-llenar si la IA lo deja vacío.
-// - Snooze manual con “.” (6h).
-// - Logs y endpoints de diagnóstico.
+// Cambios clave vs 38.0.0:
+// - IA con contexto de reintentos por campo (askTries) y última respuesta del bot (lastBotReply) → NO repite.
+// - Flujo bloqueado por campo (pending_field): no avanza hasta que la IA marque answered=true.
+// - Variación automática: si askTries≥2, IA añade pista breve (“Responde: mañana / tarde / noche”), 1 sola pregunta.
+// - Enlace SOLO en saludo inicial (cada ventana de 6h). Servidor lo quita si aparece fuera del saludo.
+// - Marca fija “Gapink Nails” (nunca “Ga Pink”). Prompt se lo recuerda.
+// - Cero keywords ni regex de contenido en servidor (todo lo infiere la IA). El server solo aplica el contrato.
 //
-// Campos que debe devolver la IA:
-// {"lang":"es|en|fr","intent":"appt|hi|other","upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},"ask":"svc|salon|staff|day|part|null","reply":"...", "final":true|false}
+// JSON IA esperado por turno:
+// {
+//   "lang":"es|en|fr",
+//   "intent":"appt|hi|other",
+//   "upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},
+//   "answered": true|false,
+//   "answered_field":"svc|salon|staff|day|part|null",
+//   "ask":"svc|salon|staff|day|part|null",
+//   "reply":"... (una sola pregunta, sin listas de servicios)",
+//   "final": true|false
+// }
 //
-// Notas:
-// - Sin análisis de “me da igual” etc. Esa comprensión la hace la IA y nos pasa los campos.
-// - Para cortar bucles sin entender el contenido, usamos: "siguiente campo faltante" + control de repeticiones de respuesta.
-// - El link SOLO aparece en saludo (server lo sanitiza si no toca).
+// Completo cuando: svc + salon + (staff_any OR staff) + day + part.
 
 import express from "express"
 import pino from "pino"
@@ -40,6 +42,9 @@ dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isoWeek); dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
 const nowEU = () => dayjs().tz(EURO_TZ)
 
+const BRAND = "Gapink Nails"
+const BOOKING_URL = "https://gapinknails.square.site/"
+
 // ===== Config
 const PORT = process.env.PORT || 8080
 const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
@@ -52,17 +57,17 @@ const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 24)
 const HISTORY_TRUNC_EACH = Number(process.env.HISTORY_TRUNC_EACH || 140)
 const PROMPT_MAX_CHARS = Number(process.env.PROMPT_MAX_CHARS || 3200)
 
-const FIELD_COOLDOWN_MS = Number(process.env.FIELD_COOLDOWN_MS || 15000)
-const MAX_SAME_REPLY = Number(process.env.MAX_SAME_REPLY || 2)
+const MAX_SAME_REPLY = Number(process.env.MAX_SAME_REPLY || 2)      // veces exactas
+const MAX_ASK_TRIES   = Number(process.env.MAX_ASK_TRIES || 3)      // reintentos por campo antes de “pista”
 
-// ===== IA (compacta)
+// ===== IA
 const AI_PROVIDER = (process.env.AI_PROVIDER || (process.env.DEEPSEEK_API_KEY? "deepseek" : process.env.OPENAI_API_KEY? "openai" : "none")).toLowerCase()
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ""
 const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL   || "deepseek-chat"
 const OPENAI_API_KEY   = process.env.OPENAI_API_KEY || ""
 const OPENAI_MODEL     = process.env.OPENAI_MODEL   || "gpt-4o-mini"
 const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 12000)
-const AI_TEMPERATURE   = Number(process.env.AI_TEMPERATURE || 0.2)
+const AI_TEMPERATURE   = Number(process.env.AI_TEMPERATURE || 0.22) // un pelín más variación
 const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 220)
 
 // ===== Utils
@@ -92,7 +97,7 @@ function deepClone(o){ return JSON.parse(JSON.stringify(o||{})) }
 function truncate(s, n){ const x=String(s||""); return x.length<=n?x:x.slice(0,n-1)+"…" }
 
 // ===== DB
-const db = new Database("gapink_compact_nokey.db"); db.pragma("journal_mode = WAL")
+const db = new Database("gapink_seq_v382.db"); db.pragma("journal_mode = WAL")
 db.exec(`
 CREATE TABLE IF NOT EXISTS sessions (
   phone TEXT PRIMARY KEY,
@@ -114,7 +119,7 @@ CREATE TABLE IF NOT EXISTS intakes (
 CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   phone TEXT,
-  direction TEXT, -- in|out|sys
+  direction TEXT,
   action TEXT,
   message TEXT,
   extra TEXT,
@@ -190,33 +195,21 @@ function hadAssistantLast6h(phone){
   return !!row
 }
 
-// ===== Estado & completitud (sin mirar contenido del usuario)
+// ===== Estado & completitud
 function isComplete(s){
   return !!(s.svc && s.salon && (s.staff_any===true || s.staff) && s.day && s.part)
 }
 function nextFieldToAsk(s){
   const order = ["svc","salon","staff","day","part"]
-  const missing = []
-  if (!s.svc) missing.push("svc")
-  if (!s.salon) missing.push("salon")
-  if (!(s.staff_any===true || s.staff)) missing.push("staff")
-  if (!s.day) missing.push("day")
-  if (!s.part) missing.push("part")
-  for (const f of order){ if (missing.includes(f)) return f }
+  if (!s.svc) return "svc"
+  if (!s.salon) return "salon"
+  if (!(s.staff_any===true || s.staff)) return "staff"
+  if (!s.day) return "day"
+  if (!s.part) return "part"
   return null
 }
-function fieldAskedRecently(session, field){
-  const t = Date.now()
-  session.ask_at = session.ask_at || {}
-  const last = session.ask_at[field] || 0
-  return (t - last) < FIELD_COOLDOWN_MS
-}
-function noteAskedNow(session, field){
-  session.ask_at = session.ask_at || {}
-  session.ask_at[field] = Date.now()
-}
 
-// ===== Textos estándar (no dependen del usuario)
+// ===== Textos estándar (solo fallback)
 function standardQuestion(lang, field){
   if (lang==="en"){
     if (field==="svc") return "What service would you like?"
@@ -238,45 +231,53 @@ function standardQuestion(lang, field){
     return "¿Mañana, tarde o noche?"
   }
 }
+
+// Link SOLO en saludo
 function sanitizeReplyLink(reply, shouldGreet){
-  // Solo permitimos el link en el saludo inicial
-  const URL = "https://gapinknails.square.site/"
   if (shouldGreet) return reply
-  return String(reply||"").replaceAll(URL, "").replaceAll("  "," ").trim()
+  return String(reply||"").replaceAll(BOOKING_URL, "").replace(/\s{2,}/g," ").trim()
 }
 
-// ===== IA compacta (1 sola llamada, prompt mini)
-async function aiCallCompact({langHint, known, shouldGreet, bookingURL, historyCompact, userText}){
-  if (AI_PROVIDER==="none") return { lang:"es", intent:"other", upd:{}, ask:null, reply:"Hola 👋", final:false }
+// ===== IA (1 llamada; le pasamos reintentos y última frase)
+async function aiCallCompact({brand, langHint, known, pendingField, shouldGreet, bookingURL, historyCompact, userText, askTries, lastBotReply}){
+  if (AI_PROVIDER==="none") return { lang:"es", intent:"other", upd:{}, answered:false, answered_field:null, ask: pendingField||"svc", reply:"Hola 👋", final:false }
   const controller = new AbortController()
   const timeout = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
 
   const sys =
-`Reply ONLY with JSON. Keep it short.
+`You are the WhatsApp assistant for "${brand}". Reply ONLY with JSON. Be short, warm, and NEVER ask more than one question.
 
 Schema:
-{"lang":"es|en|fr","intent":"appt|hi|other","upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},"ask":"svc|salon|staff|day|part|null","reply":"...", "final":true|false}
+{"lang":"es|en|fr","intent":"appt|hi|other","upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},"answered":true|false,"answered_field":"svc|salon|staff|day|part|null","ask":"svc|salon|staff|day|part|null","reply":"...", "final":true|false}
 
-Rules:
-- Language = user's language; be consistent.
-- Greeting: only if server says "shouldGreet": true. Make it vary naturally AND include this link exactly once: ${"https://gapinknails.square.site/"} . Never include the link outside greeting.
-- Ask ONE short question at a time (no lists).
-- DO NOT ask for fields already known.
-- Appointment is complete when svc+salon+(staff_any or staff)+day+part.
-- Return valid JSON only.`
+Hard rules:
+- Always use the brand name exactly: "Gapink Nails".
+- Language = user's; stay consistent with langHint unless the user changes it.
+- Greeting: ONLY when shouldGreet=true; make it naturally varied AND include exactly once: ${BOOKING_URL}. Outside greeting, NEVER include that link.
+- There is EXACTLY ONE active question at a time. The server passes "pendingField".
+- If the user's message answers that pendingField, set upd for that field, answered=true, answered_field=pendingField, and ask the NEXT missing field.
+- If it does NOT answer, keep answered=false and ask the SAME pendingField again with a DIFFERENT phrasing than lastBotReply.
+- If askTries >= 2 for this field, add a tiny hint (e.g., for part: "Responde: mañana / tarde / noche"), still ONE question.
+- Avoid repeating verbatim sentences. Mirror user's wording when helpful.
+- Appointment is complete only if svc+salon+(staff_any or staff)+day+part are known.
+- Return STRICT JSON; no extra text.`
 
   const server = {
     langHint,
     known,
+    pendingField,
     shouldGreet,
     bookingURL,
-    nextField: nextFieldToAsk(known),
+    nextIfReady: nextFieldToAsk(known),
+    askTries,
+    lastBotReply,
     now: nowEU().format("YYYY-MM-DD HH:mm")
   }
 
   const hist = historyCompact.join("\n")
-  let prompt = `[SERVER]\n${JSON.stringify(server)}\n[HISTORY]\n${hist}\n[USER]\n${userText}`
   const head = sys + "\n"
+  let prompt = `[SERVER]\n${JSON.stringify(server)}\n[HISTORY]\n${hist}\n[USER]\n${userText}`
+
   if ((head.length + prompt.length) > PROMPT_MAX_CHARS){
     const overflow = (head.length + prompt.length) - PROMPT_MAX_CHARS
     prompt = truncate(prompt, Math.max(200, prompt.length - overflow - 50))
@@ -294,8 +295,7 @@ Rules:
     clearTimeout(timeout)
     if (!resp.ok) return null
     const data = await resp.json()
-    const text = data?.choices?.[0]?.message?.content || ""
-    return text
+    return data?.choices?.[0]?.message?.content || ""
   }catch{
     clearTimeout(timeout); return null
   }
@@ -326,7 +326,7 @@ app.get("/", (_req,res)=>{
   a{color:#1f6feb;text-decoration:none}
   </style>
   <div class="card">
-    <h1>🩷 Gapink Nails Bot v37.2.0 “IA 1-pass, sin keywords”</h1>
+    <h1>🩷 ${BRAND} Bot v38.2.0</h1>
     <div class="row">
       <div class="pill ${conectado ? "ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</div>
       <div class="pill warn">Historial ${HISTORY_HOURS}h · ${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch</div>
@@ -335,7 +335,7 @@ app.get("/", (_req,res)=>{
       <div class="pill">Intakes: ${count}</div>
     </div>
     ${!conectado && lastQR ? `<div class="mt"><img src="/qr.png" width="300" style="border-radius:8px"/></div>`:""}
-    <p class="mt" style="opacity:.8">Reserva online (solo en saludo): <a target="_blank" href="https://gapinknails.square.site/">https://gapinknails.square.site/</a></p>
+    <p class="mt" style="opacity:.8">Reserva online (solo en saludo): <a target="_blank" href="${BOOKING_URL}">${BOOKING_URL}</a></p>
     <div class="foot">Desarrollado por <strong>Gonzalo García Aranda</strong></div>
   </div>`)
 })
@@ -378,9 +378,9 @@ async function loadBaileys(){
   const useMultiFileAuthState = mod.useMultiFileAuthState || mod.default?.useMultiFileAuthState
   const fetchLatestBaileysVersion = mod.fetchLatestBaileysVersion || mod.default?.fetchLatestBaileysVersion || (async()=>({version:[2,3000,0]}))
   const Browsers = mod.Browsers || mod.default?.Browsers || {
-    linux:(n="Gapink Bot · Gonzalo García Aranda")=>["Linux",n,"121.0.0"],
-    macOS:(n="Gapink Bot · Gonzalo García Aranda")=>["MacOS",n,"121.0.0"],
-    windows:(n="Gapink Bot · Gonzalo García Aranda")=>["Windows",n,"121.0.0"],
+    linux:(n=`${BRAND} Bot · Gonzalo García Aranda`)=>["Linux",n,"121.0.0"],
+    macOS:(n=`${BRAND} Bot · Gonzalo García Aranda`)=>["MacOS",n,"121.0.0"],
+    windows:(n=`${BRAND} Bot · Gonzalo García Aranda`)=>["Windows",n,"121.0.0"],
   }
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
@@ -392,7 +392,7 @@ async function startBot(){
     if(!fs.existsSync("auth_info")) fs.mkdirSync("auth_info",{recursive:true})
     const { state, saveCreds } = await useMultiFileAuthState("auth_info")
     const { version } = await fetchLatestBaileysVersion().catch(()=>({version:[2,3000,0]}))
-    const browserIdentity = (Browsers.linux ?? Browsers.macOS)("Gapink Bot · Gonzalo García Aranda")
+    const browserIdentity = (Browsers.linux ?? Browsers.macOS)(`${BRAND} Bot · Gonzalo García Aranda`)
     const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:browserIdentity, syncFullHistory:false })
     globalThis.sock = sock
 
@@ -425,24 +425,26 @@ async function startBot(){
       const job = prev.then(async ()=>{
         let s = loadSession(phone) || {
           phone,
+          // Datos
           svc:null, salon:null, staff_any:null, staff:null, day:null, part:null,
           lang:null,
-          snooze_until_ms:null,
+          // Control
+          pending_field:null,
+          ask_tries:{},                // reintentos por campo
           last_bot_reply:null, same_reply_count:0,
-          last_field_asked:null,
-          ask_at:{}
+          snooze_until_ms:null
         }
         let p = loadProfile(phone)
 
         try{
-          // Snooze manual con "."
+          // Snooze manual
           if (isFromMe && textRaw.trim()==="." && SNOOZE_ON_DOT){
             s.snooze_until_ms = nowEU().add(SNOOZE_HOURS,"hour").valueOf()
             saveSession(phone, s)
             logEvent({phone, direction:"sys", action:"manual_snooze", message:"."})
             return
           }
-          // Si el cliente habla durante snooze
+          // Snooze activo
           if (!isFromMe && s.snooze_until_ms && nowEU().valueOf() < s.snooze_until_ms){
             if (AUTO_UNSNOOZE_ON_USER){
               s.snooze_until_ms = null
@@ -457,11 +459,11 @@ async function startBot(){
           // Log entrada
           logEvent({phone, direction:"in", action:"message", message:textRaw})
 
-          // Historial y si toca saludo
+          // Historial y saludo
           const histCompact = getHistoryCompact(phone)
           const shouldGreet = !hadAssistantLast6h(phone)
 
-          // Known (solo sesión + perfil, sin interpretar)
+          // Known (no inferimos)
           const known = {
             svc:   s.svc || p.svc || null,
             salon: s.salon || p.salon || null,
@@ -472,32 +474,36 @@ async function startBot(){
           }
           const langHint = s.lang || p.lang || "es"
 
-          // Cooldown del siguiente campo
-          let nxt = nextFieldToAsk(s)
-          if (nxt && fieldAskedRecently(s, nxt)){
-            const order = ["svc","salon","staff","day","part"]
-            for (const f of order){
-              if (f===nxt) continue
-              if (f==="staff" && (s.staff_any===true || s.staff)) continue
-              if (!s[f]) { nxt = f; break }
-            }
+          // Campo pendiente inicial
+          if (!s.pending_field){
+            s.pending_field = nextFieldToAsk(s)
           }
-          if (nxt) noteAskedNow(s, nxt)
+          // Contador de reintentos para este campo
+          const tries = s.ask_tries[s.pending_field||"none"] || 0
 
-          // ===== Llamada IA
-          const bookingURL = "https://gapinknails.square.site/"
+          // ===== Llamada IA con contexto de reintentos y última frase
           const aiRaw = await aiCallCompact({
-            langHint, known, shouldGreet, bookingURL,
-            historyCompact: histCompact, userText: textRaw
+            brand: BRAND,
+            langHint,
+            known,
+            pendingField: s.pending_field,
+            shouldGreet,
+            bookingURL: BOOKING_URL,
+            historyCompact: histCompact,
+            userText: textRaw,
+            askTries: tries,
+            lastBotReply: s.last_bot_reply || ""
           })
           logEvent({phone, direction:"sys", action:"ai_raw", message: truncate(String(aiRaw||""), 1000)})
 
           const aiJson = toJSONLoose(aiRaw) || {}
           logEvent({phone, direction:"sys", action:"ai_json", message: safeJSONStringify(aiJson)})
 
-          // Aplicar updates tal cual vienen de la IA (sin keywords)
+          // Idioma
           if (aiJson.lang) s.lang = aiJson.lang
           const up = aiJson.upd || {}
+
+          // Aplica updates
           if (typeof up.svc === "string" && up.svc.trim()) s.svc = up.svc.trim()
           if (up.salon === "torremolinos" || up.salon === "la_luz") s.salon = up.salon
           if (typeof up.staff_any === "boolean") s.staff_any = up.staff_any
@@ -505,42 +511,49 @@ async function startBot(){
           if (typeof up.day === "string" && up.day.trim()) s.day = up.day.trim()
           if (up.part && ["mañana","tarde","noche"].includes(up.part)) s.part = up.part
 
-          // Decide si está completo
+          // ¿Respondió el campo pendiente?
+          const answered = !!aiJson.answered && aiJson.answered_field === s.pending_field
+          if (answered){
+            // reset tries del campo respondido
+            s.ask_tries[s.pending_field] = 0
+            // pasar al siguiente
+            s.pending_field = nextFieldToAsk(s)
+          } else if (s.pending_field){
+            // incrementa reintentos si seguimos con el mismo
+            s.ask_tries[s.pending_field] = (s.ask_tries[s.pending_field]||0) + 1
+          }
+
           const completed = isComplete(s)
           let reply = (typeof aiJson.reply==="string"? aiJson.reply.trim() : "") || ""
           let ask = aiJson.ask || null
           const finalizeFlag = !!aiJson.final
 
-          // Nunca metas el link fuera del saludo
+          // Enlace solo en saludo
           reply = sanitizeReplyLink(reply, shouldGreet)
 
-          // Anti-bucle: si IA pregunta por algo distinto del siguiente campo necesario, la sobreescribimos
-          let need = nextFieldToAsk(s)
-          if (!completed && need){
-            if (ask !== need){
-              reply = standardQuestion(s.lang || langHint, need)
-              ask = need
+          // Enforcer: si NO respondió, la pregunta debe seguir siendo sobre el pending_field actual
+          if (!answered && s.pending_field){
+            if (ask !== s.pending_field){
+              // si la IA cambió de tema, mantenemos el campo
+              ask = s.pending_field
             }
           }
 
-          // Anti-bucle: si repite exactamente el mismo texto y es la misma pregunta, forzamos avanzar a otro campo que falte
-          if (reply && s.last_bot_reply && reply === s.last_bot_reply && s.last_field_asked && ask === s.last_field_asked){
-            const order = ["svc","salon","staff","day","part"]
-            for (const f of order){
-              if (!s[f] && f !== ask){
-                reply = standardQuestion(s.lang || langHint, f)
-                ask = f
-                break
-              }
-            }
+          // Anti-repetición literal
+          if (reply && s.last_bot_reply && reply === s.last_bot_reply){
+            s.same_reply_count = (s.same_reply_count||0) + 1
+          } else {
+            s.same_reply_count = 0
+          }
+          if (s.same_reply_count >= MAX_SAME_REPLY){
+            // forzamos ligera variación (sin cambiar el campo)
+            reply = (s.lang==="en") ? (reply + " (just a quick confirm)") :
+                    (s.lang==="fr") ? (reply + " (petite confirmation)") :
+                                      (reply + " (te leo)")
           }
 
-          // Guardar “qué hemos preguntado”
-          s.last_field_asked = ask || s.last_field_asked
-
-          // Finalización si procede
+          // Cierre si completado
           if (completed || finalizeFlag){
-            // Guardar intake
             const id = `int_${randomUUID().slice(0,8)}_${Date.now().toString(36)}`
             db.prepare(`INSERT INTO intakes
               (id, phone, salon, svc, staff_any, staff, day, part, created_at, last_msg)
@@ -551,32 +564,32 @@ async function startBot(){
               created: new Date().toISOString(), raw: textRaw
             })
 
-            // Memoriza perfil (sin inferir nada)
-            const p0 = deepClone(p)
-            p.lang = s.lang || p.lang || "es"
-            p.salon = s.salon || p.salon
-            p.svc = s.svc || p.svc
-            if (s.staff_any===true){ p.staff_any = true; p.staff = null }
-            if (s.staff){ p.staff_any = false; p.staff = s.staff }
-            p.part = s.part || p.part
-            saveProfile(phone, p)
+            // Memoriza perfil mínimo
+            const prof = loadProfile(phone)
+            prof.lang = s.lang || prof.lang || "es"
+            prof.salon = s.salon || prof.salon
+            prof.svc = s.svc || prof.svc
+            if (s.staff_any===true){ prof.staff_any = true; prof.staff = null }
+            if (s.staff){ prof.staff_any = false; prof.staff = s.staff }
+            prof.part = s.part || prof.part
+            saveProfile(phone, prof)
 
-            // Si la IA no dio cierre, ponemos uno corto (sin link, porque no es saludo)
             if (!reply){
-              reply = (p.lang==="en") ? "All set! I’ve got everything noted. If you need changes, just tell me ✨"
-                   : (p.lang==="fr") ? "Parfait, tout est noté. Dis-moi si tu veux changer quelque chose ✨"
-                   : "¡Listo! Tengo todo apuntado. Si quieres cambiar algo, dime ✨"
+              reply = (prof.lang==="en") ? "All set ✅ If you need changes, just tell me."
+                   : (prof.lang==="fr") ? "Parfait ✅ Dis-moi si tu veux changer quelque chose."
+                   : "¡Listo! ✅ Si quieres cambiar algo, dime."
             }
 
             await sendText(jid, phone, reply)
             s.last_bot_reply = reply
+            s.pending_field = null
             saveSession(phone, s)
             return
           }
 
-          // Fallback: si no hay reply por lo que sea, preguntamos el siguiente campo
+          // Fallback: si no hay reply, pregunta estándar del campo pendiente
           if (!reply){
-            reply = standardQuestion(s.lang || langHint, nextFieldToAsk(s) || "salon")
+            reply = standardQuestion(s.lang || langHint, s.pending_field || nextFieldToAsk(s) || "svc")
           }
 
           await sendText(jid, phone, reply)
@@ -586,9 +599,9 @@ async function startBot(){
         }catch(err){
           logEvent({phone, direction:"sys", action:"handler_error", message: err?.message, extra:{stack: err?.stack}})
           const lang = s.lang || loadProfile(phone).lang || "es"
-          const txt = (lang==="en")?"Oops, small glitch. Which salon works for you, Torremolinos or La Luz?"
-                    : (lang==="fr")?"Oups, petit bug. Quel salon te convient, Torremolinos ou La Luz ?"
-                    : "Se me cruzó un cable 🤯. ¿Qué salón prefieres: Torremolinos o La Luz?"
+          const txt = (lang==="en")?"Glitch 😅 Which salon works for you, Torremolinos or La Luz?"
+                    : (lang==="fr")?"Oups 😅 Quel salon te convient, Torremolinos ou La Luz ?"
+                    : "Ups 😅 ¿Qué salón prefieres: Torremolinos o La Luz?"
           try{ await sock.sendMessage(jid, { text: txt }) }catch{}
         }
       })
@@ -601,7 +614,7 @@ async function startBot(){
 }
 
 // ===== Arranque
-console.log(`🩷 Gapink Nails Bot v37.2.0 “IA 1-pass · sin keywords · saludo con link solo al inicio” · Historial ${HISTORY_HOURS}h/${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch · AI:${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}`)
+console.log(`🩷 ${BRAND} Bot v38.2.0 · Historial ${HISTORY_HOURS}h/${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch · AI:${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}`)
 const server = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", e=>{ console.error("uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", e=>{ console.error("unhandledRejection:", e) })
