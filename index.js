@@ -1,28 +1,36 @@
-// index.js — Gapink Nails · v38.3.0 “saludo 1× + beauty, no repetitiva”
+// index.js — Gapink Nails · v40.0.0 “IA decide saludo/cita/info · 1 sola pregunta”
 //
-// Cambios vs 38.2.0:
-// - Saludo SOLO 1 vez por ventana de 6h, PERO si el usuario manda un saludo puro (“hola/buenas/hello/…”),
-//   se permite saludar otra vez. El enlace solo aparece en ese saludo.
-// - En el prompt dejamos claro que Gapink Nails es un *salón de belleza* (no solo uñas).
-//   Ejemplos de servicios: cejas, depilación, pestañas, faciales, manicura/pedicura, etc.
-// - Si pending_field=svc y el usuario pone “cejas”, la IA debe marcar answered=true y pasar al siguiente campo.
-// - Pregunta activa única, sin repeticiones verbatim. Tras varios intentos añade pista breve.
-// - Cero keywords para extraer servicio/elecciones (lo hace la IA). ÚNICA excepción: detección de “saludo puro”,
-//   para permitir un segundo saludo dentro de 6h si el cliente dice “hola”, por tu petición.
+// Qué hace:
+// - Pasa a la IA TODO el contexto útil (últimas 6h de conversación, compactado).
+// - La IA devuelve SOLO JSON con:
+//   {
+//     "lang":"es|en|fr|...",
+//     "is_greeting": true|false,
+//     "wants_appointment": true|false,
+//     "extracted": {
+//        "svc": string|null,          // servicio: "cejas", "micropigmentación", etc.
+//        "salon": "torremolinos"|"la_luz"|null,
+//        "staff_any": true|false|null,
+//        "staff": string|null,
+//        "day": string|null,          // “jueves”, “20/09”, etc. (solo texto, la IA decide)
+//        "part": "mañana"|"tarde"|"noche"|null
+//     },
+//     "missing": ["svc","salon","staff_or_any","day","part"], // solo campos faltantes
+//     "reply_hint": "texto breve opcional para guiar al usuario (máx 140c)"
+//   }
 //
-// JSON esperado de IA por turno:
-// {
-//   "lang":"es|en|fr",
-//   "intent":"appt|hi|other",
-//   "upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},
-//   "answered": true|false,
-//   "answered_field":"svc|salon|staff|day|part|null",
-//   "ask":"svc|salon|staff|day|part|null",
-//   "reply":"... (1 sola pregunta, sin listas infinitas)",
-//   "final": true|false
-// }
+// - El servidor NO reinterpreta: si falta algo, pregunta SOLO por el primer faltante.
+// - Si todo está completo, devuelve un resumen corto y pide confirmación con 1 pregunta.
+// - Log completo en SQLite + endpoint /logs.json
 //
-// Completo cuando: svc + salon + (staff_any OR staff) + day + part.
+// Notas:
+// - Sin Square aquí (clasificador puro). Puedes añadir la reserva real después si quieres.
+// - Sin “listas de servicios”; la IA decide por lenguaje natural y contexto.
+//
+// ENV esperados (opcionales):
+//   PORT, BOT_DEBUG, HISTORY_HOURS, HISTORY_MAX_MSGS, HISTORY_TRUNC_EACH,
+//   AI_PROVIDER (deepseek|openai), DEEPSEEK_API_KEY, DEEPSEEK_MODEL, OPENAI_API_KEY, OPENAI_MODEL,
+//   AI_TIMEOUT_MS, AI_TEMPERATURE, AI_MAX_TOKENS
 
 import express from "express"
 import pino from "pino"
@@ -34,54 +42,38 @@ import Database from "better-sqlite3"
 import dayjs from "dayjs"
 import utc from "dayjs/plugin/utc.js"
 import tz from "dayjs/plugin/timezone.js"
-import isoWeek from "dayjs/plugin/isoWeek.js"
 import "dayjs/locale/es.js"
-import { webcrypto, randomUUID } from "crypto"
+import { webcrypto } from "crypto"
 import { createRequire } from "module"
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto
-dayjs.extend(utc); dayjs.extend(tz); dayjs.extend(isoWeek); dayjs.locale("es")
+dayjs.extend(utc); dayjs.extend(tz); dayjs.locale("es")
 const EURO_TZ = "Europe/Madrid"
 const nowEU = () => dayjs().tz(EURO_TZ)
 
+// ===== Marca
 const BRAND = "Gapink Nails"
 const BOOKING_URL = "https://gapinknails.square.site/"
 
 // ===== Config
 const PORT = process.env.PORT || 8080
 const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
-const SNOOZE_HOURS = Number(process.env.SNOOZE_HOURS || 6)
-const SNOOZE_ON_DOT = !/^false$/i.test(process.env.SNOOZE_ON_DOT || "true")
-const AUTO_UNSNOOZE_ON_USER = !/^false$/i.test(process.env.AUTO_UNSNOOZE_ON_USER || "true")
-
 const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 6)
-const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 24)
-const HISTORY_TRUNC_EACH = Number(process.env.HISTORY_TRUNC_EACH || 140)
-const PROMPT_MAX_CHARS = Number(process.env.PROMPT_MAX_CHARS || 3200)
-
-const MAX_SAME_REPLY = Number(process.env.MAX_SAME_REPLY || 2)
-const MAX_ASK_TRIES   = Number(process.env.MAX_ASK_TRIES || 3)
+const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 40)
+const HISTORY_TRUNC_EACH = Number(process.env.HISTORY_TRUNC_EACH || 180)
 
 // ===== IA
 const AI_PROVIDER = (process.env.AI_PROVIDER || (process.env.DEEPSEEK_API_KEY? "deepseek" : process.env.OPENAI_API_KEY? "openai" : "none")).toLowerCase()
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ""
 const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL   || "deepseek-chat"
-const OPENAI_API_KEY   = process.env.OPENAI_API_KEY || ""
-const OPENAI_MODEL     = process.env.OPENAI_MODEL   || "gpt-4o-mini"
-const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 12000)
-const AI_TEMPERATURE   = Number(process.env.AI_TEMPERATURE || 0.22)
-const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 220)
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY   || ""
+const OPENAI_MODEL     = process.env.OPENAI_MODEL     || "gpt-4o-mini"
+const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 10000)
+const AI_TEMPERATURE   = Number(process.env.AI_TEMPERATURE || 0.15) // barato, estable
+const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 160)
 
 // ===== Utils
-const onlyDigits = s => String(s||"").replace(/\D+/g,"")
-function normalizePhoneES(raw){
-  const d=onlyDigits(raw); if(!d) return null
-  if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
-  if (d.startsWith("34") && d.length===11) return `+${d}`
-  if (d.length===9) return `+34${d}`
-  if (d.startsWith("00")) return `+${d.slice(2)}`
-  return `+${d}`
-}
+function truncate(s, n){ const x=String(s||""); return x.length<=n?x:x.slice(0,n-1)+"…" }
 function safeJSONStringify(v){
   const seen = new WeakSet()
   try{
@@ -95,257 +87,158 @@ function safeJSONStringify(v){
     })
   }catch{ try { return String(v) } catch { return "[Unserializable]" } }
 }
-function deepClone(o){ return JSON.parse(JSON.stringify(o||{})) }
-function truncate(s, n){ const x=String(s||""); return x.length<=n?x:x.slice(0,n-1)+"…" }
-
-// Saludo puro (excepción pedida por Gonzalo)
-function isGreetingOnly(text){
-  const t = (text||"").trim().toLowerCase()
-  // Sin “keywords” para negocio: solo saludos básicos permitidos para la excepción del saludo
-  return /^(hola+|buenas+|buenos dias|buenas tardes|buenas noches|hello+|hi+|hey+|holi+)[!¡.,\s]*$/i.test(t)
+const onlyDigits = s => String(s||"").replace(/\D+/g,"")
+function normalizePhoneE164(raw){
+  const d=onlyDigits(raw); if(!d) return null
+  if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
+  if (d.startsWith("34") && d.length===11) return `+${d}`
+  if (d.length===9) return `+34${d}`
+  if (d.startsWith("00")) return `+${d.slice(2)}`
+  return `+${d}`
 }
 
 // ===== DB
-const db = new Database("gapink_seq_v383.db"); db.pragma("journal_mode = WAL")
+const db = new Database("gapink_ai_classifier_v400.db"); db.pragma("journal_mode = WAL")
 db.exec(`
+CREATE TABLE IF NOT EXISTS logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  phone TEXT,
+  direction TEXT,        -- in|out|sys
+  message TEXT,
+  extra TEXT,
+  ts TEXT
+);
 CREATE TABLE IF NOT EXISTS sessions (
   phone TEXT PRIMARY KEY,
   data_json TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS intakes (
-  id TEXT PRIMARY KEY,
-  phone TEXT NOT NULL,
-  salon TEXT,
-  svc TEXT,
-  staff_any INTEGER,
-  staff TEXT,
-  day TEXT,
-  part TEXT,
-  created_at TEXT NOT NULL,
-  last_msg TEXT
-);
-CREATE TABLE IF NOT EXISTS logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  phone TEXT,
-  direction TEXT,
-  action TEXT,
-  message TEXT,
-  extra TEXT,
-  ts TEXT
-);
-CREATE TABLE IF NOT EXISTS profiles (
-  phone TEXT PRIMARY KEY,
-  data_json TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
 `)
-
-function loadSession(phone){
-  const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@phone`).get({phone})
-  return row ? JSON.parse(row.data_json) : null
-}
-function saveSession(phone, s){
-  const json = JSON.stringify(s || {})
-  const upd = db.prepare(`UPDATE sessions SET data_json=@j, updated_at=@u WHERE phone=@p`)
-    .run({ j: json, u: new Date().toISOString(), p: phone })
-  if (upd.changes===0){
-    db.prepare(`INSERT INTO sessions (phone, data_json, updated_at) VALUES (@p,@j,@u)`)
-      .run({ p: phone, j: json, u: new Date().toISOString() })
-  }
-}
-function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
-
-function loadProfile(phone){
-  const row = db.prepare(`SELECT data_json FROM profiles WHERE phone=@phone`).get({phone})
-  return row ? JSON.parse(row.data_json) : { phone, salon:null, svc:null, staff_any:null, staff:null, part:null, lang:"es" }
-}
-function saveProfile(phone, p){
-  const json = JSON.stringify(p || {})
-  const upd = db.prepare(`UPDATE profiles SET data_json=@j, updated_at=@u WHERE phone=@p`)
-    .run({ j: json, u: new Date().toISOString(), p: phone })
-  if (upd.changes===0){
-    db.prepare(`INSERT INTO profiles (phone, data_json, updated_at) VALUES (@p,@j,@u)`)
-      .run({ p: phone, j: json, u: new Date().toISOString() })
-  }
-}
-
-function logEvent({phone, direction, action, message, extra}){
+function logEvent({phone, direction, message, extra}){
   try{
-    db.prepare(`INSERT INTO logs (phone, direction, action, message, extra, ts)
-      VALUES (@p,@d,@a,@m,@e,@t)`).run({
+    db.prepare(`INSERT INTO logs (phone,direction,message,extra,ts) VALUES (@p,@d,@m,@e,@t)`).run({
       p: phone || "unknown",
       d: direction || "sys",
-      a: action || "event",
       m: message || null,
       e: extra ? safeJSONStringify(extra) : null,
       t: new Date().toISOString()
     })
   }catch{}
-  if (BOT_DEBUG){
-    try{ console.log(JSON.stringify({ phone, direction, action, message, extra, ts:new Date().toISOString() })) }catch{}
-  }
+  if (BOT_DEBUG){ try{ console.log(JSON.stringify({ phone:phone||"?", direction, message, extra })) }catch{} }
 }
-
-function getHistoryCompact(phone, maxMsgs=HISTORY_MAX_MSGS, trunc=HISTORY_TRUNC_EACH){
+function getHistoryCompact(phone){
   const since = nowEU().subtract(HISTORY_HOURS,"hour").toISOString()
   const rows = db.prepare(`SELECT direction, message FROM logs
     WHERE phone=@p AND ts>=@since AND message IS NOT NULL
-    ORDER BY id DESC LIMIT @limit`).all({p:phone, since, limit:maxMsgs})
-  const ordered = rows.reverse()
-  return ordered.map(r=>{
+    ORDER BY id DESC LIMIT @limit`).all({p:phone, since, limit:HISTORY_MAX_MSGS})
+  return rows.reverse().map(r=>{
     const tag = r.direction==="in" ? "U" : r.direction==="out" ? "A" : "S"
-    return `${tag}:${truncate(r.message||"", trunc)}`
+    return `${tag}:${truncate(r.message||"", HISTORY_TRUNC_EACH)}`
   })
 }
-function hadAssistantLast6h(phone){
-  const since = nowEU().subtract(HISTORY_HOURS,"hour").toISOString()
-  const row = db.prepare(`SELECT 1 FROM logs WHERE phone=@p AND direction='out' AND ts>=@since LIMIT 1`).get({p:phone, since})
-  return !!row
+function loadSession(phone){
+  const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@p`).get({p:phone})
+  return row ? JSON.parse(row.data_json) : { phone, lang:"es", last_summary:null }
 }
-
-// ===== Estado & completitud
-function isComplete(s){
-  return !!(s.svc && s.salon && (s.staff_any===true || s.staff) && s.day && s.part)
-}
-function nextFieldToAsk(s){
-  if (!s.svc) return "svc"
-  if (!s.salon) return "salon"
-  if (!(s.staff_any===true || s.staff)) return "staff"
-  if (!s.day) return "day"
-  if (!s.part) return "part"
-  return null
-}
-
-// ===== Textos estándar (fallback)
-function standardQuestion(lang, field){
-  if (lang==="en"){
-    if (field==="svc") return "What service would you like? (e.g., brows, waxing, lashes, facial, manicure/pedicure)"
-    if (field==="salon") return "Which salon works for you, Torremolinos or La Luz?"
-    if (field==="staff") return "Any stylist or someone specific?"
-    if (field==="day") return "What day works for you?"
-    return "Morning, afternoon or evening?"
-  } else if (lang==="fr"){
-    if (field==="svc") return "Quel service veux-tu ? (ex : sourcils, épilation, cils, soin visage, manucure/pédicure)"
-    if (field==="salon") return "Quel salon te convient, Torremolinos ou La Luz ?"
-    if (field==="staff") return "Peu importe la personne ou quelqu’un en particulier ?"
-    if (field==="day") return "Quel jour te convient ?"
-    return "Matin, après-midi ou soir ?"
-  } else {
-    if (field==="svc") return "¿Qué servicio te gustaría? (ej.: cejas, depilación, pestañas, facial, manicura/pedicura)"
-    if (field==="salon") return "¿Qué salón prefieres: Torremolinos o La Luz?"
-    if (field==="staff") return "¿Cualquiera del equipo o alguien en concreto?"
-    if (field==="day") return "¿Qué día te viene bien?"
-    return "¿Mañana, tarde o noche?"
+function saveSession(phone, s){
+  const j = JSON.stringify(s||{})
+  const up = db.prepare(`UPDATE sessions SET data_json=@j, updated_at=@u WHERE phone=@p`).run({j, u:new Date().toISOString(), p:phone})
+  if (up.changes===0){
+    db.prepare(`INSERT INTO sessions (phone,data_json,updated_at) VALUES (@p,@j,@u)`).run({p:phone, j, u:new Date().toISOString()})
   }
 }
 
-// Link SOLO en saludo
-function sanitizeReplyLink(reply, shouldGreet){
-  if (shouldGreet) return reply
-  return String(reply||"").replaceAll(BOOKING_URL, "").replace(/\s{2,}/g," ").trim()
-}
-
-// ===== IA
-async function aiCallCompact({brand, langHint, known, pendingField, shouldGreet, bookingURL, historyCompact, userText, askTries, lastBotReply}){
-  if (AI_PROVIDER==="none") return { lang:"es", intent:"other", upd:{}, answered:false, answered_field:null, ask: pendingField||"svc", reply:"Hola 👋", final:false }
+// ===== IA: clasificador compacto
+async function aiClassify({brand, bookingURL, historyCompact, userText}){
+  if (AI_PROVIDER==="none") return null
   const controller = new AbortController()
   const timeout = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
 
   const sys =
-`You are the WhatsApp assistant for a full-service beauty salon named "${brand}". Reply ONLY with JSON. Be short, warm, and NEVER ask more than one question.
+`You are the WhatsApp assistant for a BEAUTY SALON called "${brand}".
+Your ONLY task is to classify the conversation and extract info to avoid asking twice.
+Return STRICT JSON and NOTHING else.
 
 Schema:
-{"lang":"es|en|fr","intent":"appt|hi|other","upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},"answered":true|false,"answered_field":"svc|salon|staff|day|part|null","ask":"svc|salon|staff|day|part|null","reply":"...", "final":true|false}
+{
+  "lang": "es|en|fr|... (detected)",
+  "is_greeting": true|false,
+  "wants_appointment": true|false,
+  "extracted": {
+    "svc": string|null,
+    "salon": "torremolinos"|"la_luz"|null,
+    "staff_any": true|false|null,
+    "staff": string|null,
+    "day": string|null,
+    "part": "mañana"|"tarde"|"noche"|null
+  },
+  "missing": ["svc"|"salon"|"staff_or_any"|"day"|"part", ...],
+  "reply_hint": "brief natural cue to ask for the FIRST missing item (<=140 chars, 1 question, no menus)"
+}
 
-Strict rules:
-- Always use the brand exactly: "Gapink Nails".
-- It's a BEAUTY SALON (not only nails). Examples: brows/cejas, waxing/depilación, lashes/pestañas, facials, manicure/pedicure, etc.
-- Language = user's; follow langHint unless user clearly switches.
-- Greeting ONLY when shouldGreet=true; include exactly once: ${BOOKING_URL}. Never include that link outside greeting.
-- There is EXACTLY ONE active question. Server passes "pendingField".
-- If user's message answers pendingField, set upd for that field, answered=true, answered_field=pendingField, and ask the NEXT missing field.
-  Example: pendingField="svc" and user says "cejas" → upd.svc="cejas", answered=true, ask="salon".
-- If it does NOT answer, keep answered=false and ask the SAME pendingField again with a DIFFERENT phrasing than lastBotReply.
-- If askTries >= 2 for this field, add a tiny hint (e.g., for "part": "Responde: mañana / tarde / noche"), still ONE short question.
-- Never list long menus. Do not push nails-only options.
-- Appointment is complete only if svc+salon+(staff_any or staff)+day+part are known.
-- Return STRICT JSON; no extra text.`
+Rules:
+- Consider the LAST 6 hours of chat (provided as compact history).
+- If the user already mentioned something before (e.g., 'cejas', 'Torremolinos', 'me da igual quien'), mark it in extracted to avoid re-asking.
+- A message like "quiero cita" or "appointment" → wants_appointment=true.
+- Greetings like "hola/hello/hi/buenas" → is_greeting=true (only if the current message is indeed a greeting tone).
+- Never include ${bookingURL} in reply_hint. That's for the UI, not classification.
+- DO NOT add extra fields. Keep JSON tight.`
 
-  const server = {
-    langHint,
-    known,
-    pendingField,
-    shouldGreet,
-    bookingURL,
-    nextIfReady: nextFieldToAsk(known),
-    askTries,
-    lastBotReply,
-    now: nowEU().format("YYYY-MM-DD HH:mm")
-  }
-
-  const hist = historyCompact.join("\n")
-  const head = sys + "\n"
-  let prompt = `[SERVER]\n${JSON.stringify(server)}\n[HISTORY]\n${hist}\n[USER]\n${userText}`
-
-  if ((head.length + prompt.length) > PROMPT_MAX_CHARS){
-    const overflow = (head.length + prompt.length) - PROMPT_MAX_CHARS
-    prompt = truncate(prompt, Math.max(200, prompt.length - overflow - 50))
+  const payload = {
+    brand,
+    now: nowEU().format("YYYY-MM-DD HH:mm"),
+    history: historyCompact,
+    user: userText
   }
 
   try{
     const url = AI_PROVIDER==="deepseek" ? "https://api.deepseek.com/chat/completions" : "https://api.openai.com/v1/chat/completions"
     const headers = { "Content-Type":"application/json", "Authorization":`Bearer ${AI_PROVIDER==="deepseek"?DEEPSEEK_API_KEY:OPENAI_API_KEY}` }
     const messages = [
-      { role:"system", content: head.trim() },
-      { role:"user", content: prompt }
+      { role:"system", content: sys },
+      { role:"user", content: JSON.stringify(payload) }
     ]
     const body = JSON.stringify({ model: AI_PROVIDER==="deepseek"?DEEPSEEK_MODEL:OPENAI_MODEL, temperature:AI_TEMPERATURE, max_tokens:AI_MAX_TOKENS, messages })
     const resp = await fetch(url,{ method:"POST", headers, body, signal: controller.signal })
     clearTimeout(timeout)
     if (!resp.ok) return null
     const data = await resp.json()
-    return data?.choices?.[0]?.message?.content || ""
+    const txt = data?.choices?.[0]?.message?.content || ""
+    // Intentamos parseo robusto
+    let s = String(txt).trim().replace(/```json/gi,"```")
+    if (s.startsWith("```")) s = s.slice(3)
+    if (s.endsWith("```")) s = s.slice(0,-3)
+    const i = s.indexOf("{"), j = s.lastIndexOf("}")
+    if (i>=0 && j>i) s = s.slice(i, j+1)
+    return JSON.parse(s)
   }catch{
     clearTimeout(timeout); return null
   }
 }
-function toJSONLoose(text){
-  if (!text) return null
-  let s = String(text).trim().replace(/```json/gi,"```")
-  if (s.startsWith("```")) s = s.slice(3)
-  if (s.endsWith("```")) s = s.slice(0,-3)
-  const i = s.indexOf("{"), j = s.lastIndexOf("}")
-  if (i>=0 && j>i) s = s.slice(i, j+1)
-  try{ return JSON.parse(s) }catch{ return null }
-}
 
-// ===== Mini web
+// ===== Mini web (estado y QR)
 const app = express()
 let lastQR = null, conectado = false
 app.get("/", (_req,res)=>{
-  const count = db.prepare(`SELECT COUNT(*) as c FROM intakes`).get()?.c || 0
   res.send(`<!doctype html><meta charset="utf-8"><style>
   body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f6f7f9}
-  .card{max-width:960px;padding:28px;border-radius:18px;background:#fff;box-shadow:0 10px 32px rgba(0,0,0,.08)}
-  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .card{max-width:900px;padding:28px;border-radius:18px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.08)}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
   .pill{padding:6px 10px;border-radius:999px;background:#eef1f4;font-size:13px}
-  .ok{background:#d9f7e8;color:#0f5132}.bad{background:#fde2e1;color:#842029}.warn{background:#fff3cd;color:#664d03}
+  .ok{background:#d9f7e8;color:#0f5132}.bad{background:#fde2e1;color:#842029}
   .mt{margin-top:12px}
-  .foot{margin-top:16px;font-size:12px;opacity:.7}
   a{color:#1f6feb;text-decoration:none}
+  .foot{margin-top:8px;opacity:.7;font-size:12px}
   </style>
   <div class="card">
-    <h1>🩷 ${BRAND} Bot v38.3.0</h1>
+    <h1>🩷 ${BRAND} — IA Clasificador v40.0.0</h1>
     <div class="row">
-      <div class="pill ${conectado ? "ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</div>
-      <div class="pill warn">Historial ${HISTORY_HOURS}h · ${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch</div>
-      <div class="pill">IA: ${AI_PROVIDER.toUpperCase()}</div>
-      <div class="pill">Max tokens: ${AI_MAX_TOKENS}</div>
-      <div class="pill">Intakes: ${count}</div>
+      <span class="pill ${conectado?"ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</span>
+      <span class="pill">Historial IA ${HISTORY_HOURS}h · máx ${HISTORY_MAX_MSGS} msgs</span>
+      <span class="pill">IA: ${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}</span>
     </div>
-    ${!conectado && lastQR ? `<div class="mt"><img src="/qr.png" width="300" style="border-radius:8px"/></div>`:""}
-    <p class="mt" style="opacity:.8">Reserva online (solo en saludo): <a target="_blank" href="${BOOKING_URL}">${BOOKING_URL}</a></p>
+    ${!conectado && lastQR ? `<div class="mt"><img src="/qr.png" width="280" style="border-radius:10px"/></div>`:""}
+    <p class="mt">Reserva online: <a target="_blank" href="${BOOKING_URL}">${BOOKING_URL}</a></p>
     <div class="foot">Desarrollado por <strong>Gonzalo García Aranda</strong></div>
   </div>`)
 })
@@ -358,28 +251,12 @@ app.get("/logs.json", (req,res)=>{
   const phone = req.query.phone || null
   const limit = Number(req.query.limit || 500)
   const rows = phone
-    ? db.prepare(`SELECT id,phone,direction,action,message,extra,ts FROM logs WHERE phone=@p ORDER BY id DESC LIMIT @limit`).all({p:phone, limit})
-    : db.prepare(`SELECT id,phone,direction,action,message,extra,ts FROM logs ORDER BY id DESC LIMIT @limit`).all({limit})
+    ? db.prepare(`SELECT id,phone,direction,message,extra,ts FROM logs WHERE phone=@p ORDER BY id DESC LIMIT @limit`).all({p:phone, limit})
+    : db.prepare(`SELECT id,phone,direction,message,extra,ts FROM logs ORDER BY id DESC LIMIT @limit`).all({limit})
   res.json(rows.map(r=>({ ...r, extra: r.extra? JSON.parse(r.extra): null })))
 })
-app.get("/intakes.json", (_req,res)=>{
-  const rows = db.prepare(`SELECT * FROM intakes ORDER BY created_at DESC LIMIT 500`).all()
-  res.json(rows)
-})
-app.get("/session.json", (req,res)=>{
-  const phone = String(req.query.phone||"").trim()
-  if (!phone) return res.status(400).json({error:"phone required"})
-  const row = db.prepare(`SELECT data_json, updated_at FROM sessions WHERE phone=@p`).get({p:phone})
-  res.json({ phone, session: row?.data_json ? JSON.parse(row.data_json) : null, updated_at: row?.updated_at || null })
-})
-app.get("/profile.json", (req,res)=>{
-  const phone = String(req.query.phone||"").trim()
-  if (!phone) return res.status(400).json({error:"phone required"})
-  const prof = loadProfile(phone)
-  res.json(prof)
-})
 
-// ===== Baileys
+// ===== WhatsApp (Baileys)
 async function loadBaileys(){
   const require = createRequire(import.meta.url); let mod=null
   try{ mod=require("@whiskeysockets/baileys") }catch{}; if(!mod){ mod=await import("@whiskeysockets/baileys") }
@@ -395,7 +272,6 @@ async function loadBaileys(){
   return { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers }
 }
 
-// ===== WhatsApp loop
 async function startBot(){
   try{
     const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = await loadBaileys()
@@ -418,197 +294,112 @@ async function startBot(){
 
     async function sendText(jid, phone, text){
       if (!text) return
-      try{ await sock.sendMessage(jid, { text }) }catch(e){}
-      logEvent({phone, direction:"out", action:"send", message:text})
+      try{ await sock.sendMessage(jid, { text }) }catch{}
+      logEvent({phone, direction:"out", message:text})
     }
 
     sock.ev.on("messages.upsert", async ({messages})=>{
       const m = messages?.[0]; if (!m?.message) return
       const jid = m.key.remoteJid
       const isFromMe = !!m.key.fromMe
-      const phone = normalizePhoneES((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
+      const phone = normalizePhoneE164((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
       const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
-      const pushName = (m.pushName || "").trim()
       if (!textRaw) return
 
       const prev = QUEUE.get(phone)||Promise.resolve()
       const job = prev.then(async ()=>{
-        let s = loadSession(phone) || {
-          phone,
-          // Datos
-          svc:null, salon:null, staff_any:null, staff:null, day:null, part:null,
-          lang:null,
-          // Control
-          pending_field:null,
-          ask_tries:{},
-          last_bot_reply:null, same_reply_count:0,
-          snooze_until_ms:null
-        }
-        let p = loadProfile(phone)
-
         try{
-          // Snooze manual
-          if (isFromMe && textRaw.trim()==="." && SNOOZE_ON_DOT){
-            s.snooze_until_ms = nowEU().add(SNOOZE_HOURS,"hour").valueOf()
-            saveSession(phone, s)
-            logEvent({phone, direction:"sys", action:"manual_snooze", message:"."})
-            return
-          }
-          // Snooze activo
-          if (!isFromMe && s.snooze_until_ms && nowEU().valueOf() < s.snooze_until_ms){
-            if (AUTO_UNSNOOZE_ON_USER){
-              s.snooze_until_ms = null
-              saveSession(phone, s)
-              logEvent({phone, direction:"sys", action:"auto_unsnooze_on_user", message:textRaw})
-            } else {
-              logEvent({phone, direction:"sys", action:"dropped_due_snooze", message:textRaw})
-              return
-            }
-          }
+          if (isFromMe){ logEvent({phone, direction:"in", message:textRaw, extra:{fromMe:true}}); return }
 
           // Log entrada
-          logEvent({phone, direction:"in", action:"message", message:textRaw})
+          logEvent({phone, direction:"in", message:textRaw})
 
-          // Historial + política de saludo
-          const histCompact = getHistoryCompact(phone)
-          const greetByWindow = !hadAssistantLast6h(phone)
-          const greetByUser   = isGreetingOnly(textRaw)
-          const shouldGreet   = greetByWindow || greetByUser
+          // 1) Compacta historial
+          const hist = getHistoryCompact(phone)
 
-          // Known (sin inferencia)
-          const known = {
-            svc:   s.svc || p.svc || null,
-            salon: s.salon || p.salon || null,
-            staff_any: (s.staff_any!=null) ? s.staff_any : (p.staff_any!=null ? p.staff_any : null),
-            staff: s.staff || p.staff || null,
-            day:   s.day || null,
-            part:  s.part || p.part || null
-          }
-          const langHint = s.lang || p.lang || "es"
-
-          // Campo pendiente inicial
-          if (!s.pending_field){
-            s.pending_field = nextFieldToAsk(s)
-          }
-          const tries = s.ask_tries[s.pending_field||"none"] || 0
-
-          // ===== Llamada IA
-          const aiRaw = await aiCallCompact({
+          // 2) Pide a la IA SOLO la clasificación + extracción
+          const ai = await aiClassify({
             brand: BRAND,
-            langHint,
-            known,
-            pendingField: s.pending_field,
-            shouldGreet,
             bookingURL: BOOKING_URL,
-            historyCompact: histCompact,
-            userText: textRaw,
-            askTries: tries,
-            lastBotReply: s.last_bot_reply || ""
+            historyCompact: hist,
+            userText: textRaw
           })
-          logEvent({phone, direction:"sys", action:"ai_raw", message: truncate(String(aiRaw||""), 1000)})
+          logEvent({phone, direction:"sys", message:"ai_json", extra: ai})
 
-          const aiJson = toJSONLoose(aiRaw) || {}
-          logEvent({phone, direction:"sys", action:"ai_json", message: safeJSONStringify(aiJson)})
+          // 3) Respuesta mínima basada en la DECISIÓN de la IA
+          let reply = ""
+          const lang = ai?.lang || "es"
+          const ex   = ai?.extracted || {}
+          const missing = Array.isArray(ai?.missing) ? ai.missing : []
 
-          // Idioma
-          if (aiJson.lang) s.lang = aiJson.lang
-          const up = aiJson.upd || {}
-
-          // Aplica updates
-          if (typeof up.svc === "string" && up.svc.trim()) s.svc = up.svc.trim()
-          if (up.salon === "torremolinos" || up.salon === "la_luz") s.salon = up.salon
-          if (typeof up.staff_any === "boolean") s.staff_any = up.staff_any
-          if (typeof up.staff === "string" && up.staff.trim()){ s.staff = up.staff.trim(); s.staff_any = false }
-          if (typeof up.day === "string" && up.day.trim()) s.day = up.day.trim()
-          if (up.part && ["mañana","tarde","noche"].includes(up.part)) s.part = up.part
-
-          // ¿Respondió el campo pendiente?
-          const answered = !!aiJson.answered && aiJson.answered_field === s.pending_field
-          if (answered){
-            s.ask_tries[s.pending_field] = 0
-            s.pending_field = nextFieldToAsk(s)
-          } else if (s.pending_field){
-            s.ask_tries[s.pending_field] = (s.ask_tries[s.pending_field]||0) + 1
+          // Si no hay IA o no clasificó bien, una sola pregunta genérica
+          if (!ai){
+            reply = (lang==="en") ? "Hi! Do you want to book an appointment?" :
+                    (lang==="fr") ? "Salut ! Tu veux réserver un rendez-vous ?" :
+                                     "¡Hola! ¿Quieres reservar una cita?"
+            await sendText(jid, phone, reply); return
           }
 
-          const completed = isComplete(s)
-          let reply = (typeof aiJson.reply==="string"? aiJson.reply.trim() : "") || ""
-          let ask = aiJson.ask || null
-          const finalizeFlag = !!aiJson.final
+          // Saludo + intención
+          if (ai.is_greeting && !ai.wants_appointment){
+            reply = (lang==="en") ? "Hi! How can I help you today?" :
+                    (lang==="fr") ? "Salut ! Comment puis-je t’aider ?" :
+                                     "¡Hola! ¿En qué puedo ayudarte?"
+            await sendText(jid, phone, reply); return
+          }
 
-          // Enlace solo en saludo
-          reply = sanitizeReplyLink(reply, shouldGreet)
-
-          // Si NO respondió el pendiente, seguimos con el mismo campo
-          if (!answered && s.pending_field){
-            if (ask !== s.pending_field){
-              ask = s.pending_field
+          // Quiere cita: preguntamos SOLO lo que falta (primero de la lista)
+          if (ai.wants_appointment){
+            if (!missing.length){
+              // Todo listo → resumen corto + confirmación (1 sola pregunta)
+              const salonTxt = ex.salon==="la_luz" ? "La Luz" : (ex.salon==="torremolinos" ? "Torremolinos" : "—")
+              const staffTxt = (ex.staff_any===true) ? "cualquiera del equipo" : (ex.staff? ex.staff : "—")
+              const resumen = (lang==="en")
+                ? `Great! ${ex.svc||"service"} in ${salonTxt}, ${staffTxt}, ${ex.day||"día a convenir"} por la ${ex.part||"franja a convenir"}. ¿Lo confirmo?`
+                : (lang==="fr")
+                  ? `Top ! ${ex.svc||"service"} à ${salonTxt}, ${staffTxt}, ${ex.day||"jour à convenir"} ${ex.part||"créneau à convenir"}. Je confirme ?`
+                  : `Perfecto: ${ex.svc||"servicio"} en ${salonTxt}, ${staffTxt}, ${ex.day||"día a convenir"} por la ${ex.part||"franja a convenir"}. ¿Lo confirmo?`
+              await sendText(jid, phone, resumen); return
+            } else {
+              const first = missing[0]
+              // Pista corta sugerida por IA (si viene)
+              const hint = (typeof ai.reply_hint==="string" && ai.reply_hint.trim()) ? ai.reply_hint.trim() : null
+              const ask = hint || (
+                (lang==="en") ? (
+                  first==="svc"          ? "What service would you like?"
+                : first==="salon"        ? "Which salon works for you, Torremolinos or La Luz?"
+                : first==="staff_or_any" ? "Any stylist or someone specific?"
+                : first==="day"          ? "What day works for you?"
+                : /*part*/                 "Morning, afternoon or evening?"
+                )
+                : (lang==="fr") ? (
+                  first==="svc"          ? "Quel service veux-tu ?"
+                : first==="salon"        ? "Quel salon te convient, Torremolinos ou La Luz ?"
+                : first==="staff_or_any" ? "Peu importe la personne ou quelqu’un en particulier ?"
+                : first==="day"          ? "Quel jour te convient ?"
+                :                          "Matin, après-midi ou soir ?"
+                )
+                : (
+                  first==="svc"          ? "¿Qué servicio te gustaría?"
+                : first==="salon"        ? "¿Qué salón prefieres: Torremolinos o La Luz?"
+                : first==="staff_or_any" ? "¿Cualquiera del equipo o alguien en concreto?"
+                : first==="day"          ? "¿Qué día te viene bien?"
+                :                          "¿Mañana, tarde o noche?"
+                )
+              )
+              await sendText(jid, phone, ask); return
             }
           }
 
-          // Anti-repetición literal
-          if (reply && s.last_bot_reply && reply === s.last_bot_reply){
-            s.same_reply_count = (s.same_reply_count||0) + 1
-          } else {
-            s.same_reply_count = 0
-          }
-          if (s.same_reply_count >= MAX_SAME_REPLY){
-            reply = (s.lang==="en") ? (reply + " (just to confirm)") :
-                    (s.lang==="fr") ? (reply + " (petite confirmation)") :
-                                      (reply + " (te leo)")
-          }
-
-          // Cierre si completado
-          if (completed || finalizeFlag){
-            const id = `int_${randomUUID().slice(0,8)}_${Date.now().toString(36)}`
-            db.prepare(`INSERT INTO intakes
-              (id, phone, salon, svc, staff_any, staff, day, part, created_at, last_msg)
-            VALUES
-              (@id,@phone,@salon,@svc,@staff_any,@staff,@day,@part,@created,@raw)`).run({
-              id, phone, salon:s.salon, svc:s.svc, staff_any: s.staff_any?1:0, staff:s.staff||null,
-              day:s.day||null, part:s.part||null,
-              created: new Date().toISOString(), raw: textRaw
-            })
-
-            // Memoria básica
-            const prof = loadProfile(phone)
-            prof.lang = s.lang || prof.lang || "es"
-            prof.salon = s.salon || prof.salon
-            prof.svc = s.svc || prof.svc
-            if (s.staff_any===true){ prof.staff_any = true; prof.staff = null }
-            if (s.staff){ prof.staff_any = false; prof.staff = s.staff }
-            prof.part = s.part || prof.part
-            saveProfile(phone, prof)
-
-            if (!reply){
-              reply = (prof.lang==="en") ? "All set ✅ If you need changes, just tell me."
-                   : (prof.lang==="fr") ? "Parfait ✅ Dis-moi si tu veux changer quelque chose."
-                   : "¡Listo! ✅ Si quieres cambiar algo, dime."
-            }
-
-            await sendText(jid, phone, reply)
-            s.last_bot_reply = reply
-            s.pending_field = null
-            saveSession(phone, s)
-            return
-          }
-
-          // Fallback
-          if (!reply){
-            reply = standardQuestion(s.lang || langHint, s.pending_field || nextFieldToAsk(s) || "svc")
-          }
-
+          // No saludo, no cita → respuesta mínima neutra
+          reply = (lang==="en") ? "Got it. Tell me if you want to book an appointment." :
+                  (lang==="fr") ? "Compris. Dis-moi si tu veux réserver." :
+                                   "Entendido. Dime si quieres reservar una cita."
           await sendText(jid, phone, reply)
-          s.last_bot_reply = reply
-          saveSession(phone, s)
 
         }catch(err){
-          logEvent({phone, direction:"sys", action:"handler_error", message: err?.message, extra:{stack: err?.stack}})
-          const lang = s.lang || loadProfile(phone).lang || "es"
-          const txt = (lang==="en")?"Glitch 😅 Which salon works for you, Torremolinos or La Luz?"
-                    : (lang==="fr")?"Oups 😅 Quel salon te convient, Torremolinos ou La Luz ?"
-                    : "Ups 😅 ¿Qué salón prefieres: Torremolinos o La Luz?"
-          try{ await sock.sendMessage(jid, { text: txt }) }catch{}
+          logEvent({phone, direction:"sys", message:"handler_error", extra:{msg:err?.message, stack:err?.stack}})
+          try{ await sendText(jid, phone, "Ups 😅 ¿Quieres reservar una cita?") }catch{}
         }
       })
       QUEUE.set(phone, job.finally(()=>{ if (QUEUE.get(phone)===job) QUEUE.delete(phone) }))
@@ -620,9 +411,8 @@ async function startBot(){
 }
 
 // ===== Arranque
-console.log(`🩷 ${BRAND} Bot v38.3.0 · Historial ${HISTORY_HOURS}h/${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch · AI:${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}`)
-const server = app.listen(PORT, ()=>{ startBot().catch(console.error) })
+const appListen = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", e=>{ console.error("uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", e=>{ console.error("unhandledRejection:", e) })
-process.on("SIGTERM", ()=>{ try{ server.close(()=>process.exit(0)) }catch{ process.exit(0) } })
-process.on("SIGINT",  ()=>{ try{ server.close(()=>process.exit(0)) }catch{ process.exit(0) } })
+process.on("SIGTERM", ()=>{ try{ appListen.close(()=>process.exit(0)) }catch{ process.exit(0) } })
+process.on("SIGINT",  ()=>{ try{ appListen.close(()=>process.exit(0)) }catch{ process.exit(0) } })
