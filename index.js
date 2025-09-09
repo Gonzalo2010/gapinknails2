@@ -1,13 +1,9 @@
-// index.js — Gapink Nails · v42.0.0
+// index.js — Gapink Nails · v43.0.0
 // “IA decide saludo/cita/info · 1 sola pregunta + mute 6h (auto y por '.') + búsqueda avanzada de logs”
 //
-// Novedades v42:
-// - FIX: SyntaxError por backticks escapados en db.prepare(...).
-// - /logs.json con filtros: phone, q (texto), dir (in|out|sys), from, to, limit, offset, order (asc|desc).
-// - /logs.ndjson para stream de resultados grandes.
-// - /sessions.json (listar o una sesión concreta) y /session/unmute?phone=... para desmutear rápido.
-// - FTS5 opcional: si está disponible, búsquedas por texto usan logs_fts MATCH; si no, fallback a LIKE.
-// - Se mantiene: mute 6h por "." y auto-mute al tener datos completos; saludo con https://gapinknails.square.site/
+// Cambios clave v43:
+// - Al tener TODOS los datos → NO confirma ni responde; simplemente se auto-mutea 6h.
+// - Mantiene: mute 6h por “.” (cliente o staff), /logs.json y /logs.ndjson con filtros, /session/unmute.
 //
 // ENV (opcionales):
 //   PORT, BOT_DEBUG, HISTORY_HOURS, HISTORY_MAX_MSGS, HISTORY_TRUNC_EACH,
@@ -91,7 +87,7 @@ function parseDateOrNull(v){
 }
 
 // ===== DB
-const db = new Database("gapink_ai_classifier_v420.db"); db.pragma("journal_mode = WAL")
+const db = new Database("gapink_ai_classifier_v430.db"); db.pragma("journal_mode = WAL")
 db.exec(`
 CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,12 +121,9 @@ try {
       INSERT INTO logs_fts(rowid, message) VALUES (new.id, new.message);
     END;
   `)
-  // Smoke test
-  db.prepare(`SELECT count(*) AS n FROM logs_fts`).get()
+  db.prepare("SELECT count(*) AS n FROM logs_fts").get()
   FTS_AVAILABLE = true
-} catch {
-  FTS_AVAILABLE = false
-}
+} catch { FTS_AVAILABLE = false }
 
 function logEvent({phone, direction, message, extra}){
   try{
@@ -174,9 +167,7 @@ function saveSession(phone, s){
 }
 function isMuted(session){
   if (!session?.mute_until) return false
-  try{
-    return dayjs(session.mute_until).isAfter(nowEU())
-  }catch{ return false }
+  try{ return dayjs(session.mute_until).isAfter(nowEU()) }catch{ return false }
 }
 function setMute(session, hours, reason="manual"){
   const until = nowEU().add(hours,"hour").toISOString()
@@ -241,7 +232,6 @@ Rules:
     if (!resp.ok) return null
     const data = await resp.json()
     const txt = data?.choices?.[0]?.message?.content || ""
-    // Intentamos parseo robusto
     let s = String(txt).trim().replace(/```json/gi,"```")
     if (s.startsWith("```")) s = s.slice(3)
     if (s.endsWith("```")) s = s.slice(0,-3)
@@ -253,7 +243,7 @@ Rules:
   }
 }
 
-// ===== Mini web (estado, QR y endpoints de logs)
+// ===== Mini web (estado, QR y endpoints)
 const app = express()
 let lastQR = null, conectado = false
 
@@ -270,7 +260,7 @@ app.get("/", (_req,res)=>{
   code{background:#f4f6f8;padding:2px 6px;border-radius:6px}
   </style>
   <div class="card">
-    <h1>🩷 ${BRAND} — IA Clasificador v42.0.0</h1>
+    <h1>🩷 ${BRAND} — IA Clasificador v43.0.0</h1>
     <div class="row">
       <span class="pill ${conectado?"ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</span>
       <span class="pill">Historial IA ${HISTORY_HOURS}h · máx ${HISTORY_MAX_MSGS} msgs</span>
@@ -289,7 +279,6 @@ app.get("/", (_req,res)=>{
     <div class="foot">Desarrollado por <strong>Gonzalo García Aranda</strong></div>
   </div>`)
 })
-
 app.get("/qr.png", async (_req,res)=>{
   if(!lastQR) return res.status(404).send("No QR")
   const png = await qrcode.toBuffer(lastQR, { type:"png", width:512, margin:1 })
@@ -318,18 +307,15 @@ app.get("/logs.json", (req,res)=>{
   let sql
   if (q){
     if (FTS_AVAILABLE){
-      // full-text (rápido y relevante)
       sql = `
         SELECT l.id,l.phone,l.direction,l.message,l.extra,l.ts
-        FROM logs l
-        JOIN logs_fts f ON f.rowid = l.id
+        FROM logs l JOIN logs_fts f ON f.rowid = l.id
         WHERE (${where.join(" AND ")}) AND f.logs_fts MATCH @q
         ORDER BY l.id ${order}
         LIMIT @limit OFFSET @offset
       `
       params.q = q
     } else {
-      // fallback LIKE
       sql = `
         SELECT id,phone,direction,message,extra,ts
         FROM logs
@@ -359,7 +345,7 @@ app.get("/logs.json", (req,res)=>{
 // --- Logs NDJSON (stream) ---
 app.get("/logs.ndjson", (req,res)=>{
   res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8")
-  // Reutilizamos la misma query builder de /logs.json
+
   const phone = req.query.phone || null
   const q     = (req.query.q || "").toString().trim()
   const dir   = (req.query.dir || "").toString().trim().toLowerCase()
@@ -437,7 +423,6 @@ app.get("/sessions.json", (req,res)=>{
     return res.json(out)
   }
 })
-
 app.get("/session/unmute", (req,res)=>{
   const phone = req.query.phone
   if (!phone) return res.status(400).json({ ok:false, error:"phone required" })
@@ -513,7 +498,7 @@ async function startBot(){
             return
           }
 
-          // Log de entrada (incluye info de si viene de nosotros)
+          // Log de entrada
           logEvent({phone, direction:"in", message:textRaw, extra:{fromMe:isFromMe}})
 
           // Si es mensaje “fromMe” (vosotros) y no es ".", no activar bot
@@ -538,20 +523,19 @@ async function startBot(){
           logEvent({phone, direction:"sys", message:"ai_json", extra: ai})
 
           // 4) Respuesta mínima
-          let reply = ""
           const lang = ai?.lang || "es"
           const ex   = ai?.extracted || {}
           const missing = Array.isArray(ai?.missing) ? ai.missing : []
 
           // Sin IA -> saludo + enlace
           if (!ai){
-            reply = `¡Hola! Soy la asistente de ${BRAND} 💖 Puedes reservar aquí también: ${BOOKING_URL}. ¿Quieres reservar una cita?`
+            const reply = `¡Hola! Soy la asistente de ${BRAND} 💖 Puedes reservar aquí también: ${BOOKING_URL}. ¿Quieres reservar una cita?`
             await sendText(jid, phone, reply); return
           }
 
           // Saludo sin cita -> saludo + enlace
           if (ai.is_greeting && !ai.wants_appointment){
-            reply = (lang==="en")
+            const reply = (lang==="en")
               ? `Hi! I'm ${BRAND}'s assistant 💖 You can also book here: ${BOOKING_URL}. How can I help you?`
               : (lang==="fr")
                 ? `Salut ! Je suis l’assistante de ${BRAND} 💖 Tu peux aussi réserver ici : ${BOOKING_URL}. Comment puis-je t’aider ?`
@@ -562,26 +546,21 @@ async function startBot(){
           // Quiere cita -> preguntar SOLO lo que falte
           if (ai.wants_appointment){
             if (!missing.length){
+              // ★ Ya hay todos los datos → NO responder, solo auto-mutear 6h y log interno
+              // (guardamos un resumen interno por si sirve al staff, pero no se envía)
               const salonTxt = ex.salon==="la_luz" ? "La Luz" : (ex.salon==="torremolinos" ? "Torremolinos" : "—")
               const staffTxt = (ex.staff_any===true) ? "cualquiera del equipo" : (ex.staff? ex.staff : "—")
-              const resumen = (lang==="en")
-                ? `Great! ${ex.svc||"service"} in ${salonTxt}, ${staffTxt}, ${ex.day||"day to agree"} in the ${ex.part||"slot to agree"}. Do I confirm?`
-                : (lang==="fr")
-                  ? `Top ! ${ex.svc||"service"} à ${salonTxt}, ${staffTxt}, ${ex.day||"jour à convenir"} sur le ${ex.part||"créneau à convenir"}. Je confirme ?`
-                  : `Perfecto: ${ex.svc||"servicio"} en ${salonTxt}, ${staffTxt}, ${ex.day||"día a convenir"} por la ${ex.part||"franja a convenir"}. ¿Lo confirmo?`
+              const resumenInterno = `Datos completos: ${ex.svc||"servicio"} · ${salonTxt} · ${staffTxt} · ${ex.day||"día?"} · ${ex.part||"franja/hora?"}`
 
-              await sendText(jid, phone, resumen)
-
-              // Auto-mute 6h tras datos completos
-              session = setMute(session, MUTE_HOURS, "auto-after-data-complete")
-              session.last_summary = resumen
+              session = setMute(session, MUTE_HOURS, "auto-after-data-complete_no-confirm")
+              session.last_summary = resumenInterno
               saveSession(phone, session)
-              logEvent({phone, direction:"sys", message:"auto_muted_after_complete", extra:{until:session.mute_until}})
+              logEvent({phone, direction:"sys", message:"auto_muted_after_complete_no_confirm", extra:{until:session.mute_until, data:ex}})
 
-              return
+              return // silencio total
             } else {
               const first = missing[0]
-              const hint = (typeof ai.reply_hint==="string" && ai.reply_hint.trim()) ? ai.reply_hint.trim() : null
+              const hint = (typeof ai?.reply_hint==="string" && ai.reply_hint.trim()) ? ai.reply_hint.trim() : null
               const ask = hint || (
                 (lang==="en") ? (
                   first==="svc"          ? "What service would you like?"
@@ -610,9 +589,9 @@ async function startBot(){
           }
 
           // No saludo, no cita → respuesta mínima neutra
-          reply = (lang==="en") ? "Got it. Tell me if you want to book an appointment."
-                : (lang==="fr") ? "Compris. Dis-moi si tu veux réserver."
-                : "Entendido. Dime si quieres reservar una cita."
+          const reply = (lang==="en") ? "Got it. Tell me if you want to book an appointment."
+                     : (lang==="fr") ? "Compris. Dis-moi si tu veux réserver."
+                     : "Entendido. Dime si quieres reservar una cita."
           await sendText(jid, phone, reply)
 
         }catch(err){
