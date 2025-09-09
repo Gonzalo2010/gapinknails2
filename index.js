@@ -1,14 +1,16 @@
-// index.js — Gapink Nails · v38.2.0 “IA secuencial anti-bucle + saludo con enlace (solo al inicio)”
+// index.js — Gapink Nails · v38.3.0 “saludo 1× + beauty, no repetitiva”
 //
-// Cambios clave vs 38.0.0:
-// - IA con contexto de reintentos por campo (askTries) y última respuesta del bot (lastBotReply) → NO repite.
-// - Flujo bloqueado por campo (pending_field): no avanza hasta que la IA marque answered=true.
-// - Variación automática: si askTries≥2, IA añade pista breve (“Responde: mañana / tarde / noche”), 1 sola pregunta.
-// - Enlace SOLO en saludo inicial (cada ventana de 6h). Servidor lo quita si aparece fuera del saludo.
-// - Marca fija “Gapink Nails” (nunca “Ga Pink”). Prompt se lo recuerda.
-// - Cero keywords ni regex de contenido en servidor (todo lo infiere la IA). El server solo aplica el contrato.
+// Cambios vs 38.2.0:
+// - Saludo SOLO 1 vez por ventana de 6h, PERO si el usuario manda un saludo puro (“hola/buenas/hello/…”),
+//   se permite saludar otra vez. El enlace solo aparece en ese saludo.
+// - En el prompt dejamos claro que Gapink Nails es un *salón de belleza* (no solo uñas).
+//   Ejemplos de servicios: cejas, depilación, pestañas, faciales, manicura/pedicura, etc.
+// - Si pending_field=svc y el usuario pone “cejas”, la IA debe marcar answered=true y pasar al siguiente campo.
+// - Pregunta activa única, sin repeticiones verbatim. Tras varios intentos añade pista breve.
+// - Cero keywords para extraer servicio/elecciones (lo hace la IA). ÚNICA excepción: detección de “saludo puro”,
+//   para permitir un segundo saludo dentro de 6h si el cliente dice “hola”, por tu petición.
 //
-// JSON IA esperado por turno:
+// JSON esperado de IA por turno:
 // {
 //   "lang":"es|en|fr",
 //   "intent":"appt|hi|other",
@@ -16,7 +18,7 @@
 //   "answered": true|false,
 //   "answered_field":"svc|salon|staff|day|part|null",
 //   "ask":"svc|salon|staff|day|part|null",
-//   "reply":"... (una sola pregunta, sin listas de servicios)",
+//   "reply":"... (1 sola pregunta, sin listas infinitas)",
 //   "final": true|false
 // }
 //
@@ -57,8 +59,8 @@ const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 24)
 const HISTORY_TRUNC_EACH = Number(process.env.HISTORY_TRUNC_EACH || 140)
 const PROMPT_MAX_CHARS = Number(process.env.PROMPT_MAX_CHARS || 3200)
 
-const MAX_SAME_REPLY = Number(process.env.MAX_SAME_REPLY || 2)      // veces exactas
-const MAX_ASK_TRIES   = Number(process.env.MAX_ASK_TRIES || 3)      // reintentos por campo antes de “pista”
+const MAX_SAME_REPLY = Number(process.env.MAX_SAME_REPLY || 2)
+const MAX_ASK_TRIES   = Number(process.env.MAX_ASK_TRIES || 3)
 
 // ===== IA
 const AI_PROVIDER = (process.env.AI_PROVIDER || (process.env.DEEPSEEK_API_KEY? "deepseek" : process.env.OPENAI_API_KEY? "openai" : "none")).toLowerCase()
@@ -67,7 +69,7 @@ const DEEPSEEK_MODEL   = process.env.DEEPSEEK_MODEL   || "deepseek-chat"
 const OPENAI_API_KEY   = process.env.OPENAI_API_KEY || ""
 const OPENAI_MODEL     = process.env.OPENAI_MODEL   || "gpt-4o-mini"
 const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 12000)
-const AI_TEMPERATURE   = Number(process.env.AI_TEMPERATURE || 0.22) // un pelín más variación
+const AI_TEMPERATURE   = Number(process.env.AI_TEMPERATURE || 0.22)
 const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 220)
 
 // ===== Utils
@@ -96,8 +98,15 @@ function safeJSONStringify(v){
 function deepClone(o){ return JSON.parse(JSON.stringify(o||{})) }
 function truncate(s, n){ const x=String(s||""); return x.length<=n?x:x.slice(0,n-1)+"…" }
 
+// Saludo puro (excepción pedida por Gonzalo)
+function isGreetingOnly(text){
+  const t = (text||"").trim().toLowerCase()
+  // Sin “keywords” para negocio: solo saludos básicos permitidos para la excepción del saludo
+  return /^(hola+|buenas+|buenos dias|buenas tardes|buenas noches|hello+|hi+|hey+|holi+)[!¡.,\s]*$/i.test(t)
+}
+
 // ===== DB
-const db = new Database("gapink_seq_v382.db"); db.pragma("journal_mode = WAL")
+const db = new Database("gapink_seq_v383.db"); db.pragma("journal_mode = WAL")
 db.exec(`
 CREATE TABLE IF NOT EXISTS sessions (
   phone TEXT PRIMARY KEY,
@@ -200,7 +209,6 @@ function isComplete(s){
   return !!(s.svc && s.salon && (s.staff_any===true || s.staff) && s.day && s.part)
 }
 function nextFieldToAsk(s){
-  const order = ["svc","salon","staff","day","part"]
   if (!s.svc) return "svc"
   if (!s.salon) return "salon"
   if (!(s.staff_any===true || s.staff)) return "staff"
@@ -209,22 +217,22 @@ function nextFieldToAsk(s){
   return null
 }
 
-// ===== Textos estándar (solo fallback)
+// ===== Textos estándar (fallback)
 function standardQuestion(lang, field){
   if (lang==="en"){
-    if (field==="svc") return "What service would you like?"
+    if (field==="svc") return "What service would you like? (e.g., brows, waxing, lashes, facial, manicure/pedicure)"
     if (field==="salon") return "Which salon works for you, Torremolinos or La Luz?"
     if (field==="staff") return "Any stylist or someone specific?"
     if (field==="day") return "What day works for you?"
     return "Morning, afternoon or evening?"
   } else if (lang==="fr"){
-    if (field==="svc") return "Tu veux quel service ?"
+    if (field==="svc") return "Quel service veux-tu ? (ex : sourcils, épilation, cils, soin visage, manucure/pédicure)"
     if (field==="salon") return "Quel salon te convient, Torremolinos ou La Luz ?"
     if (field==="staff") return "Peu importe la personne ou quelqu’un en particulier ?"
     if (field==="day") return "Quel jour te convient ?"
     return "Matin, après-midi ou soir ?"
   } else {
-    if (field==="svc") return "¿Qué servicio te gustaría?"
+    if (field==="svc") return "¿Qué servicio te gustaría? (ej.: cejas, depilación, pestañas, facial, manicura/pedicura)"
     if (field==="salon") return "¿Qué salón prefieres: Torremolinos o La Luz?"
     if (field==="staff") return "¿Cualquiera del equipo o alguien en concreto?"
     if (field==="day") return "¿Qué día te viene bien?"
@@ -238,27 +246,29 @@ function sanitizeReplyLink(reply, shouldGreet){
   return String(reply||"").replaceAll(BOOKING_URL, "").replace(/\s{2,}/g," ").trim()
 }
 
-// ===== IA (1 llamada; le pasamos reintentos y última frase)
+// ===== IA
 async function aiCallCompact({brand, langHint, known, pendingField, shouldGreet, bookingURL, historyCompact, userText, askTries, lastBotReply}){
   if (AI_PROVIDER==="none") return { lang:"es", intent:"other", upd:{}, answered:false, answered_field:null, ask: pendingField||"svc", reply:"Hola 👋", final:false }
   const controller = new AbortController()
   const timeout = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
 
   const sys =
-`You are the WhatsApp assistant for "${brand}". Reply ONLY with JSON. Be short, warm, and NEVER ask more than one question.
+`You are the WhatsApp assistant for a full-service beauty salon named "${brand}". Reply ONLY with JSON. Be short, warm, and NEVER ask more than one question.
 
 Schema:
 {"lang":"es|en|fr","intent":"appt|hi|other","upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},"answered":true|false,"answered_field":"svc|salon|staff|day|part|null","ask":"svc|salon|staff|day|part|null","reply":"...", "final":true|false}
 
-Hard rules:
-- Always use the brand name exactly: "Gapink Nails".
-- Language = user's; stay consistent with langHint unless the user changes it.
-- Greeting: ONLY when shouldGreet=true; make it naturally varied AND include exactly once: ${BOOKING_URL}. Outside greeting, NEVER include that link.
-- There is EXACTLY ONE active question at a time. The server passes "pendingField".
-- If the user's message answers that pendingField, set upd for that field, answered=true, answered_field=pendingField, and ask the NEXT missing field.
+Strict rules:
+- Always use the brand exactly: "Gapink Nails".
+- It's a BEAUTY SALON (not only nails). Examples: brows/cejas, waxing/depilación, lashes/pestañas, facials, manicure/pedicure, etc.
+- Language = user's; follow langHint unless user clearly switches.
+- Greeting ONLY when shouldGreet=true; include exactly once: ${BOOKING_URL}. Never include that link outside greeting.
+- There is EXACTLY ONE active question. Server passes "pendingField".
+- If user's message answers pendingField, set upd for that field, answered=true, answered_field=pendingField, and ask the NEXT missing field.
+  Example: pendingField="svc" and user says "cejas" → upd.svc="cejas", answered=true, ask="salon".
 - If it does NOT answer, keep answered=false and ask the SAME pendingField again with a DIFFERENT phrasing than lastBotReply.
-- If askTries >= 2 for this field, add a tiny hint (e.g., for part: "Responde: mañana / tarde / noche"), still ONE question.
-- Avoid repeating verbatim sentences. Mirror user's wording when helpful.
+- If askTries >= 2 for this field, add a tiny hint (e.g., for "part": "Responde: mañana / tarde / noche"), still ONE short question.
+- Never list long menus. Do not push nails-only options.
 - Appointment is complete only if svc+salon+(staff_any or staff)+day+part are known.
 - Return STRICT JSON; no extra text.`
 
@@ -326,7 +336,7 @@ app.get("/", (_req,res)=>{
   a{color:#1f6feb;text-decoration:none}
   </style>
   <div class="card">
-    <h1>🩷 ${BRAND} Bot v38.2.0</h1>
+    <h1>🩷 ${BRAND} Bot v38.3.0</h1>
     <div class="row">
       <div class="pill ${conectado ? "ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</div>
       <div class="pill warn">Historial ${HISTORY_HOURS}h · ${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch</div>
@@ -430,7 +440,7 @@ async function startBot(){
           lang:null,
           // Control
           pending_field:null,
-          ask_tries:{},                // reintentos por campo
+          ask_tries:{},
           last_bot_reply:null, same_reply_count:0,
           snooze_until_ms:null
         }
@@ -459,11 +469,13 @@ async function startBot(){
           // Log entrada
           logEvent({phone, direction:"in", action:"message", message:textRaw})
 
-          // Historial y saludo
+          // Historial + política de saludo
           const histCompact = getHistoryCompact(phone)
-          const shouldGreet = !hadAssistantLast6h(phone)
+          const greetByWindow = !hadAssistantLast6h(phone)
+          const greetByUser   = isGreetingOnly(textRaw)
+          const shouldGreet   = greetByWindow || greetByUser
 
-          // Known (no inferimos)
+          // Known (sin inferencia)
           const known = {
             svc:   s.svc || p.svc || null,
             salon: s.salon || p.salon || null,
@@ -478,10 +490,9 @@ async function startBot(){
           if (!s.pending_field){
             s.pending_field = nextFieldToAsk(s)
           }
-          // Contador de reintentos para este campo
           const tries = s.ask_tries[s.pending_field||"none"] || 0
 
-          // ===== Llamada IA con contexto de reintentos y última frase
+          // ===== Llamada IA
           const aiRaw = await aiCallCompact({
             brand: BRAND,
             langHint,
@@ -514,12 +525,9 @@ async function startBot(){
           // ¿Respondió el campo pendiente?
           const answered = !!aiJson.answered && aiJson.answered_field === s.pending_field
           if (answered){
-            // reset tries del campo respondido
             s.ask_tries[s.pending_field] = 0
-            // pasar al siguiente
             s.pending_field = nextFieldToAsk(s)
           } else if (s.pending_field){
-            // incrementa reintentos si seguimos con el mismo
             s.ask_tries[s.pending_field] = (s.ask_tries[s.pending_field]||0) + 1
           }
 
@@ -531,10 +539,9 @@ async function startBot(){
           // Enlace solo en saludo
           reply = sanitizeReplyLink(reply, shouldGreet)
 
-          // Enforcer: si NO respondió, la pregunta debe seguir siendo sobre el pending_field actual
+          // Si NO respondió el pendiente, seguimos con el mismo campo
           if (!answered && s.pending_field){
             if (ask !== s.pending_field){
-              // si la IA cambió de tema, mantenemos el campo
               ask = s.pending_field
             }
           }
@@ -546,8 +553,7 @@ async function startBot(){
             s.same_reply_count = 0
           }
           if (s.same_reply_count >= MAX_SAME_REPLY){
-            // forzamos ligera variación (sin cambiar el campo)
-            reply = (s.lang==="en") ? (reply + " (just a quick confirm)") :
+            reply = (s.lang==="en") ? (reply + " (just to confirm)") :
                     (s.lang==="fr") ? (reply + " (petite confirmation)") :
                                       (reply + " (te leo)")
           }
@@ -564,7 +570,7 @@ async function startBot(){
               created: new Date().toISOString(), raw: textRaw
             })
 
-            // Memoriza perfil mínimo
+            // Memoria básica
             const prof = loadProfile(phone)
             prof.lang = s.lang || prof.lang || "es"
             prof.salon = s.salon || prof.salon
@@ -587,7 +593,7 @@ async function startBot(){
             return
           }
 
-          // Fallback: si no hay reply, pregunta estándar del campo pendiente
+          // Fallback
           if (!reply){
             reply = standardQuestion(s.lang || langHint, s.pending_field || nextFieldToAsk(s) || "svc")
           }
@@ -614,7 +620,7 @@ async function startBot(){
 }
 
 // ===== Arranque
-console.log(`🩷 ${BRAND} Bot v38.2.0 · Historial ${HISTORY_HOURS}h/${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch · AI:${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}`)
+console.log(`🩷 ${BRAND} Bot v38.3.0 · Historial ${HISTORY_HOURS}h/${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch · AI:${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}`)
 const server = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", e=>{ console.error("uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", e=>{ console.error("unhandledRejection:", e) })
