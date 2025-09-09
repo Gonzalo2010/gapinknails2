@@ -1,23 +1,10 @@
-// index.js — Gapink Nails · v37.0.0 “IA Compacta – 1-pass, low cost”
-// Objetivo: Reducir coste de IA al mínimo, manteniendo TODO el flujo por IA (sin keywords/regex).
-// - 1 sola llamada a IA por mensaje (sin segunda pasada).
-// - Prompt MUY corto y esquema JSON con campos abreviados.
-// - Historial compacto de 6h: últimos N mensajes (configurable) y truncados por caracteres.
-// - Memoria de preferencias por teléfono (salón, último servicio, staff, franja, idioma).
-// - Saludo inicial SIEMPRE (si no hubo mensajes del bot en 6h) e incluye el link de reservas: https://gapinknails.square.site/
-// - Anti-bucle básico (si la IA repite el mismo texto > MAX_SAME_REPLY, forzamos cierre si ya tiene todos los campos).
-// - Snooze con “.” (6h por defecto).
-//
-// NOTA: Sin listas, sin catálogos, sin Square aquí. Es un “intake” 100% IA + memoria.
-// Los campos que la IA debe devolver en JSON (todo opcional, rellena lo que detecte):
-// lang  : "es"|"en"|"fr" (detectar por conversación)
-// intent: "appt"|"hi"|"other"
-// upd   : { svc, salon ("torremolinos"|"la_luz"), staff_any (bool), staff (string), day, part ("mañana"|"tarde"|"noche") }
-// reply : string (mensaje al usuario, en lang)
-// final : bool (true si ya están todos los campos)
-// indifferent: { day:bool, part:bool } (opcional; si true y hay memoria, la usamos)
-//
-// Campos que consideramos “completos” para cerrar intake: svc, salon, (staff_any==true o staff), day, part.
+// index.js — Gapink Nails · v37.1.0 “IA Compacta + Anti-loop server”
+// Objetivo: cero bucles tontos. TODO pasa por IA (1 llamada), pero:
+//  - Enforzador server-side: nunca preguntar dos veces lo ya sabido.
+//  - Microparches opcionales (SAFE_PATCHES) para “Torremolinos/La Luz/me da igual” si la IA no lo pilla.
+//  - Prompt mini y tokens bajos. Historial compacto y truncado.
+//  - Saludo (si no hubo mensajes del bot en 6h) incluye link: https://gapinknails.square.site/
+//  - Snooze con “.” (6h). Logs completos.
 
 import express from "express"
 import pino from "pino"
@@ -47,12 +34,15 @@ const SNOOZE_ON_DOT = !/^false$/i.test(process.env.SNOOZE_ON_DOT || "true")
 const AUTO_UNSNOOZE_ON_USER = !/^false$/i.test(process.env.AUTO_UNSNOOZE_ON_USER || "true")
 
 const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 6)
-const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 24)        // menos contexto = menos coste
-const HISTORY_TRUNC_EACH = Number(process.env.HISTORY_TRUNC_EACH || 140)   // recortar cada línea
-const PROMPT_MAX_CHARS = Number(process.env.PROMPT_MAX_CHARS || 3200)      // límite duro del prompt
+const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 24)
+const HISTORY_TRUNC_EACH = Number(process.env.HISTORY_TRUNC_EACH || 140)
+const PROMPT_MAX_CHARS = Number(process.env.PROMPT_MAX_CHARS || 3200)
 
 const MAX_SAME_REPLY = Number(process.env.MAX_SAME_REPLY || 2)
-const FIELD_COOLDOWN_MS = Number(process.env.FIELD_COOLDOWN_MS || 15000)   // anti-spam de la misma pregunta
+const FIELD_COOLDOWN_MS = Number(process.env.FIELD_COOLDOWN_MS || 15000)
+
+// Parches mínimos (opcional). Si quieres 100% IA pura, pon SAFE_PATCHES=false
+const SAFE_PATCHES = !/^false$/i.test(process.env.SAFE_PATCHES || "true")
 
 // ===== IA (compacta)
 const AI_PROVIDER = (process.env.AI_PROVIDER || (process.env.DEEPSEEK_API_KEY? "deepseek" : process.env.OPENAI_API_KEY? "openai" : "none")).toLowerCase()
@@ -62,7 +52,7 @@ const OPENAI_API_KEY   = process.env.OPENAI_API_KEY || ""
 const OPENAI_MODEL     = process.env.OPENAI_MODEL   || "gpt-4o-mini"
 const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 12000)
 const AI_TEMPERATURE   = Number(process.env.AI_TEMPERATURE || 0.2)
-const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 220)          // respuesta corta
+const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 220)
 
 // ===== Utils
 const onlyDigits = s => String(s||"").replace(/\D+/g,"")
@@ -139,6 +129,8 @@ function saveSession(phone, s){
       .run({ p: phone, j: json, u: new Date().toISOString() })
   }
 }
+function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
+
 function loadProfile(phone){
   const row = db.prepare(`SELECT data_json FROM profiles WHERE phone=@phone`).get({phone})
   return row ? JSON.parse(row.data_json) : { phone, salon:null, svc:null, staff_any:null, staff:null, part:null, lang:"es" }
@@ -152,7 +144,6 @@ function saveProfile(phone, p){
       .run({ p: phone, j: json, u: new Date().toISOString() })
   }
 }
-function clearSession(phone){ db.prepare(`DELETE FROM sessions WHERE phone=@phone`).run({phone}) }
 
 function logEvent({phone, direction, action, message, extra}){
   try{
@@ -214,49 +205,64 @@ function noteAskedNow(session, field){
   session.ask_at[field] = Date.now()
 }
 
+// ===== Enforzador de respuesta (no repetir campo)
+function standardQuestion(lang, field){
+  if (lang==="en"){
+    if (field==="svc") return "What service would you like?"
+    if (field==="salon") return "Which salon works for you, Torremolinos or La Luz?"
+    if (field==="staff") return "Any stylist or someone specific?"
+    if (field==="day") return "What day works for you?"
+    return "Morning, afternoon or evening?"
+  } else if (lang==="fr"){
+    if (field==="svc") return "Tu veux quel service ?"
+    if (field==="salon") return "Quel salon te convient, Torremolinos ou La Luz ?"
+    if (field==="staff") return "Peu importe la personne ou quelqu’un en particulier ?"
+    if (field==="day") return "Quel jour te convient ?"
+    return "Matin, après-midi ou soir ?"
+  } else {
+    if (field==="svc") return "¿Qué servicio te gustaría?"
+    if (field==="salon") return "¿Qué salón prefieres: Torremolinos o La Luz?"
+    if (field==="staff") return "¿Cualquiera del equipo o alguien en concreto?"
+    if (field==="day") return "¿Qué día te viene bien?"
+    return "¿Mañana, tarde o noche?"
+  }
+}
+
 // ===== IA compacta (1 sola llamada)
 async function aiCallCompact({langHint, known, shouldGreet, bookingURL, historyCompact, userText}){
   if (AI_PROVIDER==="none") return { lang:"es", intent:"other", upd:{}, reply:"Hola 👋", final:false }
   const controller = new AbortController()
   const timeout = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
 
-  // Prompt mínimo + server hints + historial ya compactado
   const sys =
-`You are a WhatsApp assistant for a beauty salon. Reply ONLY with JSON, no prose.
-Short keys to reduce tokens.
+`Reply ONLY with JSON (no prose). Keep it short.
 
 Schema:
-{"lang":"es|en|fr","intent":"appt|hi|other","upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},"reply": "...", "final": true|false, "indifferent":{"day":true|false?,"part":true|false?}}
+{"lang":"es|en|fr","intent":"appt|hi|other","upd":{"svc":?,"salon":"torremolinos|la_luz"?,"staff_any":true|false?,"staff":?,"day":?,"part":"mañana|tarde|noche"?},"reply":"...", "final":true|false,"indifferent":{"day":true|false?,"part":true|false?}}
 
 Rules:
-- Language = user's language. Keep consistent.
-- Greet at start if server says so; include online booking link.
-- Ask ONE short question at a time. No lists. Be warm.
-- Use known fields; don't ask what is known.
-- If indifferent and profile has a pref, you may rely on it (server will fill).
-- Appointment complete when svc+salon+(staff_any or staff)+day+part.
-- Always return valid JSON only.`
+- Language = user's language; stay consistent.
+- Greet at start if server says so; include booking link exactly.
+- Ask ONE short question at a time. No lists.
+- Do NOT ask for fields already known.
+- If user says “me da igual / cualquiera / whatever”, set the matching field to indifferent (use staff_any=true; day=“cualquiera”; part omit).
+- Appointment is complete when svc+salon+(staff_any or staff)+day+part.
+- Return valid JSON only.`
 
   const server = {
     langHint,
-    known,                         // {svc,salon,staff_any,staff,day,part}
-    shouldGreet,                   // boolean
-    bookingURL,                    // string
+    known,
+    shouldGreet,
+    bookingURL,
     nextField: nextFieldToAsk(known),
     now: nowEU().format("YYYY-MM-DD HH:mm")
   }
 
-  // Historial comprimido en una línea por msg
   const hist = historyCompact.join("\n")
-
-  // Construcción del prompt final (recortar si hace falta)
-  let prompt =
-`[SERVER]\n${JSON.stringify(server)}\n[HISTORY]\n${hist}\n[USER]\n${userText}`
-  // recorte duro por caracteres si hiciera falta
+  let prompt = `[SERVER]\n${JSON.stringify(server)}\n[HISTORY]\n${hist}\n[USER]\n${userText}`
   const head = sys + "\n"
   if ((head.length + prompt.length) > PROMPT_MAX_CHARS){
     const overflow = (head.length + prompt.length) - PROMPT_MAX_CHARS
-    // recorta al final del history/prompt
     prompt = truncate(prompt, Math.max(200, prompt.length - overflow - 50))
   }
 
@@ -280,13 +286,31 @@ Rules:
 }
 function toJSONLoose(text){
   if (!text) return null
-  let s = String(text).trim()
-  s = s.replace(/```json/gi,"```")
+  let s = String(text).trim().replace(/```json/gi,"```")
   if (s.startsWith("```")) s = s.slice(3)
   if (s.endsWith("```")) s = s.slice(0,-3)
   const i = s.indexOf("{"), j = s.lastIndexOf("}")
   if (i>=0 && j>i) s = s.slice(i, j+1)
   try{ return JSON.parse(s) }catch{ return null }
+}
+
+// ===== Microparches opcionales para cortar bucles (muy limitados)
+function safePatchFromUser(s, userText, profile){
+  if (!SAFE_PATCHES) return
+  const t = String(userText||"").toLowerCase()
+  if (!s.salon){
+    if (/\btorremolinos\b/.test(t)) s.salon = "torremolinos"
+    else if (/\bla\s*luz\b/.test(t)) s.salon = "la_luz"
+  }
+  if (s.staff_any==null){
+    if (/\b(me da igual|cualquiera|quien sea|quién sea|any|whatever)\b/.test(t)) s.staff_any = true
+  }
+  if (!s.day){
+    if (/\b(me da igual|cualquiera|lo que sea|whatever|any day)\b/.test(t)) s.day = "cualquiera"
+  }
+  if (!s.part){
+    if (/\b(me da igual|cualquiera|lo que sea|whatever)\b/.test(t)) s.part = profile?.part || "tarde"
+  }
 }
 
 // ===== Mini web
@@ -305,12 +329,13 @@ app.get("/", (_req,res)=>{
   a{color:#1f6feb;text-decoration:none}
   </style>
   <div class="card">
-    <h1>🩷 Gapink Nails Bot v37.0.0 “IA Compacta – 1-pass”</h1>
+    <h1>🩷 Gapink Nails Bot v37.1.0 “IA Compacta + Anti-loop”</h1>
     <div class="row">
       <div class="pill ${conectado ? "ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</div>
       <div class="pill warn">Historial ${HISTORY_HOURS}h · ${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch</div>
       <div class="pill">IA: ${AI_PROVIDER.toUpperCase()}</div>
       <div class="pill">Max tokens: ${AI_MAX_TOKENS}</div>
+      <div class="pill">Parches: ${SAFE_PATCHES?"ON":"OFF"}</div>
       <div class="pill">Intakes: ${count}</div>
     </div>
     ${!conectado && lastQR ? `<div class="mt"><img src="/qr.png" width="300" style="border-radius:8px"/></div>`:""}
@@ -375,9 +400,8 @@ async function startBot(){
     const sock = makeWASocket({ logger:pino({level:"silent"}), printQRInTerminal:false, auth:state, version, browser:browserIdentity, syncFullHistory:false })
     globalThis.sock = sock
 
-    let lastQRcache = null
     sock.ev.on("connection.update", ({connection,qr})=>{
-      if (qr){ lastQR=qr; lastQRcache=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
+      if (qr){ lastQR=qr; conectado=false; try{ qrcodeTerminal.generate(qr,{small:true}) }catch{} }
       if (connection==="open"){ lastQR=null; conectado=true }
       if (connection==="close"){ conectado=false; setTimeout(()=>{ startBot().catch(console.error) }, 3000) }
     })
@@ -440,7 +464,7 @@ async function startBot(){
           const histCompact = getHistoryCompact(phone)
           const shouldGreet = !hadAssistantLast6h(phone)
 
-          // Compilar "known" para IA (usa memoria si está vacío tras cierre)
+          // “known” para la IA (mezcla sesión + perfil para ayudar)
           const known = {
             svc:   s.svc || p.svc || null,
             salon: s.salon || p.salon || null,
@@ -451,10 +475,9 @@ async function startBot(){
           }
           const langHint = s.lang || p.lang || "es"
 
-          // Anti-ask cooldown
-          const nxt = nextFieldToAsk(s)
+          // Cooldown del próximo campo
+          let nxt = nextFieldToAsk(s)
           if (nxt && fieldAskedRecently(s, nxt)){
-            // intenta preguntar el siguiente que falte con cooldown distinto
             const order = ["svc","salon","staff","day","part"]
             for (const f of order){
               if (f===nxt) continue
@@ -463,11 +486,10 @@ async function startBot(){
               if (f==="salon" && s.salon) continue
               if (f==="day" && s.day) continue
               if (f==="part" && s.part) continue
-              noteAskedNow(s, f); break
+              nxt = f; break
             }
-          } else if (nxt) {
-            noteAskedNow(s, nxt)
           }
+          if (nxt) noteAskedNow(s, nxt)
 
           // ===== Llamada IA compacta
           const bookingURL = "https://gapinknails.square.site/"
@@ -480,7 +502,7 @@ async function startBot(){
           const aiJson = toJSONLoose(aiRaw) || {}
           logEvent({phone, direction:"sys", action:"ai_json", message: safeJSONStringify(aiJson)})
 
-          // Aplicar updates (SIN keywords; solo lo que diga la IA)
+          // Aplicar updates que diga la IA
           if (aiJson.lang) s.lang = aiJson.lang
           const up = aiJson.upd || {}
           if (typeof up.svc === "string" && up.svc.trim()) s.svc = up.svc.trim()
@@ -490,29 +512,38 @@ async function startBot(){
           if (typeof up.day === "string" && up.day.trim()) s.day = up.day.trim()
           if (up.part && ["mañana","tarde","noche"].includes(up.part)) s.part = up.part
 
-          // Si marcó indiferente y hay memoria, completa desde perfil
-          const ind = aiJson.indifferent || {}
-          if (ind.day && !s.day) s.day = "cualquiera"
-          if (ind.part && !s.part) s.part = p.part || "tarde"
-          if (s.staff_any==null && (p.staff_any===true || p.staff)) {
-            if (p.staff_any===true) s.staff_any = true
-            else { s.staff = p.staff; s.staff_any = false }
-          }
+          // Microparches anti-bucle (opcionales)
+          safePatchFromUser(s, textRaw, p)
 
-          // Mensaje IA
+          // Compleción?
+          const completed = isComplete(s)
           let reply = (typeof aiJson.reply==="string"? aiJson.reply.trim() : "") || ""
           const finalizeFlag = !!aiJson.final
-          const completed = isComplete(s)
 
-          // Anti-bucle: si repite lo mismo
+          // Anti-bucle de texto
           if (reply && s.last_bot_reply && reply === s.last_bot_reply){
             s.same_reply_count = (s.same_reply_count||0) + 1
           } else {
             s.same_reply_count = 0
           }
-          // Si ya está completo o hay bucle, cerramos
+
+          // Enforzador: si falta algo, ignoramos la redacción de IA y preguntamos SOLO lo siguiente
+          let need = nextFieldToAsk(s)
+          if (!completed && need){
+            // Si el need está en cooldown, escoge otro que falte
+            if (fieldAskedRecently(s, need)){
+              const order = ["svc","salon","staff","day","part"]
+              for (const f of order){
+                if (f===need) continue
+                if (f==="staff" && (s.staff_any===true || s.staff)) continue
+                if (!s[f]) { need = f; break }
+              }
+            }
+            reply = standardQuestion(s.lang || langHint, need)
+          }
+
+          // Cierre si completo / final / o bucle
           if (completed || finalizeFlag || s.same_reply_count >= MAX_SAME_REPLY){
-            // Guardar intake
             const id = `int_${randomUUID().slice(0,8)}_${Date.now().toString(36)}`
             db.prepare(`INSERT INTO intakes
               (id, phone, salon, svc, staff_any, staff, day, part, created_at, last_msg)
@@ -523,7 +554,7 @@ async function startBot(){
               created: new Date().toISOString(), raw: textRaw
             })
 
-            // Actualizar memoria de perfil
+            // Memoriza perfil
             const p0 = deepClone(p)
             p.lang = s.lang || p.lang || "es"
             p.salon = s.salon || p.salon
@@ -533,7 +564,7 @@ async function startBot(){
             p.part = s.part || p.part
             saveProfile(phone, p)
 
-            // Mensaje de cierre si la IA no lo dio
+            // Mensaje de cierre (si IA no lo trajo)
             if (!reply){
               reply = (p.lang==="en")
                 ? "All set! I’ve got everything noted. If you prefer, you can also book online: https://gapinknails.square.site/"
@@ -547,25 +578,11 @@ async function startBot(){
             return
           }
 
-          // Si IA no dio texto, pon una pregunta mínima (fallback raro)
+          // Enviar respuesta
           if (!reply){
-            // Esta es la única rama donde podríamos “generar” algo sin IA para no quedarnos mudos
-            const f = nextFieldToAsk(s)
             const lang = s.lang || p.lang || "es"
-            if (f==="svc"){
-              reply = (lang==="en")?"What service would you like?":"fr"===lang?"Tu veux quel service ?":"¿Qué servicio te gustaría?"
-            } else if (f==="salon"){
-              reply = (lang==="en")?"Torremolinos or La Luz?":"fr"===lang?"Torremolinos ou La Luz ?":"¿Torremolinos o La Luz?"
-            } else if (f==="staff"){
-              reply = (lang==="en")?"Any stylist or someone specific?":"fr"===lang?"N’importe qui ou quelqu’un en particulier ?":"¿Cualquiera del equipo o alguien en concreto?"
-            } else if (f==="day"){
-              reply = (lang==="en")?"What day works for you?":"fr"===lang?"Quel jour te convient ?":"¿Qué día te viene bien?"
-            } else { // part
-              reply = (lang==="en")?"Morning, afternoon or evening?":"fr"===lang?"Matin, après-midi ou soir ?":"¿Mañana, tarde o noche?"
-            }
+            reply = standardQuestion(lang, nextFieldToAsk(s) || "salon")
           }
-
-          // Enviar respuesta IA
           await sendText(jid, phone, reply)
           s.last_bot_reply = reply
           saveSession(phone, s)
@@ -588,7 +605,7 @@ async function startBot(){
 }
 
 // ===== Arranque
-console.log(`🩷 Gapink Nails Bot v37.0.0 “IA Compacta – 1-pass” · Historial ${HISTORY_HOURS}h/${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch · AI:${AI_PROVIDER.toUpperCase()} · maxTokens=${AI_MAX_TOKENS}`)
+console.log(`🩷 Gapink Nails Bot v37.1.0 “IA Compacta + Anti-loop” · Historial ${HISTORY_HOURS}h/${HISTORY_MAX_MSGS} msgs · trunc ${HISTORY_TRUNC_EACH}ch · AI:${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS} · SAFE_PATCHES=${SAFE_PATCHES}`)
 const server = app.listen(PORT, ()=>{ startBot().catch(console.error) })
 process.on("uncaughtException", e=>{ console.error("uncaughtException:", e?.stack||e?.message||e) })
 process.on("unhandledRejection", e=>{ console.error("unhandledRejection:", e) })
