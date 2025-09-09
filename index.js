@@ -1,18 +1,19 @@
-// index.js — Gapink Nails · v41.0.0 “IA decide + saludo 24h con link + sin confirmación + . = silencio 6h”
+// index.js — Gapink Nails · v41.2.0
+// “Saludo 24h + ‘salón’ (nunca ‘sucursal’) + 1 sola pregunta + link SOLO en saludo + . silencia 6h (de cualquiera) + anti-repeticiones”
 //
 // Qué hace:
-// - TODO pasa por IA (clasificador): saludo, intención de cita, y extracción de datos ya mencionados.
-// - El servidor SOLO pregunta por el primer dato que falte. Cero menús, cero repeticiones.
-// - Saludo cercano SOLO 1 vez cada 24h y con el enlace a reservas.
-// - Si el mensaje lo envías tú con un "." → el bot calla 6h (sin auto-unsnooze).
-// - Cuando YA tenemos todos los datos (svc+salon+staff_any/staff+day+part) → mensaje de cierre cercano
-//   y se AUTO-SNOOZEA el chat 6h para que lo coja una empleada. Sin "¿Lo confirmo?".
-// - Logs completos en SQLite + /logs.json.
+// - TODO por IA: detecta saludo, intención de cita y extrae lo ya dicho para no pedirlo dos veces.
+// - Saludo cercano SOLO 1 vez cada 24h, con el enlace de reservas.
+// - 1 sola pregunta a la vez. Anti-repetición: no repite la misma frase ni “Hola” fuera del saludo.
+// - Cierra sin pedir confirmación: si ya hay svc+salon+staff_any/staff+day+part → mensaje de cierre cercano y silencio 6h.
+// - El mensaje "." silencia 6h aunque lo envíe cualquiera (tú o el cliente).
+// - Logs en SQLite y endpoint /logs.json
 //
-// ENV opcionales:
+// ENV (opcionales):
 //   PORT, BOT_DEBUG,
 //   GREET_WINDOW_HOURS=24, SNOOZE_HOURS=6, AUTO_SNOOZE_AFTER_COMPLETE_HOURS=6,
 //   HISTORY_HOURS=6, HISTORY_MAX_MSGS=40, HISTORY_TRUNC_EACH=180,
+//   MAX_SAME_REPLY=2, ASK_COOLDOWN_MS=70000,
 //   AI_PROVIDER=deepseek|openai, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, OPENAI_API_KEY, OPENAI_MODEL,
 //   AI_TIMEOUT_MS=10000, AI_TEMPERATURE=0.15, AI_MAX_TOKENS=160
 
@@ -43,13 +44,16 @@ const BOOKING_URL = "https://gapinknails.square.site/"
 const PORT = process.env.PORT || 8080
 const BOT_DEBUG = /^true$/i.test(process.env.BOT_DEBUG || "")
 
-const GREET_WINDOW_HOURS = Number(process.env.GREET_WINDOW_HOURS || 24) // saludo 1×/24h
-const SNOOZE_HOURS = Number(process.env.SNOOZE_HOURS || 6)              // "." = silencio 6h
+const GREET_WINDOW_HOURS = Number(process.env.GREET_WINDOW_HOURS || 24)
+const SNOOZE_HOURS = Number(process.env.SNOOZE_HOURS || 6)
 const AUTO_SNOOZE_AFTER_COMPLETE_HOURS = Number(process.env.AUTO_SNOOZE_AFTER_COMPLETE_HOURS || 6)
 
 const HISTORY_HOURS = Number(process.env.HISTORY_HOURS || 6)
 const HISTORY_MAX_MSGS = Number(process.env.HISTORY_MAX_MSGS || 40)
 const HISTORY_TRUNC_EACH = Number(process.env.HISTORY_TRUNC_EACH || 180)
+
+const MAX_SAME_REPLY = Number(process.env.MAX_SAME_REPLY || 2) // veces exacta antes de variar
+const ASK_COOLDOWN_MS = Number(process.env.ASK_COOLDOWN_MS || 70000) // no re-preguntar mismo campo tan seguido
 
 // ===== IA
 const AI_PROVIDER = (process.env.AI_PROVIDER || (process.env.DEEPSEEK_API_KEY? "deepseek" : process.env.OPENAI_API_KEY? "openai" : "none")).toLowerCase()
@@ -62,6 +66,15 @@ const AI_TEMPERATURE   = Number(process.env.AI_TEMPERATURE || 0.15)
 const AI_MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 160)
 
 // ===== Utils
+const onlyDigits = s => String(s||"").replace(/\D+/g,"")
+function normalizePhoneE164(raw){
+  const d=onlyDigits(raw); if(!d) return null
+  if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
+  if (d.startsWith("34") && d.length===11) return `+${d}`
+  if (d.length===9) return `+34${d}`
+  if (d.startsWith("00")) return `+${d.slice(2)}`
+  return `+${d}`
+}
 function truncate(s, n){ const x=String(s||""); return x.length<=n?x:x.slice(0,n-1)+"…" }
 function safeJSONStringify(v){
   const seen = new WeakSet()
@@ -76,18 +89,9 @@ function safeJSONStringify(v){
     })
   }catch{ try{ return String(v) }catch{ return "[Unserializable]" } }
 }
-const onlyDigits = s => String(s||"").replace(/\D+/g,"")
-function normalizePhoneE164(raw){
-  const d=onlyDigits(raw); if(!d) return null
-  if (raw.startsWith("+") && d.length>=8 && d.length<=15) return `+${d}`
-  if (d.startsWith("34") && d.length===11) return `+${d}`
-  if (d.length===9) return `+34${d}`
-  if (d.startsWith("00")) return `+${d.slice(2)}`
-  return `+${d}`
-}
 
 // ===== DB
-const db = new Database("gapink_ai_v410.db"); db.pragma("journal_mode = WAL")
+const db = new Database("gapink_ai_v412.db"); db.pragma("journal_mode = WAL")
 db.exec(`
 CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,8 +133,15 @@ function loadSession(phone){
   const row = db.prepare(`SELECT data_json FROM sessions WHERE phone=@p`).get({p:phone})
   return row ? JSON.parse(row.data_json) : {
     phone, lang:"es",
+    // saludo & silencio
     last_greet_at_ms: null,
     snooze_until_ms: null,
+    // anti-rep
+    last_bot_reply: null,
+    same_reply_count: 0,
+    last_ask_field: null,
+    last_ask_at_ms: 0,
+    // guardar último “resumen”
     last_summary: null
   }
 }
@@ -142,40 +153,46 @@ function saveSession(phone, s){
   }
 }
 
-// ===== IA: clasificador compacto
+// ===== Sanitizadores de respuesta
+function sanitizeReplyLink(reply, isGreeting){
+  const r = String(reply||"")
+  return isGreeting ? r : r.replaceAll(BOOKING_URL,"").replace(/\s{2,}/g," ").trim()
+}
+function stripLeadingGreeting(reply, allowGreeting){
+  if (allowGreeting) return reply
+  // quita “hola/holi/buenas/hello/hi/hey” al principio si la IA lo coló por error
+  const s = String(reply||"").trim()
+  return s.replace(/^(hola+|holi+|buenas+|hello+|hi+|hey+)[,!.\s]+/i, "").trim()
+}
+function isSameReply(a,b){ return String(a||"").trim() === String(b||"").trim() }
+
+// ===== IA: clasificador
 async function aiClassify({brand, bookingURL, historyCompact, userText}){
   if (AI_PROVIDER==="none") return null
   const controller = new AbortController()
   const timeout = setTimeout(()=>controller.abort(), AI_TIMEOUT_MS)
 
   const sys =
-`You are the WhatsApp assistant for a BEAUTY SALON called "${brand}".
-Your ONLY job: detect greeting, appointment intent, and extract already-mentioned info so we never ask twice.
-Return STRICT JSON, nothing else.
+`You are the WhatsApp assistant for a BEAUTY SALON called "${brand}" (never say "sucursal"; always say "salón").
+Your ONLY job: detect greeting, appointment intent, and extract already-mentioned info so we NEVER ask twice.
+Return STRICT JSON ONLY.
 
 Schema:
 {
   "lang": "es|en|fr|...",
   "is_greeting": true|false,
   "wants_appointment": true|false,
-  "extracted": {
-    "svc": string|null,
-    "salon": "torremolinos"|"la_luz"|null,
-    "staff_any": true|false|null,
-    "staff": string|null,
-    "day": string|null,
-    "part": "mañana"|"tarde"|"noche"|null
-  },
+  "extracted": { "svc":string|null, "salon":"torremolinos"|"la_luz"|null, "staff_any":true|false|null, "staff":string|null, "day":string|null, "part":"mañana"|"tarde"|"noche"|null },
   "missing": ["svc"|"salon"|"staff_or_any"|"day"|"part", ...],
-  "reply_hint": "friendly cue to ask the FIRST missing item (<=140 chars, 1 question, no menus)"
+  "reply_hint": "friendly cue to ask the FIRST missing item (<=140 chars, 1 question, no menus, no greeting, no external links)"
 }
 
 Rules:
-- Consider ONLY the last 6 hours of compact history.
-- If the user already said it earlier, include it in "extracted".
-- Words like “cualquiera/me da igual” → staff_any=true.
-- Do NOT include ${bookingURL} in reply_hint.
-- Keep JSON tight, no prose.`
+- Consider ONLY the last 6 hours of compact history (server provides).
+- If the latest user message contradicts earlier info, prefer the LATEST user message.
+- “me da igual/cualquiera” → staff_any=true.
+- DO NOT include ${bookingURL} in reply_hint.
+- No “hola/buenas/hello” in reply_hint unless explicitly told shouldGreet=true by the server.`
 
   const payload = {
     brand,
@@ -222,14 +239,15 @@ app.get("/", (_req,res)=>{
   .foot{margin-top:8px;opacity:.7;font-size:12px}
   </style>
   <div class="card">
-    <h1>🩷 ${BRAND} — IA v41.0.0</h1>
+    <h1>🩷 ${BRAND} — IA v41.2.0</h1>
     <div class="row">
       <span class="pill ${conectado?"ok":"bad"}">WhatsApp: ${conectado?"Conectado ✅":"Desconectado ❌"}</span>
-      <span class="pill">Saludo cada ${GREET_WINDOW_HOURS}h · Silencio "." ${SNOOZE_HOURS}h</span>
-      <span class="pill">Historial IA ${HISTORY_HOURS}h · IA:${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}</span>
+      <span class="pill">Saludo cada ${GREET_WINDOW_HOURS}h · "." silencia ${SNOOZE_HOURS}h (de cualquiera)</span>
+      <span class="pill">Historial IA ${HISTORY_HOURS}h · Anti-rep activado</span>
+      <span class="pill">IA:${AI_PROVIDER.toUpperCase()} · tokens=${AI_MAX_TOKENS}</span>
     </div>
     ${!conectado && lastQR ? `<div class="mt"><img src="/qr.png" width="280" style="border-radius:10px"/></div>`:""}
-    <p class="mt">Reserva online: <a target="_blank" href="${BOOKING_URL}">${BOOKING_URL}</a></p>
+    <p class="mt">Reserva online (solo en saludo): <a target="_blank" href="${BOOKING_URL}">${BOOKING_URL}</a></p>
     <div class="foot">Desarrollado por <strong>Gonzalo García Aranda</strong></div>
   </div>`)
 })
@@ -298,8 +316,8 @@ async function startBot(){
     sock.ev.on("messages.upsert", async ({messages})=>{
       const m = messages?.[0]; if (!m?.message) return
       const jid = m.key.remoteJid
-      const isFromMe = !!m.key.fromMe
       const phone = normalizePhoneE164((jid||"").split("@")[0]||"") || (jid||"").split("@")[0]
+      const isFromMe = !!m.key.fromMe
       const textRaw = (m.message.conversation || m.message.extendedTextMessage?.text || m.message?.imageMessage?.caption || "").trim()
       if (!textRaw) return
 
@@ -308,16 +326,16 @@ async function startBot(){
         let s = loadSession(phone)
 
         try{
-          // 0) "." desde tu lado → silencio 6h
-          if (isFromMe && textRaw.trim()==="."){
+          // 0) "." silencia 6h — por cualquiera (tú, clienta, etc.)
+          if (textRaw.trim()==="."){
             s.snooze_until_ms = nowEU().add(SNOOZE_HOURS,"hour").valueOf()
             saveSession(phone, s)
-            logEvent({phone, direction:"sys", message:"manual_snooze_activated", extra:{hours:SNOOZE_HOURS}})
+            logEvent({phone, direction:"sys", message:"manual_snooze_activated", extra:{by:isFromMe?"owner":"user", hours:SNOOZE_HOURS}})
             return
           }
 
-          // Silencio activo (no auto-desactivar)
-          if (!isFromMe && s.snooze_until_ms && nowEU().valueOf() < s.snooze_until_ms){
+          // Silencio activo
+          if (s.snooze_until_ms && nowEU().valueOf() < s.snooze_until_ms){
             logEvent({phone, direction:"sys", message:"dropped_due_snooze"})
             return
           }
@@ -328,7 +346,7 @@ async function startBot(){
           // 1) Historial compacto
           const hist = getHistoryCompact(phone)
 
-          // 2) Clasificación IA
+          // 2) IA clasifica
           const ai = await aiClassify({
             brand: BRAND,
             bookingURL: BOOKING_URL,
@@ -340,86 +358,126 @@ async function startBot(){
           const lang = ai?.lang || s.lang || "es"
           s.lang = lang
 
-          // 3) Saludo (si aplica) — 1× cada 24h, con link
+          // 3) Saludo: SOLO si greeting y no saludamos en 24h
           const greetNow = !!ai?.is_greeting && shouldGreetOncePerWindow(s)
           if (greetNow){
             const hello =
-              (lang==="en") ? `Hey! I'm the ${BRAND} assistant 💖 You can book here too: ${BOOKING_URL} — how can I help?`
-            : (lang==="fr") ? `Coucou ! Je suis l’assistante de ${BRAND} 💖 Tu peux réserver ici aussi : ${BOOKING_URL} — dis-moi !`
+              (lang==="en") ? `Hey! I'm the ${BRAND} assistant 💖 You can also book here: ${BOOKING_URL}. How can I help?`
+            : (lang==="fr") ? `Coucou ! Je suis l’assistante de ${BRAND} 💖 Tu peux réserver ici : ${BOOKING_URL}. Dis-moi !`
             : /*es*/         `¡Hola! Soy la asistente de ${BRAND} 💖 Puedes reservar aquí también: ${BOOKING_URL}. ¿En qué te ayudo?`
             await sendText(jid, phone, hello)
             s.last_greet_at_ms = nowEU().valueOf()
             saveSession(phone, s)
-            // NO return: si además quiere cita, seguimos con la pregunta (1 sola).
+            // No hacemos return: seguimos si también quiere cita.
           }
 
-          // 4) Si quiere cita, preguntar SOLO lo que falte
           const ex = ai?.extracted || {}
           const missing = Array.isArray(ai?.missing) ? ai.missing : []
+          const wants = !!ai?.wants_appointment
 
-          // Si está todo → cierre cercano + auto-silencio 6h
+          // 4) Si está todo → cierre amigable y silencio 6h
           const gotAll = !!(ex.svc && ex.salon && ((ex.staff_any===true)||ex.staff) && ex.day && ex.part)
-          if (ai?.wants_appointment && gotAll){
+          if (wants && gotAll){
             const closeMsg =
-              (lang==="en") ? "Amazing ✨ I’ve noted everything and a teammate will review and confirm here. Thanks! 💕"
-            : (lang==="fr") ? "Parfait ✨ Je note tout et une collègue vérifiera et confirmera ici. Merci ! 💕"
+              (lang==="en") ? "Amazing ✨ I’ve noted everything; a teammate will review and confirm here. Thanks! 💕"
+            : (lang==="fr") ? "Parfait ✨ Je note tout; une collègue vérifiera et confirmera ici. Merci ! 💕"
             : /*es*/         "¡Genial! ✨ Lo dejo todo listo y una compañera lo revisa y te confirma por aquí. ¡Gracias! 💕"
             await sendText(jid, phone, closeMsg)
-            // Auto-silencio para no marear al cliente
             s.snooze_until_ms = nowEU().add(AUTO_SNOOZE_AFTER_COMPLETE_HOURS,"hour").valueOf()
-            s.last_summary = { when: new Date().toISOString(), extracted: ex }
+            s.last_summary = { when:new Date().toISOString(), extracted:ex }
             saveSession(phone, s)
             return
           }
 
-          // Si falta algo y hay intención de cita → 1 sola pregunta
-          if (ai?.wants_appointment && missing.length){
+          // 5) Si falta algo → 1 sola pregunta (anti-rep + sin “Hola”)
+          if (wants && missing.length){
             const first = missing[0]
-            const hint = (typeof ai?.reply_hint==="string" && ai.reply_hint.trim()) ? ai.reply_hint.trim() : null
-            // Pregunta cercana por campo faltante
-            const ask =
-              hint ? hint :
-              (lang==="en") ? (
-                first==="svc"          ? "Tell me what service you want 😊"
-              : first==="salon"        ? "Which salon suits you better, Torremolinos or La Luz?"
-              : first==="staff_or_any" ? "Any stylist is fine or someone in particular?"
-              : first==="day"          ? "What day works for you?"
-              :                          "Morning, afternoon or evening?"
-              ) :
-              (lang==="fr") ? (
-                first==="svc"          ? "Quel service tu veux ? 😊"
-              : first==="salon"        ? "Quel salon te va mieux, Torremolinos ou La Luz ?"
-              : first==="staff_or_any" ? "Peu importe la personne ou quelqu’un en particulier ?"
-              : first==="day"          ? "Quel jour te convient ?"
-              :                          "Matin, après-midi ou soir ?"
-              ) :
-              /*es*/ (
-                first==="svc"          ? "Cuéntame qué servicio quieres 😊"
-              : first==="salon"        ? "¿Qué salón te viene mejor, Torremolinos o La Luz?"
-              : first==="staff_or_any" ? "¿Te vale cualquiera del equipo o alguien en concreto?"
-              : first==="day"          ? "¿Qué día te viene bien?"
-              :                          "¿Prefieres por la mañana, por la tarde o por la noche?"
-              )
-            await sendText(jid, phone, ask)
+            let reply = (typeof ai?.reply_hint==="string" && ai.reply_hint.trim()) ? ai.reply_hint.trim() : ""
+
+            if (!reply){
+              reply =
+                (lang==="en") ? (
+                  first==="svc"          ? "Tell me what service you want 😊"
+                : first==="salon"        ? "Which salon suits you better, Torremolinos or La Luz?"
+                : first==="staff_or_any" ? "Any stylist is fine or someone in particular?"
+                : first==="day"          ? "What day works for you?"
+                :                          "Morning, afternoon or evening?"
+                )
+              : (lang==="fr") ? (
+                  first==="svc"          ? "Quel service tu veux ? 😊"
+                : first==="salon"        ? "Quel salon te va mieux, Torremolinos ou La Luz ?"
+                : first==="staff_or_any" ? "Peu importe la personne ou quelqu’un en particulier ?"
+                : first==="day"          ? "Quel jour te convient ?"
+                :                          "Matin, après-midi ou soir ?"
+                )
+              : /*es*/ (
+                  first==="svc"          ? "Cuéntame qué servicio quieres 😊"
+                : first==="salon"        ? "¿Qué salón te viene mejor, Torremolinos o La Luz?"
+                : first==="staff_or_any" ? "¿Te vale cualquiera del equipo o alguien en concreto?"
+                : first==="day"          ? "¿Qué día te viene bien?"
+                :                          "¿Prefieres por la mañana, por la tarde o por la noche?"
+                )
+            }
+
+            // No meter “hola” si no estamos saludando
+            reply = stripLeadingGreeting(reply, false)
+            // Link solo en saludo
+            reply = sanitizeReplyLink(reply, false)
+
+            // Anti-repetición exacta
+            if (isSameReply(reply, s.last_bot_reply)){
+              s.same_reply_count = (s.same_reply_count||0) + 1
+              if (s.same_reply_count >= MAX_SAME_REPLY){
+                // Variación suave
+                reply += (lang==="en") ? " (just the first thing I need 🫶)"
+                       : (lang==="fr") ? " (juste la première info 🫶)"
+                       : /*es*/         " (es lo primero que necesito 🫶)"
+              }
+            } else {
+              s.same_reply_count = 0
+            }
+
+            // No re-preguntar el mismo campo demasiado seguido
+            const nowMs = nowEU().valueOf()
+            if (s.last_ask_field === first && (nowMs - (s.last_ask_at_ms||0)) < ASK_COOLDOWN_MS){
+              // Si es exactamente igual que lo último, no molestamos más
+              if (!isSameReply(reply, s.last_bot_reply)){
+                await sendText(jid, phone, reply)
+                s.last_bot_reply = reply
+              }
+              saveSession(phone, s)
+              return
+            }
+
+            await sendText(jid, phone, reply)
+            s.last_bot_reply = reply
+            s.last_ask_field = first
+            s.last_ask_at_ms = nowMs
             saveSession(phone, s)
             return
           }
 
-          // Si no es saludo ni quiere cita → respuesta mínima cercana
-          if (!ai?.wants_appointment){
-            const base =
+          // 6) Si no quiere cita → respuesta mínima cercana (sin hola)
+          if (!wants){
+            let base =
               (lang==="en") ? "Got it 💬 If you want to book, tell me the service and we’ll sort it out."
             : (lang==="fr") ? "Bien reçu 💬 Si tu veux réserver, dis-moi le service et on s’en occupe."
             : /*es*/         "¡Te leo! 💬 Si quieres reservar, dime el servicio y lo gestionamos."
+            base = stripLeadingGreeting(base, false)
             await sendText(jid, phone, base)
+            s.last_bot_reply = base
             saveSession(phone, s)
             return
           }
 
-          // Fallback ultra defensivo
-          await sendText(jid, phone, (lang==="es") ? "¿Te viene mejor Torremolinos o La Luz?" :
-                                         (lang==="en") ? "Which salon works for you, Torremolinos or La Luz?" :
-                                                         "Quel salon te convient, Torremolinos ou La Luz ?")
+          // 7) Fallback defensivo: pregunta por salón (sin “hola”)
+          let fb =
+            (lang==="en") ? "Which salon works for you, Torremolinos or La Luz?"
+          : (lang==="fr") ? "Quel salon te convient, Torremolinos ou La Luz ?"
+          : /*es*/         "¿Qué salón te viene mejor, Torremolinos o La Luz?"
+          fb = stripLeadingGreeting(fb, false)
+          await sendText(jid, phone, fb)
+          s.last_bot_reply = fb
           saveSession(phone, s)
 
         }catch(err){
@@ -441,4 +499,3 @@ process.on("uncaughtException", e=>{ console.error("uncaughtException:", e?.stac
 process.on("unhandledRejection", e=>{ console.error("unhandledRejection:", e) })
 process.on("SIGTERM", ()=>{ try{ appListen.close(()=>process.exit(0)) }catch{ process.exit(0) } })
 process.on("SIGINT",  ()=>{ try{ appListen.close(()=>process.exit(0)) }catch{ process.exit(0) } })
-
